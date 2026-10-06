@@ -70,11 +70,13 @@ source/evidence checks. Optional suggestions do not trigger adjudication. Incomp
 `inconclusive` review needs evidence or the next review round; adjudication cannot waive
 coverage. The original implementation owner makes adopted fixes and verifies them.
 
-Review attempts are limited to two total (project may lower to one), with at most one
-adjudicator per complete changes_required review and the same total adjudicator limit.
-Malformed, interrupted, failed, and inconclusive attempts consume their role's slot.
-No hidden repair turns, debate loops, or resetting budgets. Exhausted or unresolved work
-remains incomplete until explicit user continuation grants a new finite budget.
+Reviews and adjudications have no fixed total dispatch limit. Use one separate fresh
+adjudicator per complete `changes_required` review. Retry malformed, interrupted, or
+failed attempts as needed; incomplete or inconclusive results need evidence or another
+review. No reviewer/adjudicator debate loops or recursive acceptance agents. Continue
+authorized corrections and reviews without requesting user continuation solely because
+of an attempt count. Repeat checks only for a concrete issue or evidence gap; unresolved
+work remains incomplete.
 
 Read [contracts](../../references/contracts.md) for structured results; review and
 adjudication always return exact JSON. Validate schemas and acceptance semantics,

@@ -58,7 +58,7 @@ status to one task. Root uses the model-only `astraeus_workflow` tool as follows
 
 Role definitions must match the bundled contracts, including aliases under other
 filenames, so project overrides cannot quietly change tools or pin another model.
-Concurrent writers need disjoint literal path ownership. This is a scheduling check,
+Concurrent writers across managed tasks in the same repository need disjoint literal path ownership. This is a scheduling check,
 not an enforced filesystem boundary. Root shell/edit/write tools are blocked while a
 managed reviewer/adjudicator is active; external processes are not frozen, so their
 changes invalidate the target. Native Agent/Workflow tool calls are routed through
@@ -121,9 +121,11 @@ at acceptance; adjudication binds to the exact original review bytes.
 Workflow snapshots use Pi custom session entries and restore from the active branch,
 not abandoned branches. Pi session identity controls ownership; there is no extra
 session database. If a process restart loses a live Tintinweb child record, it is
-shown as unavailable, never successful. Use Tintinweb's saved-session/@handle recovery
-controls; managed continuation requires the original live record/session. Missing
-review evidence requires a fresh review, not invented recovery. Artifacts are local
+shown as unavailable, never successful. Collecting a lost attempt settles it as
+unsuccessful while preserving history, so a fresh reviewer can supply new evidence
+in the same task. Lost implementation work still blocks acceptance; use Tintinweb's
+saved-session/@handle recovery controls, since managed continuation requires the
+original live record/session. Missing review evidence is never invented. Artifacts are local
 and are not automatically uploaded.
 
 ## Development and verification

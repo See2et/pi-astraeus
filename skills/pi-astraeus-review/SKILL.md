@@ -56,19 +56,18 @@ extent required to assess the authorized change, and never claim credit for them
 An incomplete or `inconclusive` review needs evidence or the next review round,
 not adjudication.
 
-Hard limit: two total reviewer dispatches (initial + one re-review); project policy
-may lower it to one. Failed,
-interrupted, malformed, or inconclusive attempts consume a slot too. No hidden format
-repair turns or automatic resetting of the budget. For adopted fixes, the original
+There is no fixed total dispatch limit. Retry failed, interrupted, or malformed attempts
+as needed; incomplete or inconclusive results need evidence or another review. For adopted fixes, the original
 implementation owner edits and verifies; a fresh reviewer checks the accumulated target with emphasis on
 fixed issues and affected behavior. A renewed prompt may include prior findings as
 issues to verify, without asserting their resolution. Do not repeat unrelated checks.
 
-Root may change unpinned models with a reason within the same requirements and budget.
+Root may change unpinned models with a reason within the same requirements.
 Never expand permissions, change billing routes, or widen scope to recover. If the
-budget is exhausted, evidence is missing, review/adjudication disagree unresolvedly, or the
+evidence is missing, review/adjudication disagree unresolvedly, or the
 target changed after review, report incomplete and the precise next decision needed.
-Explicit user continuation can authorize a new finite budget; it is not a pass.
+Continue authorized corrections and reviews as needed; attempt count alone does not
+require user continuation or justify acceptance.
 
 ## Pi dispatch
 

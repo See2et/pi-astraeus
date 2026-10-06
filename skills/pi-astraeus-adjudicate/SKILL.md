@@ -48,7 +48,7 @@ no unknowns remain. An accepted `fix` means `changes_required`, not final accept
 A complete `changes_required` review can be rejected on evidence and lead to `accept`.
 An incomplete/inconclusive review cannot be waived into acceptance.
 
-## Root integration and finite recovery
+## Root integration and recovery
 
 Root validates the contract against the original review and current target, then checks
 the evidence and disposition. Only adopted fixes go to the original implementation
@@ -56,13 +56,13 @@ owner for implementation and ordinary verification. Resolve investigations in th
 ownership; escalate only unauthorized product decisions, grouped for the user. Neither
 adjudicator nor root may silently change the agreed requirements to obtain acceptance.
 
-Follow the review budget in policy: one adjudicator dispatch per complete `changes_required` review,
-at most two total, no hidden repair turns or adjudication of adjudication. Failures and
-inconclusive results consume the allocated attempt. A corrected target or new evidence
-needs the next review/adjudication round within the remaining budget. A material new
+Use one adjudicator per complete `changes_required` review, without adjudication of
+adjudication. There is no fixed total dispatch limit; failed or malformed attempts may
+be retried. A corrected target or new evidence needs the next review/adjudication round
+as appropriate. A material new
 defect found during adjudication must be recorded as unresolved (and sent for correction
 or the next review), not inserted as an unbound review item or silently accepted.
-Unresolved disagreement, exhausted budget, stale artifacts, or missing evidence remains
+Unresolved disagreement, stale artifacts, or missing evidence remains
 incomplete. Root owns final acceptance and reports limits; JSON validation is not proof
 that the findings or rationale are true.
 

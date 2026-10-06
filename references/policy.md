@@ -6,9 +6,10 @@ cannot guarantee that the host will always obey policy or load all instructions.
 
 Project `astraeus.toml` is optional. Read only the file at the working project root.
 Validate via `python3 <package>/scripts/astraeus.py doctor --config astraeus.toml`.
-Defaults: the five upstream model candidates (including preferred GPT-6.1 Sol root), plus
-`openai/gpt-5.5` for the user-authorized current Pi setup; review_limit=2; no additional mandatory
-paths; assurance=reported. review_limit can only be lowered to 1, never raised above 2.
+Defaults: the five upstream model candidates (including preferred GPT-6.1 Sol root),
+plus `openai/gpt-5.5` for the user-authorized current Pi setup; no additional mandatory
+paths; assurance=reported. Reviews and adjudications have no fixed total count limit.
+The former `review_limit` setting is retired; remove it from existing project configs.
 Allowed model IDs are restrictions, not proof of availability.
 `require_review_globs` matches project-relative changed paths with Python fnmatchcase
 semantics (`*` can cross `/`); these add review requirements, never remove risk-based ones.
@@ -19,13 +20,12 @@ Only a complete `changes_required` review triggers one separate fresh adjudicato
 before fixes or acceptance of the rejected target. A complete `pass` goes directly to
 root acceptance after review validation and current-target/evidence checks; optional
 suggestions do not trigger adjudication. Incomplete or `inconclusive` reviews need
-evidence or the next review round, not adjudication. `review_limit` still bounds
-reviewer dispatches (maximum two); adjudicator dispatches are separately capped at one
-per complete `changes_required` review and at the same total limit. Failed/malformed/interrupted attempts
-consume their role's slot; there are no hidden repair turns, reviewer/adjudicator debate
-loops, or recursive acceptance agents. Incomplete reviews first need evidence or the
-next review round. Use remaining rounds for an updated target/evidence; exhausted or
-unresolved work is incomplete until explicit user continuation grants a new finite budget.
+evidence or the next review round, not adjudication. Use one adjudicator per complete
+`changes_required` review; do not create reviewer/adjudicator debate loops or recursive
+acceptance agents. Failed, malformed, or interrupted attempts may be retried. Continue
+with corrected artifacts or new evidence as needed, without requesting user continuation
+solely because of an attempt count. Repeat checks only for a concrete issue or evidence
+gap; unresolved work remains incomplete.
 Trivial work that needs no independent review needs no adjudicator.
 
 Reviewer findings are proposals, not authorized requirements. Root checks an independent
@@ -66,10 +66,10 @@ state, or external services. Freeze concurrent writers while identifying/reviewi
 a target; recheck identity before acceptance. Visual evidence must identify the
 rendered artifact and relevant viewports/pages, not merely point to source code.
 
-Record task ID, role-specific attempt counts, target ID, selected reviewer/adjudicator,
+Record task ID, target ID, selected reviewer/adjudicator,
 the original review's content hash, and results in ordinary
 task context. If context compaction would lose this, save a short local note under
 ignored `.astraeus/`. No mandatory ledger for solo work and no custom authentication/session engine.
 The checker binds adjudication to the exact supplied review and checks disposition
 coverage and acceptance consistency. It does not authenticate rationale, host receipts,
-role independence, or budgets, or discover consequential changes: root checks those.
+role independence, or discover consequential changes: root checks those.

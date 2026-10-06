@@ -4,6 +4,7 @@ import { mkdtemp, mkdir, writeFile, readFile, cp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
+import { parseFrontmatter } from '@earendil-works/pi-coding-agent';
 import { Workflow, ROOT, ENTRY, exactModel, hash, rpc, parseReport } from '../extensions/core.mjs';
 
 const MODEL = {provider:'openai',id:'gpt-5.5',reasoning:true};
@@ -24,14 +25,14 @@ async function fixture(t) {
   events.on('subagents:rpc:spawn', p => {
     const id=`child-${++count}`;
     const record={id,type:p.type,status:'running',session:{model:p.options.model,thinkingLevel:p.options.thinkingLevel},result:''};
-    records.set(id,record); p.options.onSpawned(record);
+    records.set(id,record); p.options.onSpawned(id);
     events.emit(`subagents:rpc:spawn:reply:${p.requestId}`,{success:true,data:{id}});
   });
   events.on('subagents:rpc:consume', p => events.emit(`subagents:rpc:consume:reply:${p.requestId}`,{success:true}));
   events.on('subagents:rpc:stop', p => {
     records.get(p.agentId).status='stopped'; events.emit(`subagents:rpc:stop:reply:${p.requestId}`,{success:true});
   });
-  const host={events,agentDir:()=>agentDir,appendEntry:(customType,data)=>entries.push({type:'custom',customType,data:structuredClone(data)}), manager:()=>({getRecord:id=>records.get(id)}), supportedThinking:()=>['off','low','medium','high'], parseFrontmatter:text=>({frontmatter:{name:/^name: (.+)$/m.exec(text)?.[1]}})};
+  const host={events,agentDir:()=>agentDir,appendEntry:(customType,data)=>entries.push({type:'custom',customType,data:structuredClone(data)}), manager:()=>({getRecord:id=>records.get(id)}), supportedThinking:()=>['off','low','medium','high'], parseFrontmatter};
   const ctx={cwd,hasUI:false,sessionManager:{getSessionId:()=> 'test-session',getBranch:()=>entries},modelRegistry:{getAvailable:()=>[MODEL]},executeTool:async (_name,args)=>{
     const record=records.get(args.resume); record.status='running'; record.result=''; return {content:[]};
   }};
@@ -130,5 +131,77 @@ test('branch restore marks lost active children unavailable, not successful',asy
   const f=await fixture(t); await f.delegate('worker'); f.records.clear();
   const restored=new Workflow(f.host); restored.restore(f.ctx);
   assert.equal(restored.tasks.task.jobs[0].status,'unavailable');
-  await assert.rejects(restored.execute({op:'collect',task_id:'task',run_id:restored.tasks.task.jobs[0].run_id},f.ctx),/unavailable/);
+  const lost=await restored.execute({op:'collect',task_id:'task',run_id:restored.tasks.task.jobs[0].run_id},f.ctx);
+  assert.equal(lost.collected,true); assert.equal(lost.valid,false);
+  await assert.rejects(restored.execute({op:'accept',task_id:'task'},f.ctx),/unresolved/);
+});
+
+test('optional rejected or inconclusive reviews cannot be ignored at acceptance',async t=>{
+  const f=await fixture(t); f.workflow.tasks.task.consequential=false;
+  let job=await f.delegate('reviewer'); let report=f.report(job); report.verdict='changes_required'; report.bugs=[{location:'source.txt',claim:'Defect',evidence:'Concrete example'}];
+  f.complete(job,report); await f.act({op:'collect',run_id:job.run_id});
+  await assert.rejects(f.act({op:'accept'}),/adjudication/);
+  job=await f.delegate('reviewer'); report=f.report(job); report.verdict='inconclusive'; report.unresolved=['Missing evidence'];
+  f.complete(job,report); await f.act({op:'collect',run_id:job.run_id});
+  await assert.rejects(f.act({op:'accept'}),/inconclusive/);
+});
+test('review freezing and writer ownership apply across tasks in the same repository',async t=>{
+  const f=await fixture(t);
+  await f.act({op:'start',task_id:'other',requirements:'Second bounded task',acceptance:'Verified'});
+  const review=await f.delegate('reviewer');
+  await assert.rejects(f.act({op:'delegate',task_id:'other',role:'worker',model:'openai/gpt-5.5',thinking:'high',prompt:'Write source',owned_paths:['.']}),/no writes during review/);
+  f.complete(review,f.report(review)); await f.act({op:'collect',run_id:review.run_id});
+  const worker=await f.act({op:'delegate',task_id:'other',role:'worker',model:'openai/gpt-5.5',thinking:'high',prompt:'Implement src',owned_paths:['./src/']});
+  await assert.rejects(f.delegate('worker',{owned_paths:['src/a']}),/disjoint/);
+  f.complete(worker,'Implemented and verified'); await f.act({op:'collect',task_id:'other',run_id:worker.run_id});
+  const active=await f.delegate('reviewer');
+  await assert.rejects(f.act({op:'resume',task_id:'other',run_id:worker.run_id,prompt:'Apply follow-up'}),/active work/);
+});
+test('whitespace and non-string names use runner filename fallback and cannot replace reviewer tools',async t=>{
+  const f=await fixture(t); await mkdir(join(f.cwd,'.pi/agents'),{recursive:true});
+  for (const name of ['" "','12','false']) {
+    await writeFile(join(f.cwd,'.pi/agents/astraeus-reviewer.md'),`---\nname: ${name}\ntools: bash\n---\nWritable override`);
+    await assert.rejects(f.delegate('reviewer'),/Role definition differs/);
+  }
+  assert.equal(f.records.size,0);
+});
+test('actual string onSpawned ID survives startup rejection and permits collecting failed attempt',async t=>{
+  const f=await fixture(t); f.host.events.handlers.set('subagents:rpc:spawn',new Set([p=>{
+    const record={id:'failed-child',type:p.type,status:'error',session:{model:p.options.model,thinkingLevel:p.options.thinkingLevel},error:'Fixture startup failed'};
+    f.records.set(record.id,record); p.options.onSpawned(record.id);
+    f.host.events.emit(`subagents:rpc:spawn:reply:${p.requestId}`,{success:false,error:'Fixture startup failed'});
+  }]));
+  await assert.rejects(f.delegate('reviewer'),/startup failed/);
+  const job=f.workflow.tasks.task.jobs[0]; assert.equal(job.agent_id,'failed-child');
+  const result=await f.act({op:'collect',run_id:job.run_id}); assert.equal(result.collected,true); assert.equal(result.valid,false);
+});
+test('lost reviewer can settle as failed and fresh evidence can complete the same task',async t=>{
+  const f=await fixture(t); const lost=await f.delegate('reviewer'); f.records.delete(lost.agent_id);
+  f.workflow.restore(f.ctx);
+  const attempt=await f.act({op:'collect',run_id:lost.run_id}); assert.equal(attempt.valid,false); assert.equal(attempt.status,'unavailable');
+  await assert.rejects(f.act({op:'accept'}),/validated review/);
+  const fresh=await f.delegate('reviewer'); f.complete(fresh,f.report(fresh));
+  assert.equal((await f.act({op:'collect',run_id:fresh.run_id})).valid,true);
+  assert.equal((await f.act({op:'accept'})).accepted,true);
+});
+test('adopted fixes return to original owner and require fresh review afterward',async t=>{
+  const f=await fixture(t); const worker=await f.delegate('worker'); f.complete(worker,'Implemented and verified'); await f.act({op:'collect',run_id:worker.run_id});
+  const review=await f.delegate('reviewer'); const report=f.report(review); report.verdict='changes_required'; report.bugs=[{location:'source.txt',claim:'Defect',evidence:'Concrete example'}];
+  f.complete(review,report); await f.act({op:'collect',run_id:review.run_id});
+  await assert.rejects(f.act({op:'resume',run_id:worker.run_id,prompt:'Fix defect'}),/adopted fixes/);
+  const judge=await f.delegate('adjudicator'); f.complete(judge,{schema_version:1,kind:'adjudication',task_id:'task',target_id:judge.target_id,status:'complete',summary:'Fix within authorized scope',verdict:'changes_required',review_sha256:review.result_hash,decisions:[{ref:'bugs/0',action:'fix',basis:'Original requirement',evidence:'Source behavior',rationale:'Reproduced defect'}],checked_scope:['source.txt'],evidence:['Examined requirement'],unresolved:[]});
+  const decision=await f.act({op:'collect',run_id:judge.run_id}); assert.equal(decision.valid,true,decision.error);
+  const follow=await f.act({op:'resume',run_id:worker.run_id,prompt:'Apply the adopted fix'}); assert.equal(follow.agent_id,worker.agent_id);
+  await writeFile(join(f.cwd,'source.txt'),'fixed'); f.complete(follow,'Fixed and verified'); await f.act({op:'collect',run_id:follow.run_id});
+  await assert.rejects(f.act({op:'accept'}),/target changed/);
+  const fresh=await f.delegate('reviewer'); f.complete(fresh,f.report(fresh)); await f.act({op:'collect',run_id:fresh.run_id});
+  assert.equal((await f.act({op:'accept'})).accepted,true);
+});
+test('managed work in unrelated repositories remains independent',async t=>{
+  const f=await fixture(t); await f.delegate('reviewer');
+  const cwd=join(f.agentDir,'other-repository'); await mkdir(cwd); execFileSync('git',['init','-q'],{cwd});
+  const ctx={...f.ctx,cwd};
+  await f.workflow.execute({op:'start',task_id:'independent',requirements:'Other repository',acceptance:'Verified'},ctx);
+  const worker=await f.workflow.execute({op:'delegate',task_id:'independent',role:'worker',model:'openai/gpt-5.5',thinking:'high',prompt:'Bounded independent work',owned_paths:['.']},ctx);
+  assert.equal(worker.role,'worker'); assert.equal(worker.status,'running');
 });

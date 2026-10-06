@@ -23,7 +23,6 @@ PLUGIN = Path(__file__).resolve().parents[1]
 DEFAULTS = {
     "schema_version": 1,
     "allowed_models": ["gpt-6.1-sol", "gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "openai/gpt-5.5"],
-    "review_limit": 2,
     "require_review_globs": [],
     "assurance": "reported",
 }
@@ -53,14 +52,14 @@ def run(args, *, cwd=None):
 
 def policy(path=None):
     data = {} if path is None else tomllib.loads(Path(path).read_text())
+    if "review_limit" in data:
+        raise ValueError("review_limit has been retired; remove it from astraeus.toml (reviews have no fixed count limit)")
     unknown = data.keys() - DEFAULTS.keys()
     if unknown:
         raise ValueError(f"unknown policy keys: {sorted(unknown)}")
     result = DEFAULTS | data
     if type(result["schema_version"]) is not int or result["schema_version"] != 1:
         raise ValueError("schema_version must be 1")
-    if type(result["review_limit"]) is not int or not 1 <= result["review_limit"] <= 2:
-        raise ValueError("review_limit must be 1 or 2; two total reviewer dispatches is the maximum")
     if result["assurance"] not in ("reported", "strict"):
         raise ValueError("assurance must be reported or strict")
     for key in ("allowed_models", "require_review_globs"):

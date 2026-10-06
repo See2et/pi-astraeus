@@ -1,7 +1,7 @@
 import { randomUUID, createHash } from 'node:crypto';
 import { readFile, writeFile, mkdir, realpath, readdir } from 'node:fs/promises';
-import { existsSync } from 'node:fs';
-import { dirname, join, resolve } from 'node:path';
+import { existsSync, realpathSync } from 'node:fs';
+import { dirname, join, resolve, posix } from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
@@ -91,8 +91,14 @@ export class Workflow {
   task(id, ctx) {
     const task = this.tasks[id];
     if (!task) throw new Error(`Unknown task: ${id}`);
-    if (task.cwd !== resolve(ctx.cwd)) throw new Error('This task belongs to another working directory.');
+    if (task.cwd !== realpathSync(ctx.cwd)) throw new Error('This task belongs to another working directory.');
     return task;
+  }
+  activeJobs(cwd) {
+    return Object.values(this.tasks).filter(task => task.cwd === cwd).flatMap(task => {
+      const latest = new Map(task.jobs.map(job => [job.agent_id || job.run_id, job]));
+      return [...latest.values()].filter(job => ACTIVE.has(this.manager()?.getRecord(job.agent_id)?.status ?? job.status));
+    });
   }
   async status(ctx, id) {
     const tasks = id ? [this.task(id, ctx)] : Object.values(this.tasks);
@@ -101,7 +107,7 @@ export class Workflow {
         const record = this.manager()?.getRecord(job.agent_id);
         if (ACTIVE.has(job.status)) job.status = record?.status ?? 'unavailable';
       }
-      if (task.target_id && task.cwd === resolve(ctx.cwd) && await this.target(ctx) !== task.target_id) {
+      if (task.target_id && task.cwd === realpathSync(ctx.cwd) && await this.target(ctx) !== task.target_id) {
         task.phase = 'stale'; task.accepted = false;
       }
     }
@@ -145,7 +151,8 @@ export class Workflow {
         const path = join(directory, file);
         const contents = await readFile(path, 'utf8');
         const {frontmatter} = this.host.parseFrontmatter(contents);
-        const declared = String(frontmatter.name || file.slice(0, -3)).trim();
+        const declaredName = typeof frontmatter.name === 'string' ? frontmatter.name.trim() : '';
+        const declared = declaredName || file.slice(0, -3);
         if (declared.toLowerCase() === `astraeus-${role}`) {
           if (contents !== bundled) throw new Error(`Role definition differs from bundled contract: ${path}`);
           found = true;
@@ -182,7 +189,8 @@ export class Workflow {
       const latestWorkers = new Map(task.jobs.filter(j => j.role === 'worker').map(j => [j.agent_id, j]));
       if ([...latestWorkers.values()].some(j => !j.valid)) throw new Error('Implementation owner has unresolved failed or incomplete work.');
       const matches = JSON.parse(await this.bridge(['matches-review', '--repo', ctx.cwd], ctx));
-      const needsReview = task.consequential || matches.requires_review;
+      const existingReview = [...task.jobs].reverse().find(j => j.role === 'reviewer');
+      const needsReview = task.consequential || matches.requires_review || !!existingReview;
       if (needsReview) {
         if (await this.target(ctx) !== task.target_id) throw new Error('Review target changed. Run a fresh review.');
         const last = [...task.jobs].reverse().find(j => j.role === 'reviewer');
@@ -213,7 +221,7 @@ export class Workflow {
     const ping = await rpc(this.host.events, 'ping', {});
     if (ping?.version !== 2) throw new Error('Unsupported Tintinweb RPC version');
     const currentTarget = await this.target(ctx);
-    const running = task.jobs.filter(j => ACTIVE.has(this.manager()?.getRecord(j.agent_id)?.status ?? j.status));
+    const running = this.activeJobs(task.cwd);
     if (role !== 'worker' && running.length) throw new Error('Freeze writers and collect outstanding work before review/adjudication.');
     if (role !== 'worker' && task.jobs.some(j => !j.collected)) throw new Error('Collect existing runs first.');
     let review;
@@ -223,8 +231,10 @@ export class Workflow {
       if (task.target_id !== currentTarget) throw new Error('Review target changed; adjudication cannot repair a stale review.');
       if (task.jobs.some(j => j.role === 'adjudicator' && j.review_run === review.run_id && j.valid)) throw new Error('This review already has an adjudication. Investigate unresolved evidence instead of a debate loop.');
     }
-    const owned = p.owned_paths || ['.'];
+    let owned = p.owned_paths || ['.'];
+    if (!owned.length) throw new Error('owned_paths must identify at least one owned path.');
     if (owned.some(x => !x || x.startsWith('/') || x.split('/').includes('..') || x.includes('*'))) throw new Error('owned_paths must be literal repository-relative paths (or .), no globs.');
+    owned = owned.map(path => posix.normalize(path).replace(/\/+$/, '') || '.');
     if (role === 'worker') {
       if (running.some(j => j.role !== 'worker' || overlapping(owned, j.owned_paths))) throw new Error('Concurrent writers need disjoint ownership; no writes during review.');
       if (task.jobs.some(j => j.role === 'worker' && j.collected)) throw new Error('Resume the original implementation owner; do not replace it for fixes.');
@@ -244,16 +254,18 @@ export class Workflow {
       review ? `Original review bytes:\n${await readFile(review.artifact, 'utf8')}\nreview_sha256: ${review.result_hash}` : '',
     ].filter(Boolean).join('\n\n');
     try {
-      const response = await rpc(this.host.events, 'spawn', { type: `astraeus-${role}`, prompt, options: { model, thinkingLevel:p.thinking, inheritContext:false, isBackground:true, cwd:ctx.cwd, onSpawned: record => { job.agent_id = record.id; this.save(ctx); } } });
+      const response = await rpc(this.host.events, 'spawn', { type: `astraeus-${role}`, prompt, options: { model, thinkingLevel:p.thinking, inheritContext:false, isBackground:true, cwd:ctx.cwd, onSpawned: id => { job.agent_id = id; this.save(ctx); } } });
       job.agent_id = response.id; job.status = this.manager()?.getRecord(response.id)?.status ?? 'running'; this.save(ctx);
       return job;
-    } catch (error) { job.status = job.agent_id ? 'unavailable' : 'error'; job.error = String(error); this.save(ctx); throw error; }
+    } catch (error) { job.status = this.manager()?.getRecord(job.agent_id)?.status ?? (job.agent_id ? 'unavailable' : 'error'); job.error = String(error); this.save(ctx); throw error; }
   }
   async collect(task, job, ctx) {
     const record = this.manager()?.getRecord(job.agent_id);
     if (!record) {
       if (job.collected) return job;
-      throw new Error('Managed child record unavailable; no completion is inferred. Recover through Tintinweb session controls and start a fresh review if necessary.');
+      job.status = 'unavailable'; job.collected = true; job.valid = false;
+      job.error = 'Native child record unavailable: attempt settled as unsuccessful, not completed. A fresh reviewer/adjudicator may retry; implementation ownership still requires original-session recovery.';
+      task.phase = 'needs-evidence'; this.save(ctx); return job;
     }
     job.status = record.status;
     if (ACTIVE.has(record.status)) { this.save(ctx); return { ...job, note: 'Still running. Continue independent work or collect later.' }; }
@@ -284,11 +296,13 @@ export class Workflow {
   async resume(task, job, p, ctx, signal) {
     if (job.role !== 'worker') throw new Error('Reviews and adjudications always use fresh sessions.');
     if (!job.collected || !p.prompt?.trim()) throw new Error('Collect the previous run and provide a bounded follow-up prompt.');
-    if (task.jobs.some(j => ACTIVE.has(this.manager()?.getRecord(j.agent_id)?.status ?? j.status))) throw new Error('Collect/stop active work before resuming the implementation owner.');
+    if (this.activeJobs(task.cwd).length) throw new Error('Collect/stop active work before resuming the implementation owner.');
     const latestReview = [...task.jobs].reverse().find(j => j.role === 'reviewer');
     if (latestReview?.valid && latestReview.result?.verdict === 'changes_required') {
       const decision = [...task.jobs].reverse().find(j => j.role === 'adjudicator' && j.review_run === latestReview.run_id && j.valid);
       if (!decision || decision.result?.verdict !== 'changes_required') throw new Error('Only adopted fixes from a complete adjudication may return to the implementer.');
+      if (await this.target(ctx) !== task.target_id) throw new Error('Target changed since adjudication; obtain fresh review before adopted fixes.');
+      await this.validate(decision, task, ctx);
     }
     const record = this.manager()?.getRecord(job.agent_id);
     if (!record?.session) throw new Error('Original live child session unavailable. Use Tintinweb @handle session recovery; no replacement owner was launched.');

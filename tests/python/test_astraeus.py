@@ -243,17 +243,26 @@ class PolicyTests(unittest.TestCase):
     def test_defaults_include_authorized_pi_model(self):
         self.assertEqual(a.policy(), a.DEFAULTS)
         self.assertIn("openai/gpt-5.5", a.DEFAULTS["allowed_models"])
+        self.assertNotIn("review_limit", a.policy())
 
     def test_invalid_settings(self):
         with tempfile.TemporaryDirectory() as tmp:
             p = Path(tmp) / "config.toml"
-            for text in ('review_limit = 0', 'review_limit = true', 'review_limit = 11',
-                         'review_limit = 3', 'review_limit = 10',
-                         'allowed_models = []', 'unknown = 1', 'assurance = "magic"',
+            for text in ('allowed_models = []', 'unknown = 1', 'assurance = "magic"',
                          'allowed_models = ["x", "x"]', 'schema_version = true'):
                 p.write_text(text)
                 with self.subTest(text=text), self.assertRaises(ValueError):
                     a.policy(p)
+
+    def test_retired_review_limit_requires_explicit_migration(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / "astraeus.toml"
+            for value in ("1", "2", "3", "0", "true"):
+                p.write_text(f"review_limit = {value}\n")
+                with self.subTest(value=value), self.assertRaisesRegex(
+                        ValueError, "review_limit has been retired; remove it"):
+                    a.policy(p)
+
 
 
 class TargetTests(unittest.TestCase):
@@ -289,10 +298,10 @@ class BridgeTests(unittest.TestCase):
         subprocess.run(["git", "init", "-q", str(self.repo)], check=True)
 
     def test_policy_never_searches_parent_and_rejects_subdirectory(self):
-        (Path(self.tmp.name) / "astraeus.toml").write_text('review_limit = 1\n')
-        self.assertEqual(a.project_policy(self.repo)["review_limit"], 2)
-        (self.repo / "astraeus.toml").write_text('review_limit = 1\n')
-        self.assertEqual(a.project_policy(self.repo)["review_limit"], 1)
+        (Path(self.tmp.name) / "astraeus.toml").write_text('assurance = "strict"\n')
+        self.assertEqual(a.project_policy(self.repo)["assurance"], "reported")
+        (self.repo / "astraeus.toml").write_text('assurance = "strict"\n')
+        self.assertEqual(a.project_policy(self.repo)["assurance"], "strict")
         (self.repo / "sub").mkdir()
         with self.assertRaisesRegex(ValueError, "repository root"):
             a.project_policy(self.repo / "sub")
@@ -332,6 +341,16 @@ class BridgeTests(unittest.TestCase):
         self.assertTrue(result["requires_review"])
         self.assertEqual(result["paths"], ["sensitive.txt"])
         self.assertEqual(result["changed_paths"], ["ordinary.txt", "sensitive.txt"])
+
+    def test_bridges_reject_retired_limit_in_root_config(self):
+        (self.repo / "astraeus.toml").write_text("review_limit = 2\n")
+        for command in ("policy", "matches-review"):
+            result = subprocess.run([sys.executable, str(ROOT / "scripts/astraeus.py"), command,
+                                     "--repo", str(self.repo)], capture_output=True, text=True)
+            with self.subTest(command=command):
+                self.assertEqual(result.returncode, 2)
+                self.assertEqual(result.stdout, "")
+                self.assertIn("review_limit has been retired; remove it", result.stderr)
 
     def test_cli_is_json_and_does_not_offer_codex_maintenance(self):
         result = subprocess.run([sys.executable, str(ROOT / "scripts/astraeus.py"), "policy",

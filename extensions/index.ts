@@ -3,6 +3,7 @@ import { getAgentDir, parseFrontmatter, type ExtensionAPI } from '@earendil-work
 import { getSupportedThinkingLevels } from '@earendil-works/pi-ai';
 import { Workflow, ROOT, ENTRY } from './core.mjs';
 import { join } from 'node:path';
+import { realpathSync } from 'node:fs';
 
 const ops = ['start', 'status', 'delegate', 'collect', 'resume', 'stop', 'accept', 'invalidate'] as const;
 const parameters = Type.Object({
@@ -61,8 +62,8 @@ export default function (pi: ExtensionAPI) {
       content:`Apply ${join(ROOT, 'skills/pi-astraeus-orchestrate/SKILL.md')} to authorized project work. Simple tasks stay solo. Root owns scope and final acceptance. Use astraeus_workflow for managed consequential work, including when root implements directly (delegate is optional). Preserve project/user constraints and native Pi authentication. Never claim strict sandbox assurance. Current workflow state: ${JSON.stringify(state)}. Read-only role instructions are not OS isolation.`,
     }};
   });
-  pi.on('tool_call', (event) => {
-    const tasks = Object.values(workflow.tasks) as any[];
+  pi.on('tool_call', (event, ctx) => {
+    const tasks = (Object.values(workflow.tasks) as any[]).filter(task => task.cwd === realpathSync(ctx.cwd));
     const managed = tasks.some(t => !t.accepted);
     const internal = event.parentToolCallId && internalResume.get(event.parentToolCallId) === (event.input as any).resume;
     if (managed && ['Agent','SubagentWorkflow'].includes(event.toolName) && !internal) return {block:true,reason:'Use astraeus_workflow for tracked delegation and fresh review; native Agent resumption is routed internally.'};

@@ -78,7 +78,7 @@ for the adjudicator and `--review-receipt` for the reviewer, each with JSON shap
 The checker verifies consistency of supplied data; it cannot authenticate the receipt.
 Root must obtain it from the host, never fabricate it or accept child self-report.
 Do not collect extra telemetry merely to fill a receipt under reported assurance.
-Root also verifies the agents are distinct, the dispatch budgets were respected, and
+Root also verifies the agents are distinct and
 the target and original review are still current. No receipt proves those by itself.
 
 Pi uses `thinking` in its tool contract; validator receipt `effort` remains the stable
