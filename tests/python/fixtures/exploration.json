@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "task_id": "example",
+  "target_id": "example-snapshot",
+  "status": "complete",
+  "kind": "exploration",
+  "summary": "Located the refresh boundary.",
+  "locations": [
+    "scripts/astraeus.py:plugin_action"
+  ],
+  "findings": [
+    "Refresh checks that the installed source is this local checkout."
+  ],
+  "evidence": [
+    "Source mismatch raises before any write."
+  ],
+  "unresolved": []
+}

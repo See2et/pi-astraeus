@@ -1,0 +1,4 @@
+node_modules/
+.astraeus/
+__pycache__/
+*.pyc

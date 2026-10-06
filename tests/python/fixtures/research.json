@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "task_id": "example",
+  "target_id": "example-snapshot",
+  "status": "complete",
+  "kind": "research",
+  "summary": "CLI supports schema-constrained final responses.",
+  "conclusions": [
+    "codex exec supports --output-schema; native spawn must be assessed separately."
+  ],
+  "sources": [
+    {
+      "url": "https://learn.chatgpt.com/docs/non-interactive-mode",
+      "applicable_version": "CLI documentation checked 2026-09-16; local CLI 0.153.4",
+      "checked_date": "2026-09-16",
+      "support": "--output-schema requests a final response matching a JSON Schema."
+    }
+  ],
+  "uncertainties": [
+    "This does not establish schema enforcement for native subagents."
+  ]
+}

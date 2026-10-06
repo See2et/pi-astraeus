@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "kind": "adjudication",
+  "task_id": "example",
+  "target_id": "example-snapshot",
+  "status": "complete",
+  "summary": "Illustrative adjudication; not evidence for this repository.",
+  "verdict": "accept",
+  "review_sha256": "sha256:7d65f45a9ce6bb4742f5efe9bcb1ecb90f67e54dc0de0108c02fee015ad349c7",
+  "decisions": [
+    {
+      "ref": "suggestions/0",
+      "action": "reject",
+      "basis": "The requested task does not require this optional wording change.",
+      "evidence": "The example task scope contains no documentation-edit requirement.",
+      "rationale": "Leaving the optional wording unchanged does not block acceptance."
+    }
+  ],
+  "checked_scope": [
+    "Example fixture only"
+  ],
+  "evidence": [
+    "Example-only assertion demonstrating contract shape."
+  ],
+  "unresolved": []
+}

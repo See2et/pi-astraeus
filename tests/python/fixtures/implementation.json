@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "task_id": "example",
+  "target_id": "example-snapshot",
+  "status": "complete",
+  "kind": "implementation",
+  "summary": "Added source identity preflight.",
+  "changed_files": [
+    "scripts/astraeus.py"
+  ],
+  "checks": [
+    {
+      "command": "python -m unittest discover -s tests",
+      "outcome": "not_run",
+      "evidence": "Illustrative fixture, not a real test receipt."
+    }
+  ],
+  "remaining": [
+    "Run actual tests before acceptance."
+  ]
+}

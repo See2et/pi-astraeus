@@ -1,0 +1,40 @@
+{
+  "name": "@see2et/pi-astraeus",
+  "version": "0.1.0",
+  "description": "Astraeus policy and evidence-bound review workflow for Pi",
+  "type": "module",
+  "license": "MIT",
+  "private": true,
+  "repository": {
+    "type": "git",
+    "url": "git+ssh://git@github.com/See2et/pi-astraeus.git"
+  },
+  "keywords": [
+    "pi-package"
+  ],
+  "pi": {
+    "extensions": [
+      "./extensions/index.ts"
+    ],
+    "skills": [
+      "./skills"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  },
+  "scripts": {
+    "test": "node --test tests/*.test.mjs",
+    "typecheck": "tsc --noEmit",
+    "test:python": "python3 -m unittest discover -s tests/python -v"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-ai": "1.0.4",
+    "@earendil-works/pi-coding-agent": "1.0.4",
+    "@tintinweb/pi-subagents": "0.19.0",
+    "@types/node": "26.6.4",
+    "typescript": "7.0.2"
+  }
+}
