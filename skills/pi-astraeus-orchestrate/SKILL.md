@@ -28,20 +28,33 @@ concrete concern, limited to affected scope.
 
 ## Routing
 
-Choose capability first, then a supported thinking level. Preserve explicit model and
-thinking pins. Upstream preferences are GPT-6.1 Sol for root, GPT-6 Astra for deep
-independent or visual judgment, GPT-5.6 Sol for complex dependencies or costly errors,
-GPT-5.6 Terra for bounded ordinary judgment, and GPT-5.6 Luna for narrow easily checked
-work. GPT-6 Luna is not a default candidate. These are heuristics, not measured quota
-savings or guarantees. Maximum thinking on a smaller model does not replace capability.
+Choose capability first, then a supported thinking level. The automatic candidates are
+GPT-6.1 Sol (`gpt-6.1-sol`), GPT-6 Luna (`gpt-6-luna`), and GPT-6 Astra (`gpt-6-astra`):
 
+| Assignment | Preferred route |
+| --- | --- |
+| Root and ordinary worker | GPT-6.1 Sol medium; high for uncertain architecture, debugging, compatibility, concurrency, or costly errors. |
+| Independent reviewer/adjudicator | Fresh GPT-6.1 Sol high when warranted. Fresh sessions provide independence; a different model is not required. |
+| Narrow, easily checked work | GPT-6 Luna low/medium for localization, extraction, summarization, or explicit small edits with inexpensive objective checks. |
+| Demanding or visual judgment | GPT-6 Astra high for deep reasoning, unresolved conflicting evidence, important architecture/security questions, or rendered visual acceptance. |
+
+Keep ambiguous product/design decisions and high-impact acceptance off the cheap route.
+Choose a stronger model upfront when warranted; there is no mandatory cheap-first ladder.
+These are heuristics informed by the [adopted routing assessment](../../references/routing-proposal.md),
+not measured quota savings or quality guarantees. Maximum thinking on a smaller model
+does not replace capability. Only use thinking levels actually supported by Pi for the
+exact selected model; do not clamp a requested level or silently change it.
+
+Preserve exact explicit model/provider/thinking pins. Older GPT models, including
+GPT-5.5, GPT-5.6 variants, and GPT-6 Sol, are excluded from automatic defaults but may
+be authorized by project `astraeus.toml` `allowed_models` for explicit pins or measured
+compatibility/latency exceptions. The saved Pi default is separately managed; this
+package does not change it or claim to switch an already running root session.
 Use actual Pi catalog entries and exact provider/model IDs at dispatch. Documentation
-or an allowlist does not prove availability. The current user's `openai/gpt-5.5` setup
-is explicitly authorized and included in this port's defaults; it does not establish
-Astra availability or judgment. If a preferred/pinned model is unavailable, disclose it
-and obtain authorized configuration instead of substituting silently. Never change
-authentication, billing routes, or use another inference CLI to recover. Explain material
-routing changes. A root preference is not a runtime switch; never claim an unobserved one.
+or an allowlist does not prove availability. If a preferred/pinned model is unavailable,
+disclose it and obtain authorized configuration instead of substituting silently.
+Never change authentication, billing routes, or use another inference CLI to recover.
+Explain material routing changes. A root preference is not a runtime switch.
 
 Only an explicit user request permits Pi-native Claude design direction and directly
 related UI implementation. Read [Claude design delegation](../../references/claude-design.md)

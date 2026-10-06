@@ -6,8 +6,7 @@ cannot guarantee that the host will always obey policy or load all instructions.
 
 Project `astraeus.toml` is optional. Read only the file at the working project root.
 Validate via `python3 <package>/scripts/astraeus.py doctor --config astraeus.toml`.
-Defaults: the five upstream model candidates (including preferred GPT-6.1 Sol root),
-plus `openai/gpt-5.5` for the user-authorized current Pi setup; no additional mandatory
+Defaults: GPT-6.1 Sol, GPT-6 Luna, and GPT-6 Astra; no additional mandatory
 paths; assurance=reported. Reviews and adjudications have no fixed total count limit.
 The former `review_limit` setting is retired; remove it from existing project configs.
 Allowed model IDs are restrictions, not proof of availability.
@@ -41,9 +40,10 @@ Workers retain implementation and ordinary verification. Reviewers and adjudicat
 start fresh without implementation conversation and must not edit via any tool.
 Use the actual Pi model catalog and supported thinking capabilities. Always dispatch
 an exact provider/model ID; a bare ID in allowed_models is a restriction, not permission
-to invent a provider. If upstream preferences are unavailable, obtain an authorized
-model pin or project policy; never silently substitute models. The current setup's
-`openai/gpt-5.5` is explicitly authorized, not an assertion that it provides Astra judgment.
+to invent a provider. If preferred routes are unavailable, obtain an authorized
+model pin or project policy; never silently substitute models. Legacy GPT pins remain
+valid when explicitly authorized by project `allowed_models`; they are excluded from
+automatic defaults. Fresh same-model review remains independent.
 No external inference CLI, alternate authentication engine, or charging fallback.
 Pi's current child runner does not enforce a read-only sandbox. Strict assurance must
 stop before review/adjudication; reported assurance may proceed with clear disclosure.

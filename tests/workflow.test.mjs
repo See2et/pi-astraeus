@@ -8,7 +8,7 @@ import { parseFrontmatter } from '@earendil-works/pi-coding-agent';
 import { Workflow, ROOT, ENTRY, exactModel, hash, rpc, parseReport } from '../extensions/core.mjs';
 
 const CLAUDE = {provider:'anthropic',id:'claude-opus-5-5',reasoning:true};
-const MODEL = {provider:'openai',id:'gpt-5.5',reasoning:true};
+const MODEL = {provider:'openai',id:'gpt-6.1-sol',reasoning:true};
 class Bus {
   handlers = new Map();
   on(name, fn) { const values = this.handlers.get(name) || new Set(); values.add(fn); this.handlers.set(name,values); return () => values.delete(fn); }
@@ -39,18 +39,35 @@ async function fixture(t) {
   }};
   const workflow=new Workflow(host); const act=p=>workflow.execute({task_id:'task',...p},ctx);
   await act({op:'start',requirements:'Preserve existing behavior',acceptance:'Actual local verification passes'});
-  const delegate=(role,extra={})=>act({op:'delegate',role,model:'openai/gpt-5.5',thinking:'high',prompt:'Inspect assigned behavior',...extra});
+  const delegate=(role,extra={})=>act({op:'delegate',role,model:'openai/gpt-6.1-sol',thinking:'high',prompt:'Inspect assigned behavior',...extra});
   const report=job=>({schema_version:1,kind:'review',task_id:'task',target_id:job.target_id,status:'complete',summary:'Verified source',verdict:'pass',violations:[],bugs:[],suggestions:[],checked_scope:['source.txt'],evidence:['Inspected source.txt'],unresolved:[]});
   const complete=(job,data)=>Object.assign(records.get(job.agent_id),{status:'completed',result:typeof data==='string'?data:JSON.stringify(data)});
   return {cwd,agentDir,workflow,ctx,act,delegate,report,complete,records,host};
 }
 
 test('exact model selection rejects fuzzy names, unavailable routes and prohibited models',()=>{
-  const registry={getAvailable:()=>[MODEL]}; const policy={allowed_models:['gpt-5.5']};
-  assert.equal(exactModel(registry,'openai/gpt-5.5',policy),MODEL);
-  assert.throws(()=>exactModel(registry,'gpt-5.5',policy),/exact/);
-  assert.throws(()=>exactModel(registry,'other/gpt-5.5',policy),/Unavailable/);
-  assert.throws(()=>exactModel(registry,'openai/gpt-5.5',{allowed_models:['other']}),/prohibited/);
+  const registry={getAvailable:()=>[MODEL]}; const policy={allowed_models:['gpt-6.1-sol']};
+  assert.equal(exactModel(registry,'openai/gpt-6.1-sol',policy),MODEL);
+  assert.throws(()=>exactModel(registry,'gpt-6.1-sol',policy),/exact/);
+  assert.throws(()=>exactModel(registry,'other/gpt-6.1-sol',policy),/Unavailable/);
+  assert.throws(()=>exactModel(registry,'openai/gpt-6.1-sol',{allowed_models:['other']}),/prohibited/);
+});
+test('legacy pin requires explicit policy and unavailable pin never substitutes a default',async t=>{
+  const f=await fixture(t);
+  const legacy={provider:'openai',id:'gpt-5.5',reasoning:true};
+  const policy=await f.workflow.policy(f.ctx);
+  const registry={getAvailable:()=>[MODEL,legacy]};
+  assert.throws(()=>exactModel(registry,'openai/gpt-5.5',policy),/prohibited/);
+  await writeFile(join(f.cwd,'astraeus.toml'),'allowed_models = ["openai/gpt-5.5"]\n');
+  const explicit=await f.workflow.policy(f.ctx);
+  assert.equal(exactModel(registry,'openai/gpt-5.5',explicit),legacy);
+  f.ctx.modelRegistry=registry;
+  const job=await f.delegate('worker',{model:'openai/gpt-5.5',thinking:'medium'});
+  assert.equal(f.records.get(job.agent_id).session.model,legacy);
+  assert.equal(f.records.get(job.agent_id).session.thinkingLevel,'medium');
+  f.complete(job,'Verified explicitly pinned legacy route');
+  assert.equal((await f.act({op:'collect',run_id:job.run_id})).valid,true);
+  assert.throws(()=>exactModel({getAvailable:()=>[MODEL]},'openai/gpt-5.5',explicit),/Unavailable/);
 });
 test('RPC times out and removes its reply listener',async()=>{
   const bus=new Bus(); await assert.rejects(rpc(bus,'ping',{},5),/timed out/);
@@ -150,9 +167,9 @@ test('review freezing and writer ownership apply across tasks in the same reposi
   const f=await fixture(t);
   await f.act({op:'start',task_id:'other',requirements:'Second bounded task',acceptance:'Verified'});
   const review=await f.delegate('reviewer');
-  await assert.rejects(f.act({op:'delegate',task_id:'other',role:'worker',model:'openai/gpt-5.5',thinking:'high',prompt:'Write source',owned_paths:['.']}),/no writes during review/);
+  await assert.rejects(f.act({op:'delegate',task_id:'other',role:'worker',model:'openai/gpt-6.1-sol',thinking:'high',prompt:'Write source',owned_paths:['.']}),/no writes during review/);
   f.complete(review,f.report(review)); await f.act({op:'collect',run_id:review.run_id});
-  const worker=await f.act({op:'delegate',task_id:'other',role:'worker',model:'openai/gpt-5.5',thinking:'high',prompt:'Implement src',owned_paths:['./src/']});
+  const worker=await f.act({op:'delegate',task_id:'other',role:'worker',model:'openai/gpt-6.1-sol',thinking:'high',prompt:'Implement src',owned_paths:['./src/']});
   await assert.rejects(f.delegate('worker',{owned_paths:['src/a']}),/disjoint/);
   f.complete(worker,'Implemented and verified'); await f.act({op:'collect',task_id:'other',run_id:worker.run_id});
   const active=await f.delegate('reviewer');
@@ -204,7 +221,7 @@ test('managed work in unrelated repositories remains independent',async t=>{
   const cwd=join(f.agentDir,'other-repository'); await mkdir(cwd); execFileSync('git',['init','-q'],{cwd});
   const ctx={...f.ctx,cwd};
   await f.workflow.execute({op:'start',task_id:'independent',requirements:'Other repository',acceptance:'Verified'},ctx);
-  const worker=await f.workflow.execute({op:'delegate',task_id:'independent',role:'worker',model:'openai/gpt-5.5',thinking:'high',prompt:'Bounded independent work',owned_paths:['.']},ctx);
+  const worker=await f.workflow.execute({op:'delegate',task_id:'independent',role:'worker',model:'openai/gpt-6.1-sol',thinking:'high',prompt:'Bounded independent work',owned_paths:['.']},ctx);
   assert.equal(worker.role,'worker'); assert.equal(worker.status,'running');
 });
 

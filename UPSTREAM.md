@@ -12,10 +12,12 @@ are derived from upstream examples/tests in the editable checkout at
 
 Pi adaptations remove Codex activation and plugin maintenance commands, add read-only
 `policy --repo` and `matches-review --repo` bridge commands, replace host-specific
-routing guidance and skill names, and integrate Pi workflow delegation. The original
-preferred model list is retained, with exact `openai/gpt-5.5` added for the user's
-explicitly authorized current Pi setup. This addition is not a silent fallback or
-proof that upstream preferred models are available through Pi. Pi dispatch uses the
+routing guidance and skill names, and integrate Pi workflow delegation. The upstream
+model list is replaced by the user's adopted 2026-10-06 routing policy: GPT-6.1 Sol,
+GPT-6 Luna, and GPT-6 Astra. Older GPT candidates are excluded from automatic defaults;
+exact legacy pins remain available through explicit project `allowed_models`. The
+researched rates and adoption status are recorded in `references/routing-proposal.md`.
+This policy change does not alter Pi settings or authentication. Pi dispatch uses the
 actual catalog and exact provider/model IDs; strict assurance remains blocked until
 real sandbox evidence exists. The retired `review_limit` is rejected with a migration message; reviews and
 adjudications have no fixed dispatch count cap. No installation or activation side effects are part

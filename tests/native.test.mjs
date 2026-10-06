@@ -42,7 +42,7 @@ test('Pi 1.0.4 loads both factories and runs real fresh/reused children with onl
   await loader.reload();
   assert.deepEqual(loader.getExtensions().errors,[]);
   assert.deepEqual(loader.getSkills().skills.map(s=>s.name).filter(n=>n.startsWith('pi-astraeus-')).sort(),['pi-astraeus-adjudicate','pi-astraeus-orchestrate','pi-astraeus-review']);
-  const model=runtime.getModel('openai','gpt-5.5'); assert.ok(model);
+  const model=runtime.getModel('openai','gpt-6.1-sol'); assert.ok(model);
   const sessionManager=SessionManager.inMemory(cwd);
   const {session}=await createAgentSession({cwd,agentDir,modelRuntime:runtime,model,settingsManager:settings,sessionManager,resourceLoader:loader});
   try {

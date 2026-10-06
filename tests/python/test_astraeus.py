@@ -240,10 +240,18 @@ class ContractTests(unittest.TestCase):
 
 
 class PolicyTests(unittest.TestCase):
-    def test_defaults_include_authorized_pi_model(self):
+    def test_defaults_are_adopted_automatic_candidates(self):
         self.assertEqual(a.policy(), a.DEFAULTS)
-        self.assertIn("openai/gpt-5.5", a.DEFAULTS["allowed_models"])
+        self.assertEqual(a.policy()["allowed_models"],
+                         ["gpt-6.1-sol", "gpt-6-luna", "gpt-6-astra"])
         self.assertNotIn("review_limit", a.policy())
+
+    def test_explicit_legacy_policy_preserves_exact_provider_pin(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / "astraeus.toml"
+            p.write_text('allowed_models = ["openai/gpt-5.5", "openai/gpt-5.6-sol"]\n')
+            self.assertEqual(a.policy(p)["allowed_models"],
+                             ["openai/gpt-5.5", "openai/gpt-5.6-sol"])
 
     def test_invalid_settings(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -1,12 +1,14 @@
-# Routing proposal — 2026-10-06
+# Adopted routing policy — 2026-10-06
 
-This is a researched proposal, not an applied default or a change to the user's Pi
-settings. Preserve explicit model/provider/thinking pins. The actual local Pi saved
-selection initially observed on this date was `openai/gpt-5.5`. The user subsequently
+The user adopted this researched routing policy on 2026-10-06. This package now uses
+GPT-6.1 Sol, GPT-6 Luna and GPT-6 Astra as its automatic candidates; older GPT routes
+require explicit project authorization. Adoption changes policy defaults and guidance,
+not Pi settings or authentication. Preserve explicit model/provider/thinking pins.
+The actual local Pi saved selection initially observed on this date was `openai/gpt-5.5`. The user subsequently
 authorized setting the saved default to `openai/gpt-6.1-sol` with `medium` thinking;
 that settings change was verified while preserving every unrelated setting. An
 already running session is not claimed to have switched models. Pi's offline catalog lists all three
-proposed GPT-6 IDs and `anthropic/claude-opus-5-5`; catalog presence does not establish
+adopted GPT-6 IDs and `anthropic/claude-opus-5-5`; catalog presence does not establish
 account access, quota, provider readiness, or the billing route.
 
 ## Verified rates relevant to the current routing pool
@@ -58,7 +60,7 @@ Long-context premiums, speed modes, tool charges and regional processing may cha
 actual API cost. Reasoning tokens, extra turns and correction work change task totals;
 per-token dominance is not a measured quality/latency dominance.
 
-## Proposed policy
+## Adopted policy
 
 - Root: GPT-6.1 Sol medium; high for uncertain architecture, difficult coordination or
   costly errors. Do tightly coupled/simple work at root rather than spawning by ritual.
@@ -77,7 +79,8 @@ per-token dominance is not a measured quality/latency dominance.
   adjudication and final acceptance. User choices and actual functional constraints
   outrank every model's taste. No design request means no automatic Anthropic dispatch.
 - Older GPT models: keep exact user pins and measured compatibility/latency exceptions;
-  remove them from normal automatic candidates if this proposal is adopted. No silent
+  exclude them from normal automatic candidates. Authorize exact legacy routes through
+  project `astraeus.toml` `allowed_models`. No silent
   substitution if a selected provider/model is unavailable or a quota is exhausted.
 
 These are recommendations inferred from documented capability categories and rates,

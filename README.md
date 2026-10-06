@@ -113,13 +113,18 @@ ownership and target checks are scheduling/evidence checks. See
 
 Only the current Git root's `astraeus.toml` is read. Keys preserve Astraeus's format:
 `schema_version`, `allowed_models`, `require_review_globs`, `assurance`.
-The upstream model preferences remain; this user's current `openai/gpt-5.5` is also
-explicitly authorized in the port's defaults. A bare ID in the allowlist restricts
-IDs; it never chooses a provider. Actual dispatch always requires an exact available
-provider/model and thinking level. No fuzzy matching, effort clamping, provider
+Automatic candidates are GPT-6.1 Sol for root, ordinary workers and fresh independent
+reviewers/adjudicators; GPT-6 Luna for narrow work with cheap objective checks; and
+GPT-6 Astra for demanding reasoning or visual judgment. Select capability upfront,
+without a mandatory cheap-first ladder. Fresh same-model review is independent.
+See the [adopted routing assessment](references/routing-proposal.md) for dated rates,
+supported thinking guidance and verification limits. Older GPT models are excluded
+from defaults; preserve explicitly authorized legacy pins through project
+`allowed_models`. A bare ID restricts IDs; it never chooses a provider. Actual dispatch
+always requires an exact available provider/model and thinking level. No fuzzy matching, effort clamping, provider
 substitution, API charging fallback, or account changes are used to recover.
 
-Example for an explicitly selected local policy:
+Example preserving an explicitly selected legacy pin (no automatic fallback):
 
 ```toml
 schema_version = 1
