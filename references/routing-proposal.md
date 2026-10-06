@@ -53,7 +53,7 @@ cached input, so use it for difficult judgment rather than every independent rev
 Luna 6 costs 1/20 Sol 6.1 for noncached input/output and 1/10 cached input. GPT-5.5 costs
 2.5x noncached input, 5x cached input and 3x output compared with 6.1 Sol.
 
-API cache writes are an additional 1.25x uncached input rate for the GPT-6 models.
+API cache-write tokens are billed at 1.25x the uncached input rate for the GPT-6 models.
 Long-context premiums, speed modes, tool charges and regional processing may change
 actual API cost. Reasoning tokens, extra turns and correction work change task totals;
 per-token dominance is not a measured quality/latency dominance.
