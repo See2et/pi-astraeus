@@ -9,7 +9,7 @@ This package does not implement authentication, a model runtime, or an OS sandbo
 - Three skills: `pi-astraeus-orchestrate`, `pi-astraeus-review`, `pi-astraeus-adjudicate`.
 - One extension: `astraeus_workflow` tool, `/astraeus` diagnostics, startup guidance,
   target-freeze hooks, branch-aware workflow state and status display.
-- Three agent definitions with no model/thinking pins. Worker owns implementation
+- Four agent definitions with no model/thinking pins. Worker/designer owns implementation
   and ordinary verification; reviewer/adjudicator have only `read,grep,find,ls`.
 - Upstream Astraeus schemas and Python validator, with provenance in `UPSTREAM.md`.
 
@@ -24,12 +24,13 @@ provides Python with `jsonschema`, and Home Manager installs exactly these files
 
 ```
 ~/.pi/agent/agents/astraeus-worker.md
+~/.pi/agent/agents/astraeus-designer.md
 ~/.pi/agent/agents/astraeus-reviewer.md
 ~/.pi/agent/agents/astraeus-adjudicator.md
 ```
 
 Outside Nix: install Tintinweb pi-subagents, provide Python 3.11+ with jsonschema 4.x,
-copy the three bundled definitions into `$PI_CODING_AGENT_DIR/agents` (default
+copy the four bundled definitions into `$PI_CODING_AGENT_DIR/agents` (default
 `~/.pi/agent/agents`), then load this root with `pi -e /path/to/pi-astraeus`.
 Use `PI_ASTRAEUS_PYTHON` only to select a preinstalled Python interpreter.
 Do not overwrite existing customized definitions without inspecting them.
@@ -48,9 +49,10 @@ status to one task. Root uses the model-only `astraeus_workflow` tool as follows
 | Operation | Required fields / behavior |
 |---|---|
 | `start` | `task_id`, `requirements`, `acceptance`; include constraints/non-goals/preserved contracts in `constraints`. `consequential` defaults true. Git repository root required. |
-| `delegate` | `task_id`, `role`, exact `model` provider/id, supported `thinking`, bounded `prompt`; worker `owned_paths` are literal relative paths, default `.`. |
+| `authorize_design` | `task_id`, original explicit user quote in `design_request`, bounded `design_scope`; record once for an existing task. The same optional fields may be included at `start`. |
+| `delegate` | `task_id`, `role`, exact `model` provider/id, supported `thinking`, bounded `prompt`; worker/designer `owned_paths` are literal relative paths, default `.`. |
 | `collect` | `task_id`, `run_id`; reports running promptly, validates settled outcomes. No repeated tight polling. |
-| `resume` | `task_id`, original worker `run_id`, follow-up `prompt`; uses native Agent continuation, never resumes a reviewer/adjudicator. |
+| `resume` | `task_id`, original worker/designer `run_id`, follow-up `prompt`; uses native Agent continuation, never resumes a reviewer/adjudicator. |
 | `stop` | `task_id`, `run_id`; stops only this managed child, then collect its incomplete outcome. |
 | `status` | Optional `task_id`; checks current target and restores explicit incomplete states. |
 | `invalidate` | `task_id`; marks the reviewed target stale before new work. Does not waive pending children. |
@@ -76,11 +78,36 @@ implementation + ordinary verification (same owner)
      inconclusive     -> obtain bounded missing evidence -> fresh review
 ```
 
-Worker output is concise prose describing actual changes and checks. Reviewer and
+Worker/designer output is concise prose describing actual changes and checks. Reviewer and
 adjudicator output is exactly one JSON object (one JSON fence is tolerated), matching
 the supplied schema. Children cannot write report artifacts through their readonly
 tools; root captures and validates returned bytes. Failed, malformed, interrupted or
 stale results stay incomplete. No fixed review-attempt cap is imposed.
+
+## Explicit Claude design request
+
+After the user explicitly requests Claude for design, root records `design_request`
+with the original user quote and `design_scope` as `design-direction`,
+`ui-implementation` (directly related UI work), or
+`design-direction-and-ui-implementation`. Then delegate role `designer`, exact
+`anthropic/claude-opus-5-5`, supported thinking, and the matching `design_scope`.
+No other Anthropic model or provider fallback is launched; regular worker/reviewer/
+adjudicator routes reject Anthropic even if allowlisted. This is a scoped exception
+outside regular GPT allowed_models, not a global model policy expansion.
+
+The quote is root-reported, not authenticated user consent; scope labels cannot
+semantically guarantee a prompt is in scope. Root checks the real request and each
+assignment. Authorization persists only for the same task and its bounded fixes.
+Opus owns discovery, design, related UI implementation, verification and adopted
+fixes; `resume` continues that same owner. GPT performs fresh independent review,
+adjudication and final acceptance, respecting Opus design choices unless a user
+requirement or functional constraint requires change.
+
+This path uses Pi's native Anthropic provider and existing authentication through
+Tintinweb, with the same repository as other writers. It does not invoke Claude Code,
+create a linked worktree or provide CLI snapshot/ownership isolation. Managed disjoint
+ownership and target checks are scheduling/evidence checks. See
+[Claude design delegation](references/claude-design.md) for exact boundaries.
 
 ## Policy and evidence
 
@@ -140,6 +167,7 @@ uv run --with 'jsonschema>=4.23,<5' python -c 'import os,subprocess,sys; os.envi
 Tests cover target invalidation, schema/hash binding, verdict transitions, fallback
 rejection, role overrides, writer ownership and branch recovery. The native test loads
 both real extension factories with Pi 1.0.4 and exercises real child sessions using a
-local deterministic provider. It never calls an external inference service or reads
+local deterministic provider, including a stub exact Anthropic designer route and
+same-owner continuation. It never calls an external inference service or reads
 personal auth. Set `PI_ASTRAEUS_SUBAGENTS` to a built/pinned Tintinweb package root to
 qualify that exact source instead of the locked development npm package.

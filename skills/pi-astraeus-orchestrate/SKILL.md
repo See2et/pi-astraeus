@@ -43,7 +43,16 @@ and obtain authorized configuration instead of substituting silently. Never chan
 authentication, billing routes, or use another inference CLI to recover. Explain material
 routing changes. A root preference is not a runtime switch; never claim an unobserved one.
 
-Prioritize Astra for design direction and visual acceptance. When appearance matters,
+Only an explicit user request permits Pi-native Claude design direction and directly
+related UI implementation. Read [Claude design delegation](../../references/claude-design.md)
+before dispatch: record the original quote and scope once, use exact
+`anthropic/claude-opus-5-5` with role `designer`, and keep follow-up fixes with that
+owner in the same task. General implementation, review, adjudication and acceptance
+stay on GPT. This exception uses Pi authentication, not a Claude Code CLI bridge.
+
+Prioritize Astra for design direction and visual acceptance. For an authorized Claude
+task, Opus owns design choices; GPT review assesses brief and function without
+replacing its composition, typography, color or motion preferences. When appearance matters,
 Astra must inspect rendered artifacts and relevant viewports/pages. A source review or
 implementation report is not visual acceptance. Combine visual and independent review
 when scopes fit. If Astra or visual access is unavailable, report the missing check.
@@ -51,7 +60,7 @@ when scopes fit. If Astra or visual access is unavailable, report the missing ch
 ## Handoff and acceptance
 
 Use `astraeus_workflow` operations `start`, `status`, `delegate`, `collect`, `accept`,
-and `invalidate`. Delegate with role `worker`, `reviewer`, or `adjudicator`, task ID,
+and `invalidate`. Delegate with role `worker`, explicitly authorized `designer`, `reviewer`, or `adjudicator`, task ID,
 exact model, supported thinking value, and bounded prompt. Announce requested model/thinking
 and one-line reason first. Supply goal, ownership, constraints, acceptance evidence, and
 useful output contract. Give children fresh context by default. Reviews and adjudications

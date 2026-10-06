@@ -7,7 +7,20 @@ import { fileURLToPath } from 'node:url';
 
 export const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 export const ENTRY = 'pi-astraeus:state-v1';
-export const ROLES = ['worker', 'reviewer', 'adjudicator'];
+export const ROLES = ['worker', 'designer', 'reviewer', 'adjudicator'];
+export const isWriter = role => role === 'worker' || role === 'designer';
+export const DESIGN_MODEL = 'anthropic/claude-opus-5-5';
+export const DESIGN_SCOPES = ['design-direction', 'ui-implementation', 'design-direction-and-ui-implementation'];
+export function designAuthorization(p) {
+  if (!p.design_request?.trim() || !DESIGN_SCOPES.includes(p.design_scope)) throw new Error('Explicit design_request original user quote and a bounded design_scope are required.');
+  return { request:p.design_request.trim(), scope:p.design_scope, source:'root-reported user request; not authenticated user consent' };
+}
+export function designModel(registry, value) {
+  if (value !== DESIGN_MODEL) throw new Error(`Designer requires exact ${DESIGN_MODEL}; no lower-family or provider fallback.`);
+  const model = registry.getAvailable().find(m => `${m.provider}/${m.id}` === value);
+  if (!model) throw new Error(`Unavailable authorized model: ${value}. No fallback was launched.`);
+  return model;
+}
 const ACTIVE = new Set(['running', 'queued']);
 export const hash = text => 'sha256:' + createHash('sha256').update(text).digest('hex');
 export function parseReport(text) {
@@ -20,6 +33,7 @@ export function exactModel(registry, value, policy) {
   if (typeof value !== 'string' || !value.includes('/')) throw new Error('Use an exact provider/model ID; fuzzy model selection is disabled.');
   const model = registry.getAvailable().find(m => `${m.provider}/${m.id}` === value);
   if (!model) throw new Error(`Unavailable authorized model: ${value}. No fallback was launched.`);
+  if (model.provider === 'anthropic') throw new Error('Anthropic is reserved for explicitly authorized designer scope, never general worker/reviewer/adjudicator routing.');
   if (!policy.allowed_models.some(id => id === value || id === model.id)) throw new Error(`Model prohibited by astraeus.toml: ${value}`);
   return model;
 }
@@ -168,10 +182,15 @@ export class Workflow {
       if (this.tasks[p.task_id]) throw new Error('Task already exists; use status/resume rather than replacing history.');
       if (!p.requirements?.trim() || !p.acceptance?.trim()) throw new Error('start requires requirements and acceptance conditions.');
       await this.policy(ctx); await this.target(ctx);
-      const task = { task_id: p.task_id, cwd: await realpath(ctx.cwd), requirements: p.requirements, acceptance: p.acceptance, constraints: p.constraints || '', consequential: p.consequential !== false, phase: 'implementation', jobs: [], target_id: null, accepted: false };
+      const design_authorization = p.design_request !== undefined || p.design_scope !== undefined ? designAuthorization(p) : null;
+      const task = { design_authorization, task_id: p.task_id, cwd: await realpath(ctx.cwd), requirements: p.requirements, acceptance: p.acceptance, constraints: p.constraints || '', consequential: p.consequential !== false, phase: 'implementation', jobs: [], target_id: null, accepted: false };
       this.tasks[p.task_id] = task; this.save(ctx); return task;
     }
     const task = this.task(p.task_id, ctx);
+    if (p.op === 'authorize_design') {
+      if (task.design_authorization) throw new Error('Design authorization is already recorded for this task; do not replace its scope.');
+      task.design_authorization = designAuthorization(p); this.save(ctx); return task;
+    }
     if (p.op === 'invalidate') {
       task.phase = 'stale'; task.accepted = false; task.target_id = null; this.save(ctx); return task;
     }
@@ -186,7 +205,7 @@ export class Workflow {
     if (p.op === 'resume') return this.resume(task, job, p, ctx, signal);
     if (p.op === 'accept') {
       if (task.jobs.some(j => !j.collected || ACTIVE.has(this.manager()?.getRecord(j.agent_id)?.status ?? j.status))) throw new Error('Collect every managed result before acceptance.');
-      const latestWorkers = new Map(task.jobs.filter(j => j.role === 'worker').map(j => [j.agent_id, j]));
+      const latestWorkers = new Map(task.jobs.filter(j => isWriter(j.role)).map(j => [j.agent_id, j]));
       if ([...latestWorkers.values()].some(j => !j.valid)) throw new Error('Implementation owner has unresolved failed or incomplete work.');
       const matches = JSON.parse(await this.bridge(['matches-review', '--repo', ctx.cwd], ctx));
       const existingReview = [...task.jobs].reverse().find(j => j.role === 'reviewer');
@@ -212,8 +231,9 @@ export class Workflow {
     const role = p.role;
     if (!ROLES.includes(role) || !p.prompt?.trim()) throw new Error('delegate requires role and a bounded prompt.');
     const policy = await this.policy(ctx);
-    if (role !== 'worker' && policy.assurance === 'strict') throw new Error('strict review requires verified OS read-only sandbox; Pi/Tintinweb does not supply that receipt. No review launched.');
-    const model = exactModel(ctx.modelRegistry, p.model, policy);
+    if (!isWriter(role) && policy.assurance === 'strict') throw new Error('strict review requires verified OS read-only sandbox; Pi/Tintinweb does not supply that receipt. No review launched.');
+    if (role === 'designer' && (!task.design_authorization || p.design_scope !== task.design_authorization.scope)) throw new Error('Designer requires recorded explicit design authorization and matching design_scope.');
+    const model = role === 'designer' ? designModel(ctx.modelRegistry, p.model) : exactModel(ctx.modelRegistry, p.model, policy);
     if (!p.thinking) throw new Error('Specify thinking explicitly.');
     const levels = this.host.supportedThinking(model);
     if (!levels.includes(p.thinking)) throw new Error(`Unsupported thinking ${p.thinking}; available: ${levels.join(', ')}. No clamping allowed.`);
@@ -222,8 +242,8 @@ export class Workflow {
     if (ping?.version !== 2) throw new Error('Unsupported Tintinweb RPC version');
     const currentTarget = await this.target(ctx);
     const running = this.activeJobs(task.cwd);
-    if (role !== 'worker' && running.length) throw new Error('Freeze writers and collect outstanding work before review/adjudication.');
-    if (role !== 'worker' && task.jobs.some(j => !j.collected)) throw new Error('Collect existing runs first.');
+    if (!isWriter(role) && running.length) throw new Error('Freeze writers and collect outstanding work before review/adjudication.');
+    if (!isWriter(role) && task.jobs.some(j => !j.collected)) throw new Error('Collect existing runs first.');
     let review;
     if (role === 'adjudicator') {
       review = [...task.jobs].reverse().find(j => j.role === 'reviewer');
@@ -235,22 +255,24 @@ export class Workflow {
     if (!owned.length) throw new Error('owned_paths must identify at least one owned path.');
     if (owned.some(x => !x || x.startsWith('/') || x.split('/').includes('..') || x.includes('*'))) throw new Error('owned_paths must be literal repository-relative paths (or .), no globs.');
     owned = owned.map(path => posix.normalize(path).replace(/\/+$/, '') || '.');
-    if (role === 'worker') {
-      if (running.some(j => j.role !== 'worker' || overlapping(owned, j.owned_paths))) throw new Error('Concurrent writers need disjoint ownership; no writes during review.');
-      if (task.jobs.some(j => j.role === 'worker' && j.collected)) throw new Error('Resume the original implementation owner; do not replace it for fixes.');
+    if (isWriter(role)) {
+      if (running.some(j => !isWriter(j.role) || overlapping(owned, j.owned_paths))) throw new Error('Concurrent writers need disjoint ownership; no writes during review.');
+      if (task.jobs.some(j => isWriter(j.role) && j.collected)) throw new Error('Resume the original implementation owner; do not replace it for fixes.');
       task.target_id = null; task.accepted = false;
     } else task.target_id = currentTarget;
     const run_id = randomUUID();
     const job = { run_id, role, agent_id: null, status: 'queued', collected: false, valid: false, owned_paths: owned, requested: {model:p.model, effort:p.thinking}, review_run: review?.run_id ?? null, target_id: task.target_id };
-    task.jobs.push(job); task.accepted = false; task.phase = role === 'worker' ? 'implementation' : role === 'reviewer' ? 'review' : 'adjudication'; this.save(ctx);
-    const policyText = await readFile(join(this.root, 'skills', `pi-astraeus-${role === 'worker' ? 'orchestrate' : role === 'reviewer' ? 'review' : 'adjudicate'}`, 'SKILL.md'), 'utf8');
-    const contract = role !== 'worker' ? await readFile(join(this.root, 'schemas', `${role === 'reviewer' ? 'review' : 'adjudication'}.json`), 'utf8') : '';
+    task.jobs.push(job); task.accepted = false; task.phase = isWriter(role) ? 'implementation' : role === 'reviewer' ? 'review' : 'adjudication'; this.save(ctx);
+    const designText = task.design_authorization ? await readFile(join(this.root, 'references/claude-design.md'), 'utf8') : '';
+    const policyText = await readFile(join(this.root, 'skills', `pi-astraeus-${isWriter(role) ? 'orchestrate' : role === 'reviewer' ? 'review' : 'adjudicate'}`, 'SKILL.md'), 'utf8');
+    const contract = !isWriter(role) ? await readFile(join(this.root, 'schemas', `${role === 'reviewer' ? 'review' : 'adjudication'}.json`), 'utf8') : '';
     const prompt = [
       `Task ${task.task_id}. Role ${role}. Work only on assigned scope; no child delegation.`,
       `Requirements:\n${task.requirements}\nAcceptance conditions:\n${task.acceptance}\nConstraints/non-goals/preserved contracts:\n${task.constraints}`,
+      task.design_authorization ? `Design authorization (root-reported, not authenticated): ${JSON.stringify(task.design_authorization)}\nDesign handoff policy:\n${designText}` : '',
       `Assignment:\n${p.prompt}\nOwned paths:\n${owned.join('\n')}`,
       `Role policy:\n${policyText}\nRead relevant references under ${join(this.root, 'references')} when needed.`,
-      role !== 'worker' ? `Stable target_id: ${task.target_id}. task_id: ${task.task_id}. Reported assurance: built-in read-only tools only, no OS sandbox or generation-time schema guarantee. Return exactly one JSON object matching this schema, no additional prose:\n${contract}` : 'Return actual edits, verification outcomes and remaining issues. Keep implementation and ordinary verification together.',
+      !isWriter(role) ? `Stable target_id: ${task.target_id}. task_id: ${task.task_id}. Reported assurance: built-in read-only tools only, no OS sandbox or generation-time schema guarantee. Return exactly one JSON object matching this schema, no additional prose:\n${contract}` : 'Return actual edits, verification outcomes and remaining issues. Keep implementation and ordinary verification together.',
       review ? `Original review bytes:\n${await readFile(review.artifact, 'utf8')}\nreview_sha256: ${review.result_hash}` : '',
     ].filter(Boolean).join('\n\n');
     try {
@@ -278,7 +300,7 @@ export class Workflow {
       const receiptBytes = JSON.stringify(receipt, null, 2);
       await writeFile(job.receipt_path, receiptBytes, { mode:0o600 }); job.receipt_hash = hash(receiptBytes);
       if (record.status !== 'completed') throw new Error(`Child ${record.status}: ${record.error || 'incomplete output'}`);
-      if (job.role === 'worker') {
+      if (isWriter(job.role)) {
         job.summary = record.result || ''; job.valid = true; task.phase = 'verification'; task.target_id = null;
       } else {
         if (await this.target(ctx) !== job.target_id || task.target_id !== job.target_id) throw new Error('Review target changed while child was running.');
@@ -294,7 +316,7 @@ export class Workflow {
     this.save(ctx); return job;
   }
   async resume(task, job, p, ctx, signal) {
-    if (job.role !== 'worker') throw new Error('Reviews and adjudications always use fresh sessions.');
+    if (!isWriter(job.role)) throw new Error('Reviews and adjudications always use fresh sessions.');
     if (!job.collected || !p.prompt?.trim()) throw new Error('Collect the previous run and provide a bounded follow-up prompt.');
     if (this.activeJobs(task.cwd).length) throw new Error('Collect/stop active work before resuming the implementation owner.');
     const latestReview = [...task.jobs].reverse().find(j => j.role === 'reviewer');
@@ -312,7 +334,7 @@ export class Workflow {
     task.jobs.push(follow); this.save(ctx);
     try {
       // Public native Agent tool supports resumption; RPC intentionally strips resume fields.
-      const reply = await ctx.executeTool('Agent', { subagent_type:'astraeus-worker', resume:job.agent_id, prompt:p.prompt, description:`Continue ${task.task_id}`, run_in_background:true }, {signal});
+      const reply = await ctx.executeTool('Agent', { subagent_type:`astraeus-${job.role}`, resume:job.agent_id, prompt:job.role === 'designer' ? `Continue only the original authorized design scope ${task.design_authorization.scope}; preserve Opus design decisions unless explicit user or functional constraints require a change.\n${p.prompt}` : p.prompt, description:`Continue ${task.task_id}`, run_in_background:true }, {signal});
       const updated = this.manager()?.getRecord(job.agent_id);
       if (!updated || !ACTIVE.has(updated.status)) throw new Error('Native resume did not start the original owner: ' + JSON.stringify({reply,status:updated?.status}));
       return follow;

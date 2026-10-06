@@ -73,3 +73,8 @@ ignored `.astraeus/`. No mandatory ledger for solo work and no custom authentica
 The checker binds adjudication to the exact supplied review and checks disposition
 coverage and acceptance consistency. It does not authenticate rationale, host receipts,
 role independence, or discover consequential changes: root checks those.
+
+The [explicit Claude design exception](claude-design.md) uses Pi-native Anthropic
+only for a recorded user-requested designer scope. It does not modify regular GPT
+allowed_models. General workers/reviewers/adjudicators reject Anthropic. Designer
+ownership, native continuation and review freezing use the existing managed lifecycle.

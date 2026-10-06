@@ -1,17 +1,19 @@
 import { Type } from 'typebox';
 import { getAgentDir, parseFrontmatter, type ExtensionAPI } from '@earendil-works/pi-coding-agent';
 import { getSupportedThinkingLevels } from '@earendil-works/pi-ai';
-import { Workflow, ROOT, ENTRY } from './core.mjs';
+import { Workflow, ROOT, ENTRY, isWriter } from './core.mjs';
 import { join } from 'node:path';
 import { realpathSync } from 'node:fs';
 
-const ops = ['start', 'status', 'delegate', 'collect', 'resume', 'stop', 'accept', 'invalidate'] as const;
+const ops = ['start', 'authorize_design', 'status', 'delegate', 'collect', 'resume', 'stop', 'accept', 'invalidate'] as const;
 const parameters = Type.Object({
   op: Type.Union(ops.map(op => Type.Literal(op))),
   task_id: Type.Optional(Type.String()),
   requirements: Type.Optional(Type.String()), acceptance: Type.Optional(Type.String()),
+  design_request: Type.Optional(Type.String({description:'Original explicit user request for Claude design; caller-reported quote, not authenticated consent'})),
+  design_scope: Type.Optional(Type.Union(['design-direction', 'ui-implementation', 'design-direction-and-ui-implementation'].map(x => Type.Literal(x)))),
   constraints: Type.Optional(Type.String()), consequential: Type.Optional(Type.Boolean()),
-  role: Type.Optional(Type.Union(['worker', 'reviewer', 'adjudicator'].map(x => Type.Literal(x)))),
+  role: Type.Optional(Type.Union(['worker', 'designer', 'reviewer', 'adjudicator'].map(x => Type.Literal(x)))),
   model: Type.Optional(Type.String({description:'Exact authorized provider/model ID; no fuzzy matching or fallback'})),
   thinking: Type.Optional(Type.Union(['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'].map(x => Type.Literal(x)))),
   prompt: Type.Optional(Type.String()), owned_paths: Type.Optional(Type.Array(Type.String())),
@@ -27,7 +29,7 @@ export default function (pi: ExtensionAPI) {
   const internalResume = new Map<string, string>();
   pi.registerTool({
     name:'astraeus_workflow', label:'Astraeus workflow', exposure:'model-only',
-    description:`Manage evidence-bound Astraeus work. Trivial work stays solo. For consequential work, start with requirements/acceptance/constraints, delegate only useful bounded work with exact model+thinking, collect results, use fresh reviewer then fresh adjudicator only after complete changes_required, resume the original worker for adopted fixes, and accept after evidence and current-target checks. Status does not infer success. Role policies: ${join(ROOT, 'skills')}.`,
+    description:`Manage evidence-bound Astraeus work. Trivial work stays solo. For consequential work, start with requirements/acceptance/constraints, delegate only useful bounded work with exact model+thinking, collect results, use fresh reviewer then fresh adjudicator only after complete changes_required, resume the original implementation owner for adopted fixes, and accept after evidence and current-target checks. For explicit Claude design only, record original design_request and design_scope at start/authorize_design, then use designer with matching scope and exact anthropic/claude-opus-5-5. These are caller attestations, not authenticated user consent. Status does not infer success. Role policies: ${join(ROOT, 'skills')}.`,
     parameters,
     async execute(toolCallId, params, signal, _onUpdate, ctx) {
       if (params.op === 'resume' && params.run_id && params.task_id) {
@@ -67,7 +69,7 @@ export default function (pi: ExtensionAPI) {
     const managed = tasks.some(t => !t.accepted);
     const internal = event.parentToolCallId && internalResume.get(event.parentToolCallId) === (event.input as any).resume;
     if (managed && ['Agent','SubagentWorkflow'].includes(event.toolName) && !internal) return {block:true,reason:'Use astraeus_workflow for tracked delegation and fresh review; native Agent resumption is routed internally.'};
-    const frozen = tasks.some(t => t.jobs.some((j:any) => j.role !== 'worker' && ['running','queued'].includes(workflow.manager()?.getRecord(j.agent_id)?.status ?? j.status)));
+    const frozen = tasks.some(t => t.jobs.some((j:any) => !isWriter(j.role) && ['running','queued'].includes(workflow.manager()?.getRecord(j.agent_id)?.status ?? j.status)));
     if (frozen && ['edit','write','bash','powershell'].includes(event.toolName)) return {block:true,reason:'Review target is frozen. Collect or stop the reviewer before changing files or running shell commands.'};
   });
   pi.on('agent_before_settle', (_event, ctx) => {

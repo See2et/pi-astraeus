@@ -7,6 +7,7 @@ import { execFileSync } from 'node:child_process';
 import { parseFrontmatter } from '@earendil-works/pi-coding-agent';
 import { Workflow, ROOT, ENTRY, exactModel, hash, rpc, parseReport } from '../extensions/core.mjs';
 
+const CLAUDE = {provider:'anthropic',id:'claude-opus-5-5',reasoning:true};
 const MODEL = {provider:'openai',id:'gpt-5.5',reasoning:true};
 class Bus {
   handlers = new Map();
@@ -33,8 +34,8 @@ async function fixture(t) {
     records.get(p.agentId).status='stopped'; events.emit(`subagents:rpc:stop:reply:${p.requestId}`,{success:true});
   });
   const host={events,agentDir:()=>agentDir,appendEntry:(customType,data)=>entries.push({type:'custom',customType,data:structuredClone(data)}), manager:()=>({getRecord:id=>records.get(id)}), supportedThinking:()=>['off','low','medium','high'], parseFrontmatter};
-  const ctx={cwd,hasUI:false,sessionManager:{getSessionId:()=> 'test-session',getBranch:()=>entries},modelRegistry:{getAvailable:()=>[MODEL]},executeTool:async (_name,args)=>{
-    const record=records.get(args.resume); record.status='running'; record.result=''; return {content:[]};
+  const ctx={cwd,hasUI:false,sessionManager:{getSessionId:()=> 'test-session',getBranch:()=>entries},modelRegistry:{getAvailable:()=>[MODEL, CLAUDE]},executeTool:async (_name,args)=>{
+    const record=records.get(args.resume); assert.equal(args.subagent_type,record.type); record.status='running'; record.result=''; return {content:[]};
   }};
   const workflow=new Workflow(host); const act=p=>workflow.execute({task_id:'task',...p},ctx);
   await act({op:'start',requirements:'Preserve existing behavior',acceptance:'Actual local verification passes'});
@@ -184,8 +185,9 @@ test('lost reviewer can settle as failed and fresh evidence can complete the sam
   assert.equal((await f.act({op:'collect',run_id:fresh.run_id})).valid,true);
   assert.equal((await f.act({op:'accept'})).accepted,true);
 });
-test('adopted fixes return to original owner and require fresh review afterward',async t=>{
-  const f=await fixture(t); const worker=await f.delegate('worker'); f.complete(worker,'Implemented and verified'); await f.act({op:'collect',run_id:worker.run_id});
+for (const role of ['worker', 'designer']) test(`${role} adopted fixes return to original owner and require fresh review afterward`,async t=>{
+  const f=await fixture(t); if (role === 'designer') await f.act({op:'authorize_design',...auth});
+  const worker=await f.delegate(role,role === 'designer' ? designer : {}); f.complete(worker,'Implemented and verified'); await f.act({op:'collect',run_id:worker.run_id});
   const review=await f.delegate('reviewer'); const report=f.report(review); report.verdict='changes_required'; report.bugs=[{location:'source.txt',claim:'Defect',evidence:'Concrete example'}];
   f.complete(review,report); await f.act({op:'collect',run_id:review.run_id});
   await assert.rejects(f.act({op:'resume',run_id:worker.run_id,prompt:'Fix defect'}),/adopted fixes/);
@@ -204,4 +206,50 @@ test('managed work in unrelated repositories remains independent',async t=>{
   await f.workflow.execute({op:'start',task_id:'independent',requirements:'Other repository',acceptance:'Verified'},ctx);
   const worker=await f.workflow.execute({op:'delegate',task_id:'independent',role:'worker',model:'openai/gpt-5.5',thinking:'high',prompt:'Bounded independent work',owned_paths:['.']},ctx);
   assert.equal(worker.role,'worker'); assert.equal(worker.status,'running');
+});
+
+const auth = {design_request:'Use Claude for this design and related UI implementation',design_scope:'design-direction-and-ui-implementation'};
+const designer = {model:'anthropic/claude-opus-5-5',design_scope:auth.design_scope};
+test('designer fails closed without explicit quote/scope; no general Anthropic routing or fallback', async t=>{
+  const f=await fixture(t);
+  await assert.rejects(f.delegate('designer',designer),/explicit design authorization/);
+  await assert.rejects(f.act({op:'authorize_design',design_scope:auth.design_scope}),/original user quote/);
+  await f.act({op:'authorize_design',...auth});
+  await assert.rejects(f.act({op:'authorize_design',...auth}),/already recorded/);
+  await assert.rejects(f.delegate('designer',{...designer,design_scope:'ui-implementation'}),/matching design_scope/);
+  for (const model of ['anthropic/claude-opus-4-6','anthropic/claude-sonnet-5','other/claude-opus-5-5']) await assert.rejects(f.delegate('designer',{...designer,model}),/exact anthropic/);
+  await writeFile(join(f.cwd,'astraeus.toml'),'allowed_models = ["anthropic/claude-opus-5-5"]\n');
+  for (const role of ['worker','reviewer','adjudicator']) await assert.rejects(f.delegate(role,{model:designer.model}),/reserved/);
+  f.ctx.modelRegistry={getAvailable:()=>[MODEL]};
+  await assert.rejects(f.delegate('designer',designer),/Unavailable.*No fallback/);
+  assert.equal(f.records.size,0);
+});
+test('designer persists authorization, owns same-session fixes and freezes writers across tasks', async t=>{
+  const f=await fixture(t);
+  await f.act({op:'authorize_design',...auth});
+  const job=await f.delegate('designer',{...designer,owned_paths:['ui']});
+  await f.act({op:'start',task_id:'other',requirements:'Other task',acceptance:'Verified'});
+  await assert.rejects(f.delegate('worker',{task_id:'other',owned_paths:['ui/a']}),/disjoint/);
+  await assert.rejects(f.delegate('reviewer',{task_id:'other'}),/Freeze writers/);
+  f.complete(job,'Designed, implemented and verified UI');
+  const collected=await f.act({op:'collect',run_id:job.run_id});
+  assert.equal(collected.valid,true,collected.error);
+  assert.equal(collected.receipt_path.endsWith('.receipt.json'),true);
+  await assert.rejects(f.delegate('worker'),/Resume the original/);
+  const restored=new Workflow(f.host); restored.restore(f.ctx);
+  assert.deepEqual(restored.tasks.task.design_authorization,f.workflow.tasks.task.design_authorization);
+  const follow=await restored.execute({op:'resume',task_id:'task',run_id:job.run_id,prompt:'Fix responsive overflow, preserve design'},f.ctx);
+  assert.equal(follow.agent_id,job.agent_id); assert.equal(follow.role,'designer');
+  f.complete(follow,'Fixed and verified');
+  assert.equal((await restored.execute({op:'collect',task_id:'task',run_id:follow.run_id},f.ctx)).valid,true);
+});
+test('new task does not inherit design authorization; lost designer still blocks acceptance', async t=>{
+  const f=await fixture(t);
+  await f.act({op:'start',task_id:'authorized',requirements:'UI task',acceptance:'Verified',...auth});
+  await assert.rejects(f.delegate('designer',designer),/explicit design authorization/);
+  const job=await f.delegate('designer',{...designer,task_id:'authorized'}); f.records.clear();
+  const lost=await f.act({op:'collect',task_id:'authorized',run_id:job.run_id});
+  assert.equal(lost.valid,false);
+  await assert.rejects(f.act({op:'accept',task_id:'authorized'}),/unresolved/);
+  await assert.rejects(f.act({op:'resume',task_id:'authorized',run_id:job.run_id,prompt:'Recover'}),/Original live child session unavailable/);
 });
