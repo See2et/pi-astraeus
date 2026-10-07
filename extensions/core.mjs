@@ -5,7 +5,8 @@ import { dirname, join, resolve, posix } from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
-import { ClaudeBackground, observedStatus, CLAUDE_TRANSPORT, CLI_EFFORTS, validatePaths, validateChecks, snapshot, delta, publish } from './claude.mjs';
+import { ClaudeBackground, observedStatus, CLAUDE_TRANSPORT, CLI_EFFORTS, validatePaths, validateChecks, snapshot, publish } from './claude.mjs';
+import { approvedDelta, proposalDelta, originalRequest, requiredVitest, writeReconciliation, snapshotHash } from './generated-output.mjs';
 export const isCli = job => job.transport === CLAUDE_TRANSPORT;
 export const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 export const ENTRY = 'pi-astraeus:state-v1';
@@ -159,9 +160,26 @@ export class Workflow {
   assertOperationActive() {
     if (this.operationSession && !this.current(this.operationSession)) throw new Error('Operation belongs to retired session.');
   }
+  settlePreparationFailure(job) {
+    // prepareCli replaces this exact initial shape before start is reachable.
+    // A missing UUID alone is NOT proof: prepared/attempted/unknown fields fail closed.
+    const cli = job.cli;
+    const settled = job.status === 'prelaunch-failed' && cli?.frozen === true &&
+      typeof cli.preparation_failure === 'string' && cli.preparation_failure === job.error;
+    if (!isCli(job) || job.role !== 'designer' || job.agent_id !== null || job.valid !== false || job.result || job.artifact ||
+        !['unknown','error','unavailable','prelaunch-failed'].includes(job.status) || typeof job.error !== 'string' || !job.error ||
+        !cli || (!settled && (cli.frozen !== false || Object.hasOwn(cli,'preparation_failure'))) || !Array.isArray(cli.evidence) || cli.evidence.length ||
+        Object.keys(cli).some(key => !['frozen','evidence','notified_status','preparation_failure'].includes(key))) return false;
+    cli.preparation_failure ??= job.error;
+    cli.frozen = true;
+    job.status = 'prelaunch-failed'; job.collected = true; job.valid = false;
+    // This is settlement of an unsuccessful attempt, never an implementation result.
+    return true;
+  }
   async cliOperation(method, job, ...args) {
     const session = this.operationSession;
     this.assertOperationActive();
+    if (['observe','stop'].includes(method) && this.settlePreparationFailure(job)) return {prelaunch_failed:true};
     const staged = structuredClone(job);
     let result, error;
     try { result = await this.claude[method](staged, ...args, ...(method === 'observe' ? [session?.controller.signal] : [])); }
@@ -170,12 +188,14 @@ export class Workflow {
     Object.assign(job, staged);
     if (method === 'observe') {
       job.status = error ? 'unknown' : observedStatus(job.cli.observed);
-      if (error) { job.cli.frozen = false; job.valid = false; job.error = String(error).slice(0, 1024); }
+      if (error) { job.cli.observation_failure ??= String(error).slice(0, 1024); job.cli.frozen = false; job.valid = false; job.error = String(error).slice(0, 1024); }
     }
     if (error) throw error;
     return result;
   }
   async refreshCli(task, job, ctx, session = this.session) {
+    if (session && !this.current(session)) return false;
+    if (this.settlePreparationFailure(job)) return true;
     const staged = structuredClone(job);
     let error;
     try { await this.claude.observe(staged, task.cwd, session?.controller.signal); }
@@ -183,7 +203,11 @@ export class Workflow {
     // Never mutate a retired job reference, including from an ignored abort.
     if (session && !this.current(session)) return false;
     job.cli = staged.cli;
+    if (!job.cli.ownership_failure && /^Error: Out-of-ownership baseline delta: /.test(job.error || '')) {
+      job.cli.ownership_failure = {error:job.error, provenance:'Retained failed collection state; pre-recovery report/source hashes were not captured by the older collector.'};
+    }
     if (error) {
+      job.cli.observation_failure ??= String(error).slice(0, 1024);
       job.status = 'unknown'; job.cli.frozen = false; job.valid = false; job.error = String(error).slice(0, 1024);
     } else {
       job.status = observedStatus(job.cli.observed); delete job.error;
@@ -330,9 +354,11 @@ export class Workflow {
     }
     if (p.op === 'delegate') return this.delegate(task, p, ctx, signal);
     const job = task.jobs.find(j => j.run_id === p.run_id);
-    if (['collect', 'stop', 'resume'].includes(p.op) && !job) throw new Error('Unknown run_id');
+    if (['collect', 'stop', 'resume', 'reconcile_generated'].includes(p.op) && !job) throw new Error('Unknown run_id');
+    if (p.op === 'reconcile_generated') return this.reconcileGenerated(task, job, p, ctx);
     if (p.op === 'collect') return this.collect(task, job, ctx);
     if (p.op === 'stop') {
+      if (this.settlePreparationFailure(job)) { this.save(ctx); return job; }
       try {
         if (isCli(job)) await this.cliOperation('stop', job, task.cwd);
         else await rpc(this.host.events, 'stop', { agentId: job.agent_id });
@@ -344,12 +370,23 @@ export class Workflow {
       // Re-observe external writers: a missing native manager is not freeze evidence.
       const cliOwners = new Map(Object.values(this.tasks).filter(t => t.cwd === task.cwd).flatMap(t => t.jobs.filter(isCli)).map(j => [j.agent_id || j.run_id,j]));
       for (const writer of cliOwners.values()) {
-        await this.cliOperation('observe', writer, task.cwd);
+        try { await this.cliOperation('observe', writer, task.cwd); }
+        catch (error) { task.accepted = false; task.phase = 'needs-evidence'; this.save(ctx); throw error; }
         if (!writer.cli.frozen || (writer.cli.unexpected_copy && !writer.cli.copy_frozen)) throw new Error('Freeze exact Claude writer before acceptance.');
         if (writer.valid && writer.cli.unexpected_copy) throw new Error('Unexpected Claude copy cannot be accepted as successful work.');
         if (writer.valid) {
-          if (writer.result_hash !== hash(await readFile(writer.artifact, 'utf8'))) throw new Error('Saved implementation report bytes changed.');
-          await this.claude.audit(writer);
+          try {
+            if (writer.result_hash !== hash(await readFile(writer.artifact, 'utf8'))) throw new Error('Saved implementation report bytes changed.');
+            await this.claude.audit(writer);
+            const ownerTask = Object.values(this.tasks).find(t=>t.jobs.includes(writer));
+            const before = await snapshot(task.cwd);
+            const {bytes} = await this.readCliReport(ownerTask, writer, ctx, await approvedDelta(ownerTask, writer, before));
+            await this.cliOperation('observe', writer, task.cwd);
+            if (!writer.cli.frozen || JSON.stringify(await snapshot(task.cwd)) !== JSON.stringify(before) || hash(await readFile(writer.artifact)) !== hash(bytes)) throw new Error('Claude writer/source/report changed during final audit.');
+          } catch (error) {
+            writer.valid = false; writer.error = String(error); task.accepted = false; task.phase = 'needs-evidence';
+            this.save(ctx); throw error;
+          }
         }
       }
       if (this.activeJobs(task.cwd).length || task.jobs.some(j => !j.collected || (!isCli(j) && ACTIVE.has(this.manager()?.getRecord(j.agent_id)?.status ?? j.status)))) throw new Error('Collect every managed result before acceptance.');
@@ -413,7 +450,7 @@ export class Workflow {
     owned = owned.map(path => posix.normalize(path).replace(/\/+$/, '') || '.');
     if (isWriter(role)) {
       if (running.some(j => !isWriter(j.role) || overlapping(owned, j.owned_paths))) throw new Error('Concurrent writers need disjoint ownership; no writes during review.');
-      if (task.jobs.some(j => isWriter(j.role) && j.collected)) throw new Error('Resume the original implementation owner; do not replace it for fixes.');
+      if (task.jobs.some(j => isWriter(j.role) && j.collected && !this.settlePreparationFailure(j))) throw new Error('Resume the original implementation owner; do not replace it for fixes.');
       task.target_id = null; task.accepted = false;
     } else task.target_id = currentTarget;
     const run_id = randomUUID();
@@ -480,8 +517,47 @@ export class Workflow {
     const role = await readFile(join(this.root,'agents/astraeus-designer.md'),'utf8');
     return `${prompt}\n\nDesigner role contract (native frontmatter is not CLI isolation):\n${role}\n\nInstalled Claude Code background task, exact requested model claude-opus-5-5. Do not launch nested agents, create worktrees, commit/stage/reset/stash, push, publish, or edit outside literal ownership. Preserve existing user changes. Permissions are not an OS sandbox. Run required checks exactly: ${JSON.stringify(job.cli.checks)}. Report failed/denied checks truthfully. Missing checks means checks: [].\nWrite one JSON implementation result only to ${job.cli.pending}; do not edit control metadata or publish a final result. task_id=${JSON.stringify(task.task_id)}, run_id=${JSON.stringify(job.run_id)}, target_id=${JSON.stringify(job.cli.dispatch_target)}. changed_files must match the actual delta from this run's baseline, not preexisting changes. Complete requires completed authorized work, all required checks passed, remaining: []. Schema:\n${schema}`;
   }
+  async readCliReport(task, job, ctx, paths) {
+    const candidate = job.artifact || job.cli.pending;
+    if (!(await lstat(candidate)).isFile() || (await lstat(candidate)).isSymbolicLink()) throw new Error('Symlinked/nonregular implementation report.');
+    const bytes = await readFile(candidate,'utf8');
+    if (job.artifact && job.result_hash !== hash(bytes)) throw new Error('Saved implementation report bytes changed.');
+    // Validate captured bytes, not a mutable child path reopened by Python.
+    const validation = join(job.cli.directory,`validation-${randomUUID()}.json`);
+    await writeFile(validation,bytes,{mode:0o600, flag:'wx'});
+    const result = JSON.parse(await this.bridge(['validate-result',validation,'--kind','implementation','--task-id',task.task_id,'--target-id',job.cli.dispatch_target],ctx)).result;
+    if (result.run_id !== job.run_id || result.status !== 'complete' || result.remaining.length) throw new Error('Implementation report has wrong run binding, incomplete work or remaining issues.');
+    const checks = new Map(result.checks.map(c => [c.command,c]));
+    if (checks.size !== result.checks.length || result.checks.some(c => c.outcome !== 'passed') || job.cli.checks.some(c => !checks.has(c))) throw new Error('Required checks missing, failed or not run.');
+    if (JSON.stringify([...result.changed_files].sort()) !== JSON.stringify(paths)) throw new Error('Implementation changed_files differs from actual owned baseline delta.');
+    return {bytes,result};
+  }
+  async reconcileGenerated(task, job, p, ctx) {
+    const failure = job.cli?.ownership_failure?.error || job.error;
+    if (!isCli(job) || job.role !== 'designer' || !job.collected || job.valid || job.artifact ||
+        !job.cli.frozen || job.cli.generated_reconciliation || !/^Error: Out-of-ownership baseline delta: /.test(failure || '') ||
+        [...task.jobs].reverse().find(j=>isWriter(j.role)) !== job) throw new Error('Reconcile only the latest original frozen failed ownership collection.');
+    await this.cliOperation('observe', job, task.cwd);
+    if (!job.cli.frozen || job.cli.unexpected_copy || this.activeJobs(task.cwd).length) throw new Error('Generated recovery requires stopped exact original owner and frozen writers.');
+    const request = await originalRequest(task,job);
+    const before = await snapshot(task.cwd);
+    const paths = await proposalDelta(task,job,before,p.generated_outputs);
+    const {bytes,result} = await this.readCliReport(task,job,ctx,paths);
+    const check = await requiredVitest(task,job,result,before);
+    await this.cliOperation('observe',job,task.cwd);
+    if (!job.cli.frozen || JSON.stringify(await snapshot(task.cwd)) !== JSON.stringify(before) || hash(await readFile(job.cli.pending)) !== hash(bytes)) throw new Error('Claude writer/source/report changed during reconciliation.');
+    // Preserve the historical error before ordinary collection can clear its active diagnostic.
+    job.cli.ownership_failure ??= {error:failure, provenance:'Retained failed collection state; pre-recovery report/source hashes were not captured by the older collector.'};
+    const approval = await writeReconciliation(task,job,before,p.generated_outputs,bytes,request,check);
+    job.cli.generated_reconciliation = approval;
+    job.cli.evidence.push({kind:'generated-reconciliation',path:approval.path,sha256:approval.sha256.slice(7)});
+    this.save(ctx);
+    return this.collectCli(task,job,ctx);
+  }
   async collectCli(task, job, ctx) {
+    if (this.settlePreparationFailure(job)) { this.save(ctx); return job; }
     job.valid = false;
+    let before;
     try {
       const observed = await this.cliOperation('observe', job, task.cwd);
       if (!job.cli.frozen) {
@@ -493,19 +569,10 @@ export class Workflow {
       }
       if (job.cli.unexpected_copy) throw new Error('Unexpected copy cannot produce a successful implementation report, even after exact cleanup.');
       job.collected = true;
-      const before = await snapshot(task.cwd), paths = delta(job.cli.baseline, before, job.owned_paths);
-      const candidate = job.artifact || job.cli.pending;
-      if ((await lstat(candidate)).isSymbolicLink()) throw new Error('Symlinked implementation report.');
-      const bytes = await readFile(candidate,'utf8');
-      // Validate captured bytes, not a mutable child path reopened by Python.
-      const validation = join(job.cli.directory,`validation-${randomUUID()}.json`);
-      await writeFile(validation,bytes,{mode:0o600, flag:'wx'});
-      job.result = JSON.parse(await this.bridge(['validate-result',validation,'--kind','implementation','--task-id',task.task_id,'--target-id',job.cli.dispatch_target],ctx)).result;
-      const result = job.result;
-      if (result.run_id !== job.run_id || result.status !== 'complete' || result.remaining.length) throw new Error('Implementation report has wrong run binding, incomplete work or remaining issues.');
-      const checks = new Map(result.checks.map(c => [c.command,c]));
-      if (checks.size !== result.checks.length || result.checks.some(c => c.outcome !== 'passed') || job.cli.checks.some(c => !checks.has(c))) throw new Error('Required checks missing, failed or not run.');
-      if (JSON.stringify([...result.changed_files].sort()) !== JSON.stringify(paths)) throw new Error('Implementation changed_files differs from actual owned baseline delta.');
+      before = await snapshot(task.cwd);
+      const paths = await approvedDelta(task,job,before);
+      const {bytes,result} = await this.readCliReport(task,job,ctx,paths);
+      job.result = result;
       await this.cliOperation('observe', job,task.cwd);
       if (!job.cli.frozen || JSON.stringify(await snapshot(task.cwd)) !== JSON.stringify(before)) throw new Error('Claude writer/source changed during collection.');
       if (!job.artifact) {
@@ -514,7 +581,19 @@ export class Workflow {
       } else if (job.result_hash !== hash(bytes)) throw new Error('Published implementation result changed.');
       job.result_hash = hash(bytes); job.summary = result.summary; job.valid = true;
       task.phase = 'verification'; task.target_id = null; delete job.error;
-    } catch (error) { this.assertOperationActive(); job.collected = true; job.error = String(error); task.phase = 'needs-evidence'; }
+    } catch (error) {
+      this.assertOperationActive(); job.collected = true; job.error = String(error); task.phase = 'needs-evidence';
+      if (before && /^Error: Out-of-ownership baseline delta: /.test(job.error) && !job.cli.ownership_failure) {
+        const failure = {error:job.error, baseline_sha256:snapshotHash(job.cli.baseline), current_sha256:snapshotHash(before), frozen_observation:job.cli.observed};
+        try {
+          if ((await lstat(job.cli.pending)).isFile()) failure.report_sha256 = hash(await readFile(job.cli.pending));
+        } catch { /* Missing report is not fabricated; explicit reconciliation still requires it. */ }
+        const path = join(job.cli.directory,`ownership-failure-${randomUUID()}.json`), bytes = JSON.stringify(failure,null,2);
+        await writeFile(path,bytes,{mode:0o600,flag:'wx'});
+        job.cli.ownership_failure = failure;
+        job.cli.evidence.push({kind:'ownership-failure',path,sha256:hash(bytes).slice(7)});
+      }
+    }
     this.save(ctx); return job;
   }
   async collect(task, job, ctx) {

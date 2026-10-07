@@ -51,7 +51,9 @@ writer. Sequence them if the designer needs a clean collection baseline.
 This is not an OS sandbox. CLI permission settings supplement prompt/scheduling checks
 and deny nested agents/publication; they cannot guarantee no writes outside the cwd.
 Checks must be simple exact trusted verification commands, supplied in optional
-`checks`; omitted means `[]`. Include generated outputs in ownership. Denied/failed
+`checks`; omitted means `[]`. Plan generated outputs explicitly; do not widen source
+ownership merely to include all ignored files. The narrow recovery below handles only
+known Vitest results caches after an ownership collection failure. Denied/failed
 checks remain failures, never justification to relax permissions. Existing authenticated
 CLI access remains a prerequisite; workspace trust is separate from tool permissions.
 The bundled designer definition is checked against installed role definitions and its
@@ -142,6 +144,58 @@ blocked, leave it unresolved and ask the user for an explicit recovery/migration
 rather than editing private sessions/config, overriding saved options or launching a
 replacement automatically. Historical offending records not retained cannot be recovered
 from a later status listing. No real affected-session resume is required for deployment QA.
+
+## Explicit generated verification output recovery
+
+Ordinary `collect` still rejects every outside-ownership delta, including ignored output.
+After that failure, `reconcile_generated` can approve only literal ignored, untracked,
+regular `node_modules/.vite/vitest/<40 lowercase hex>/results.json` files for the latest
+original stopped/frozen designer. Supply each exact path, baseline `before` fingerprint
+(decimal file mode plus `:` plus SHA-256, or `null` for an absent baseline), exact current
+`after` fingerprint, and a nonempty evidence-based `reason`:
+
+```json
+{"op":"reconcile_generated","task_id":"design-001","run_id":"ORIGINAL_RUN",
+ "generated_outputs":[{"path":"node_modules/.vite/vitest/da39a3ee5e6b4b0d3255bfef95601890afd80709/results.json",
+ "before":null,"after":"33188:EXACT_64_HEX_CONTENT_HASH",
+ "reason":"Required npm test runs Vitest and produced this verification results cache."}]}
+```
+
+Read the original run's immutable `request.json` for baseline fingerprints and compute
+current mode/content fingerprints without editing source or private runtime state.
+Recovery rechecks the original request/baseline/ownership/model/effort, exact stopped
+UUID, retained CLI evidence, unchanged HEAD/index, complete original run-bound report,
+empty remaining work, all passed required checks, and exact reported owned delta.
+A required passed `vitest run` (also via `npx`/`npm exec`) or an `npm test`/`npm run SCRIPT`
+resolving to `vitest run` in unchanged baseline `package.json` is required. Every other
+outside delta remains blocking. Symlinks/parent aliases, directories, deletion, globs,
+tracked/nonignored paths, arbitrary ignored source, missing/failed checks, unknown/live
+owners and copies cannot use this recovery. These are recorded check attestations,
+not a claim that the tool observed Vitest executing or that permissions are an OS sandbox.
+
+The exclusive per-run `generated-reconciliation.json` outside the managed cwd pins the
+original failure, baseline/request/report/current-source hashes, owner, lifecycle evidence,
+exact before/after fingerprints and reasons. New collector failures also retain an exclusive
+`ownership-failure-*.json` with failure-time source/report hashes when available. For older
+failed collections that captured no such hashes, the receipt explicitly says so rather
+than inventing historical observations; current original evidence is still fully revalidated.
+Successful publication keeps the original report bytes and historical failure evidence.
+Approvals are separate from `owned_paths` and CLI tool allows. Recollection, resume and
+final acceptance recheck receipt bytes and approved current hashes, including ignored
+output and owned source; later mutation invalidates the approval.
+
+Use normal fresh review/adjudication gates before bounded managed `resume`; this operation
+neither rewrites nor waives any earlier review. Resume uses the same original UUID and
+ownership. Its new baseline pins the existing cache, but approval is **not inherited**:
+if follow-up required verification changes the cache again, collect fails and a new
+explicit run-bound reconciliation is required. No owner copy/replacement or saved option
+override is permitted.
+
+Editing this repository does not reload an already running installed Nix package/tool.
+The user must arrange the normal package update and fresh Pi process/reload before the
+new operation exists in that runtime. Agents must disclose this boundary; never patch
+Pi/Claude sessions, authentication/config or mutable workflow control files to emulate it,
+and never run NixOS/Darwin activation on the user's behalf.
 
 ## Workspace trust preflight
 

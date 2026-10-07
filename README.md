@@ -40,7 +40,10 @@ No authentication values or Pi settings are managed by this package. A narrowly
 authorized GPT-owned preflight updates only Claude's canonical `~/ghq` Git-root
 workspace trust flag, preserving every unrelated config/auth/session value. Close existing
 Pi processes before updating packages, apply the host's normal manual rollout gates,
-and start a fresh Pi process. NixOS `test`/`switch` and Darwin activation remain user-only.
+and start a fresh Pi process. Editing this source does not reload an already running
+installed Nix tool: the user must update/reload the package before new operations are
+available. Never patch private sessions or mutable workflow state to emulate deployment.
+NixOS `test`/`switch` and Darwin activation remain user-only.
 
 ## Use
 
@@ -55,6 +58,7 @@ status to one task. Root uses the model-only `astraeus_workflow` tool as follows
 | `authorize_design` | `task_id`, original explicit user quote in `design_request`, bounded `design_scope`; record once for an existing task. The same optional fields may be included at `start`. |
 | `delegate` | `task_id`, `role`, exact `model` provider/id, supported `thinking`, bounded `prompt`; worker/designer `owned_paths` are literal relative paths, default `.`. Designer optionally supplies `checks` (absent means `[]`). |
 | `collect` | `task_id`, `run_id`; reports running promptly, validates settled outcomes. No repeated tight polling. |
+| `reconcile_generated` | `task_id`, original frozen failed designer `run_id`, explicit `generated_outputs` with literal Vitest cache `path`, baseline `before` (mode:sha256 or null), current `after`, and `reason`; never widens source ownership. See [bounded recovery](references/claude-design.md#explicit-generated-verification-output-recovery). |
 | `resume` | `task_id`, original worker/designer `run_id`, follow-up `prompt`; uses native Agent continuation for workers/legacy native designers, or exact stopped Claude UUID for CLI designers; never resumes a reviewer/adjudicator. |
 | `stop` | `task_id`, `run_id`; stops only this managed child, then collect its incomplete outcome. |
 | `status` | Optional `task_id`; checks current target and restores explicit incomplete states. |

@@ -6,8 +6,9 @@ import {join} from 'node:path';
 import {execFileSync} from 'node:child_process';
 import {parseFrontmatter} from '@earendil-works/pi-coding-agent';
 import {Workflow, ROOT} from '../extensions/core.mjs';
-import {ClaudeBackground, launchId} from '../extensions/claude.mjs';
+import {ClaudeBackground, launchId, snapshot} from '../extensions/claude.mjs';
 import {ClaudeTrustPreflight} from '../extensions/claude-trust.mjs';
+import {modelView} from '../extensions/model-view.mjs';
 
 const ID = '12345678-1111-2222-3333-444444444444', COPY = 'abcdef12-1111-2222-3333-444444444444';
 const auth = {design_request:'Use Claude to design and implement this UI', design_scope:'design-direction-and-ui-implementation'};
@@ -66,6 +67,146 @@ async function fixture(t) {
   const idle = ()=>{ const record=state.records.find(r=>r.sessionId===ID); record.state='done'; record.status='idle'; }; // PID is deliberately still live.
   return {cwd,home,config,trust,agentDir,workflow,ctx,act,delegate,report,idle,state,calls,host,cli};
 }
+
+const CACHE = 'node_modules/.vite/vitest/da39a3ee5e6b4b0d3255bfef95601890afd80709/results.json';
+async function generatedFixture(t,{existing=true,script='vitest run --root .',checks=['npm test','npm run typecheck']}={}) {
+  const f=await fixture(t);
+  await writeFile(join(f.cwd,'.gitignore'),'build/\nnode_modules/\n');
+  await writeFile(join(f.cwd,'package.json'),JSON.stringify({scripts:{test:script,typecheck:'tsc --noEmit'}}));
+  execFileSync('git',['add','.gitignore','package.json'],{cwd:f.cwd});
+  execFileSync('git',['-c','user.name=Test','-c','user.email=test@example.invalid','commit','-qm','verification fixture'],{cwd:f.cwd});
+  const path=join(f.cwd,CACHE); await mkdir(join(path,'..'),{recursive:true});
+  if(existing) await writeFile(path,'{"old":"fixture results"}');
+  const job=await f.delegate({checks});
+  await writeFile(join(f.cwd,'ui.txt'),'designed'); await writeFile(path,'{"new":"fixture results"}');
+  await f.report(job); f.idle();
+  const bytes=await readFile(job.cli.pending,'utf8');
+  assert.equal((await f.act({op:'collect',run_id:job.run_id})).valid,false);
+  assert.match(job.error,/Out-of-ownership baseline delta/);
+  const current=await snapshot(f.cwd);
+  const outputs=[{path:CACHE,before:job.cli.baseline.files[CACHE]??null,after:current.files[CACHE],reason:'Required npm test resolved to Vitest; its generated results cache is not UI source.'}];
+  return {...f,job,bytes,outputs,recover:extra=>f.act({op:'reconcile_generated',run_id:job.run_id,generated_outputs:outputs,...extra})};
+}
+
+test('explicit cache reconciliation preserves original failed evidence/report/ownership across restore, then resumes same owner',async t=>{
+  const f=await generatedFixture(t), job=f.job, baseline=structuredClone(job.cli.baseline), error=job.error;
+  const failure=job.cli.evidence.find(e=>e.kind==='ownership-failure'), failureBytes=await readFile(failure.path,'utf8');
+  f.workflow.save(f.ctx);
+  const restored=new Workflow(f.host,{claude:f.cli}); restored.restore(f.ctx);
+  const act=p=>restored.execute({task_id:'design',...p},f.ctx);
+  const recovered=await act({op:'reconcile_generated',run_id:job.run_id,generated_outputs:f.outputs});
+  assert.equal(recovered.valid,true,recovered.error); assert.deepEqual(recovered.cli.baseline,baseline);
+  assert.deepEqual(recovered.owned_paths,['ui.txt']); assert.equal(recovered.agent_id,job.agent_id);
+  assert.equal(await readFile(recovered.artifact,'utf8'),f.bytes);
+  assert.equal(await readFile(failure.path,'utf8'),failureBytes);
+  const receipt=JSON.parse(await readFile(recovered.cli.generated_reconciliation.path,'utf8'));
+  assert.equal(receipt.failure.error,error); assert.equal(receipt.report_sha256,recovered.result_hash);
+  assert.deepEqual(receipt.generated_outputs,f.outputs); assert.equal(receipt.required_vitest_check,'npm test');
+  assert.ok(recovered.cli.generated_reconciliation.path.startsWith(f.agentDir+'/'));
+  const view=modelView(recovered);
+  assert.deepEqual(view.cli.generated_reconciliation,recovered.cli.generated_reconciliation);
+  assert.equal(view.cli.ownership_failure.error,error); assert.equal(view.cli.baseline,undefined);
+  assert.equal((await act({op:'collect',run_id:job.run_id})).valid,true);
+  // Final audit has to check ignored output too, not merely the native Git review target.
+  restored.tasks.design.consequential=false;
+  assert.equal((await act({op:'accept'})).accepted,true);
+  const follow=await act({op:'resume',run_id:job.run_id,prompt:'Bounded original UI fix'});
+  assert.equal(follow.agent_id,job.agent_id); assert.deepEqual(follow.owned_paths,job.owned_paths);
+  assert.equal(follow.cli.baseline.files[CACHE],f.outputs[0].after);
+  assert.equal(follow.cli.generated_reconciliation,undefined,'approval never grants blanket cache ownership on a later run');
+  const initial=f.calls.find(a=>a[0]==='--bg'), settings=JSON.parse(initial[initial.indexOf('--settings')+1]);
+  assert.ok(!settings.permissions.allow.some(a=>a.includes('node_modules')));
+  assert.deepEqual(f.calls.filter(a=>a[0]==='--bg').at(-1).slice(0,4),['--bg','--resume',ID,'--']);
+  await writeFile(join(f.cwd,'ui.txt'),'bounded fix'); await writeFile(join(f.cwd,CACHE),'follow-up verification');
+  await f.report(follow); f.idle();
+  const failed=await act({op:'collect',run_id:follow.run_id}); assert.equal(failed.valid,false);
+  assert.match(failed.error,/Out-of-ownership/);
+  await assert.rejects(act({op:'resume',run_id:follow.run_id,prompt:'No implicit reapproval'}),/validated implementation/);
+  const current=await snapshot(f.cwd);
+  const again=await act({op:'reconcile_generated',run_id:follow.run_id,generated_outputs:[{...f.outputs[0],before:follow.cli.baseline.files[CACHE],after:current.files[CACHE],reason:'Explicit follow-up required Vitest results'}]});
+  assert.equal(again.valid,true,again.error); assert.deepEqual(again.owned_paths,['ui.txt']);
+});
+
+test('legacy failed collection with newly created cache is revalidated without inventing historical hashes',async t=>{
+  const f=await generatedFixture(t,{existing:false});
+  delete f.job.cli.ownership_failure; // Older collector persisted only error + baseline/lifecycle evidence.
+  f.job.cli.evidence=f.job.cli.evidence.filter(e=>e.kind!=='ownership-failure');
+  f.workflow.save(f.ctx); f.workflow.restore(f.ctx);
+  const job=f.workflow.tasks.design.jobs[0];
+  assert.equal((await f.act({op:'status'}))[0].jobs[0].cli.ownership_failure.error,f.job.error);
+  const result=await f.act({op:'reconcile_generated',run_id:job.run_id,generated_outputs:f.outputs});
+  assert.equal(result.valid,true,result.error); assert.equal(f.outputs[0].before,null);
+  const receipt=JSON.parse(await readFile(result.cli.generated_reconciliation.path,'utf8'));
+  assert.match(receipt.failure.provenance,/not captured/); assert.equal(receipt.failure.report_sha256,undefined);
+  assert.equal(await readFile(result.artifact,'utf8'),f.bytes);
+  const review={run_id:'old-procedural-review',role:'reviewer',valid:true,collected:true,result:{verdict:'changes_required',unresolved:['Missing collection evidence']}};
+  f.workflow.tasks.design.jobs.push(review);
+  await assert.rejects(f.act({op:'resume',run_id:job.run_id,prompt:'Do not bypass old review'}),/adopted fixes/);
+  assert.deepEqual(f.workflow.tasks.design.jobs.at(-1),review,'reconciliation does not waive or rewrite review gates');
+});
+
+test('reconciliation refuses unsupported paths, changed evidence, source escapes, and unfrozen lifecycle',async t=>{
+  const cases={
+    'fingerprint':async f=>{f.outputs[0].after='33188:'+ '0'.repeat(64);},
+    'blank reason':async f=>{f.outputs[0].reason=' ';},
+    'glob':async f=>{f.outputs[0].path='node_modules/.vite/vitest/*/results.json';},
+    'arbitrary ignored source':async f=>{await mkdir(join(f.cwd,'build')); await writeFile(join(f.cwd,'build/source.mjs'),'source'); const s=await snapshot(f.cwd); f.outputs.push({path:'build/source.mjs',before:null,after:s.files['build/source.mjs'],reason:'not verification'});},
+    'extra unowned source':async f=>writeFile(join(f.cwd,'outside.txt'),'escape'),
+    'owned source changed after failure':async f=>writeFile(join(f.cwd,'ui.txt'),'later tamper'),
+    'report changed after failure':async f=>f.report(f.job,{summary:'different bytes'}),
+    'missing checks':async f=>f.report(f.job,{checks:[]}),
+    'failed check':async f=>f.report(f.job,{checks:[{command:'npm test',outcome:'failed',evidence:'Fixture failure'}]}),
+    'request tamper':async f=>writeFile(join(f.job.cli.directory,'request.json'),'{}'),
+    'baseline tamper':async f=>{f.job.cli.baseline.files[CACHE]=f.outputs[0].after;},
+    'historical failure tamper':async f=>{delete f.job.cli.ownership_failure.report_sha256;},
+    'tracked cache':async f=>execFileSync('git',['add','-f',CACHE],{cwd:f.cwd}),
+    'nonignored cache':async f=>writeFile(join(f.cwd,'.gitignore'),'build/\n'),
+    'deletion':async f=>rm(join(f.cwd,CACHE)),
+    'symlink':async f=>{await rm(join(f.cwd,CACHE)); await symlink(join(f.cwd,'ui.txt'),join(f.cwd,CACHE));},
+    'symlink parent':async f=>{await rm(join(f.cwd,'node_modules/.vite/vitest'),{recursive:true}); await symlink(f.agentDir,join(f.cwd,'node_modules/.vite/vitest'));},
+    'directory':async f=>{await rm(join(f.cwd,CACHE)); await mkdir(join(f.cwd,CACHE));},
+    'index':async f=>execFileSync('git',['add','ui.txt'],{cwd:f.cwd}),
+    'HEAD':async f=>execFileSync('git',['-c','user.name=Test','-c','user.email=test@example.invalid','commit','--allow-empty','-qm','tamper'],{cwd:f.cwd}),
+    'live owner':async f=>Object.assign(f.state.records[0],{state:'working',status:'running',pid:321}),
+    'unknown owner':async f=>Object.assign(f.state.records[0],{state:'mystery',status:null}),
+    'missing owner':async f=>{f.state.records=[];},
+    'copy':async f=>{f.job.cli.unexpected_copy={id:COPY.slice(0,8),session_id:null};},
+  };
+  for(const [name,mutate] of Object.entries(cases)) await t.test(name,async t=>{
+    const f=await generatedFixture(t),count=f.calls.filter(a=>a[0]==='--bg').length;
+    await mutate(f);
+    await assert.rejects(f.recover());
+    assert.equal(f.job.valid,false); assert.equal(f.job.artifact,undefined);
+    assert.deepEqual(f.job.owned_paths,['ui.txt']); assert.equal(f.job.cli.generated_reconciliation,undefined);
+    assert.equal(f.calls.filter(a=>a[0]==='--bg').length,count,'recovery never launches inference');
+  });
+});
+
+test('reconciliation requires an actual passed required Vitest command, not arbitrary verification',async t=>{
+  for(const options of [{script:'node test.mjs'}, {checks:[]}]) {
+    const f=await generatedFixture(t,options);
+    await assert.rejects(f.recover(),/required Vitest/);
+    assert.equal(f.job.cli.generated_reconciliation,undefined);
+  }
+});
+
+test('recollect, resume and final audit pin approved cache/source/report/receipt bytes',async t=>{
+  for(const mutation of ['cache','source','report','receipt']) await t.test(mutation,async t=>{
+    const f=await generatedFixture(t); assert.equal((await f.recover()).valid,true);
+    f.workflow.tasks.design.consequential=false;
+    if(mutation==='cache') await writeFile(join(f.cwd,CACHE),'later ignored mutation');
+    if(mutation==='source') await writeFile(join(f.cwd,'ui.txt'),'later owned mutation');
+    if(mutation==='report') await writeFile(f.job.artifact,'{}');
+    if(mutation==='receipt') await writeFile(f.job.cli.generated_reconciliation.path,'{}');
+    f.workflow.save(f.ctx); f.workflow.restore(f.ctx);
+    const count=f.calls.filter(a=>a[0]==='--bg').length;
+    await assert.rejects(f.act({op:'accept'}));
+    assert.equal(f.workflow.tasks.design.accepted,false);
+    await assert.rejects(f.act({op:'resume',run_id:f.job.run_id,prompt:'Must not trust saved valid'}));
+    const result=await f.act({op:'collect',run_id:f.job.run_id}); assert.equal(result.valid,false);
+    assert.equal(f.calls.filter(a=>a[0]==='--bg').length,count); assert.equal(f.workflow.tasks.design.jobs.length,1);
+  });
+});
 
 test('documented unique launch short ID only; unknown/ambiguous output fails closed',()=>{
   assert.equal(launchId('\x1b[32mbackgrounded · 12345678 · Foo\x1b[0m\n'),'12345678');

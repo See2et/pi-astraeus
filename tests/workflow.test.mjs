@@ -247,6 +247,59 @@ test('designer fails closed without explicit quote/scope; no general Anthropic r
   await assert.rejects(f.delegate('designer',{...designer,thinking:'off'}),/Unsupported thinking/);
   assert.equal(f.records.size,0);
 });
+test('preparation failure settles unsuccessfully and releases other tasks for review, including after restore',async t=>{
+  const f=await fixture(t);
+  await f.act({op:'authorize_design',...auth});
+  f.workflow.prepareCli=async()=>{ throw new Error('ENOENT: fixture snapshot preparation failed'); };
+  await assert.rejects(f.delegate('designer',designer),/snapshot preparation failed/);
+  const job=f.workflow.tasks.task.jobs[0], original=job.error;
+  f.workflow.restore(f.ctx);
+  await f.act({op:'start',task_id:'root-takeover',requirements:'Explicit root ownership',acceptance:'Fresh independent review'});
+  const review=await f.delegate('reviewer',{task_id:'root-takeover'});
+  const failed=f.workflow.tasks.task.jobs[0];
+  assert.equal(failed.status,'prelaunch-failed'); assert.equal(failed.valid,false);
+  assert.equal(failed.collected,true); assert.equal(failed.error,original);
+  assert.equal(failed.cli.frozen,true);
+  f.complete(review,{...f.report(review),task_id:'root-takeover'});
+  assert.equal((await f.act({op:'collect',task_id:'root-takeover',run_id:review.run_id})).valid,true);
+  assert.equal((await f.act({op:'accept',task_id:'root-takeover'})).accepted,true);
+  await assert.rejects(f.act({op:'accept'}),/unresolved failed/);
+});
+test('legacy unavailable prelaunch shape releases review in one operation without losing preparation diagnostic',async t=>{
+  const f=await fixture(t), original='Submodule/directory baseline unsupported: captured-workspace/';
+  const job={run_id:'legacy-prelaunch',role:'designer',transport:'claude-code-bg-v1',agent_id:null,status:'unavailable',valid:false,collected:false,error:original,cli:{frozen:false,evidence:[]}};
+  f.workflow.tasks.task.jobs.push(job);
+  f.workflow.save(f.ctx); f.workflow.restore(f.ctx);
+  await f.act({op:'start',task_id:'root-takeover',requirements:'Explicit root ownership',acceptance:'Fresh independent review'});
+  const review=await f.delegate('reviewer',{task_id:'root-takeover'});
+  const recovered=f.workflow.tasks.task.jobs[0];
+  assert.equal(recovered.status,'prelaunch-failed'); assert.equal(recovered.error,original);
+  assert.equal(recovered.cli.preparation_failure,original); assert.equal(recovered.valid,false);
+  f.complete(review,{...f.report(review),task_id:'root-takeover'});
+  assert.equal((await f.act({op:'collect',task_id:'root-takeover',run_id:review.run_id})).valid,true);
+  assert.equal((await f.act({op:'accept',task_id:'root-takeover'})).accepted,true);
+  await assert.rejects(f.act({op:'accept'}),/unresolved failed/);
+});
+test('unbound potentially launched jobs never use preparation-only recovery',async t=>{
+  const f=await fixture(t);
+  for (const cli of [
+    {evidence:[]},
+    {frozen:null,evidence:[]},
+    {frozen:'false',evidence:[]},
+    {frozen:false,evidence:[],directory:'/prepared'},
+    {frozen:false,evidence:[],short_id:'12345678'},
+    {frozen:false,evidence:[],launch_attempted:true},
+    {frozen:false,evidence:[{kind:'launch',path:'/evidence',sha256:'x'}]},
+  ]) {
+    const job={run_id:'unbound',role:'designer',transport:'claude-code-bg-v1',agent_id:null,status:'unknown',valid:false,collected:true,error:'Unbound launch',cli};
+    f.workflow.tasks.task.jobs=[job];
+    f.workflow.claude.observe=async()=>{ throw new Error('UUID binding unavailable'); };
+    // Repeating observation must not normalize malformed state into a prelaunch proof.
+    await assert.rejects(f.delegate('reviewer'),/Freeze writers/);
+    await assert.rejects(f.delegate('reviewer'),/Freeze writers/);
+    assert.equal(job.cli.frozen,false); assert.equal(job.valid,false);
+  }
+});
 // Designer lifecycle now lives in claude.test.mjs with no native Anthropic stub.
 test('new task does not inherit design authorization; lost designer still blocks acceptance', async t=>{
   const f=await fixture(t);

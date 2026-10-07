@@ -21,6 +21,7 @@ const result = {
 const cli = {
   frozen:scalar, copy_frozen:scalar, short_id:scalar, session_id:scalar, notified_status:scalar,
   directory:scalar, pending:scalar, report_directory:scalar, dispatch_target:scalar,
+  generated_reconciliation:{path:scalar, sha256:scalar}, ownership_failure:{error:scalar, provenance:scalar},
   observed, unexpected_copy:observed, evidence:[evidence], checks:strings,
 };
 const job = {
