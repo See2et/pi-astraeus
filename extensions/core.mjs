@@ -179,7 +179,15 @@ export class Workflow {
   async cliOperation(method, job, ...args) {
     const session = this.operationSession;
     this.assertOperationActive();
-    if (['observe','stop'].includes(method) && this.settlePreparationFailure(job)) return {prelaunch_failed:true};
+    if (['observe','stop'].includes(method)) {
+      if (this.settlePreparationFailure(job)) return {prelaunch_failed:true};
+      // Acceptance, collection and stop observe outside refreshCli as well.
+      // Preserve verified failure provenance before any lifecycle overwrite.
+      const task = Object.values(this.tasks).find(t => t.jobs.includes(job));
+      const preparationOnly = task && await this.failedResumePreparation(task,job);
+      this.assertOperationActive();
+      if (preparationOnly) job.resume_preparation_failure ??= job.error;
+    }
     const staged = structuredClone(job);
     let result, error;
     try { result = await this.claude[method](staged, ...args, ...(method === 'observe' ? [session?.controller.signal] : [])); }
@@ -196,6 +204,12 @@ export class Workflow {
   async refreshCli(task, job, ctx, session = this.session) {
     if (session && !this.current(session)) return false;
     if (this.settlePreparationFailure(job)) return true;
+    // Observation can change lifecycle status and clear the current error. Keep
+    // verified preparation-only provenance separate so status/restore cannot
+    // turn an inherited failed attempt into a superseding owner.
+    const preparationOnly = await this.failedResumePreparation(task,job);
+    if (session && !this.current(session)) return false;
+    if (preparationOnly) job.resume_preparation_failure ??= job.error;
     const staged = structuredClone(job);
     let error;
     try { await this.claude.observe(staged, task.cwd, session?.controller.signal); }
@@ -210,7 +224,8 @@ export class Workflow {
       job.cli.observation_failure ??= String(error).slice(0, 1024);
       job.status = 'unknown'; job.cli.frozen = false; job.valid = false; job.error = String(error).slice(0, 1024);
     } else {
-      job.status = observedStatus(job.cli.observed); delete job.error;
+      job.status = observedStatus(job.cli.observed);
+      if (!job.resume_preparation_failure) delete job.error;
     }
     this.notice(task, job, ctx, session); return !error;
   }
@@ -358,6 +373,9 @@ export class Workflow {
     if (p.op === 'reconcile_generated') return this.reconcileGenerated(task, job, p, ctx);
     if (p.op === 'collect') return this.collect(task, job, ctx);
     if (p.op === 'stop') {
+      // An undispatched correction owns no new work to stop. Settle it without
+      // sending a stop to its shared predecessor's native session.
+      if (!isCli(job) && isWriter(job.role) && job.resume_dispatch_started === false) return this.collect(task,job,ctx);
       if (this.settlePreparationFailure(job)) { this.save(ctx); return job; }
       try {
         if (isCli(job)) await this.cliOperation('stop', job, task.cwd);
@@ -392,7 +410,14 @@ export class Workflow {
         }
       }
       if (this.activeJobs(task.cwd).length || task.jobs.some(j => !j.collected || (!isCli(j) && ACTIVE.has(this.manager()?.getRecord(j.agent_id)?.status ?? j.status)))) throw new Error('Collect every managed result before acceptance.');
-      const latestWorkers = new Map(task.jobs.filter(j => isWriter(j.role)).map(j => [j.agent_id, j]));
+      const latestWorkers = new Map();
+      for (const writer of task.jobs.filter(j => isWriter(j.role))) {
+        // An unstarted correction is still failed work of its recorded owner,
+        // not a new null-ID owner that permanently blocks later successful fixes.
+        const prior = writer.resume_from && task.jobs.find(j => j.run_id === writer.resume_from);
+        const key = !writer.agent_id && prior?.agent_id && this.settlePreparationFailure(writer) ? prior.agent_id : writer.agent_id;
+        latestWorkers.set(key,writer);
+      }
       if ([...latestWorkers.values()].some(j => !j.valid)) throw new Error('Implementation owner has unresolved failed or incomplete work.');
       const matches = JSON.parse(await this.bridge(['matches-review', '--repo', ctx.cwd], ctx));
       const existingReview = [...task.jobs].reverse().find(j => j.role === 'reviewer');
@@ -583,6 +608,13 @@ export class Workflow {
   }
   async collect(task, job, ctx) {
     if (isCli(job)) return this.collectCli(task,job,ctx);
+    if (isWriter(job.role) && job.resume_dispatch_started === false) {
+      // The shared manager still holds the predecessor's result until Agent
+      // resumes it. Those bytes cannot be attributed to this unstarted run.
+      job.collected = true; job.valid = false; job.status = 'error';
+      job.error ??= 'Native resume never dispatched; no run-specific result exists.';
+      task.phase = 'needs-evidence'; this.save(ctx); return job;
+    }
     const record = this.manager()?.getRecord(job.agent_id);
     if (!record) {
       if (job.collected) return job;
@@ -616,11 +648,63 @@ export class Workflow {
     } catch (error) { job.error = String(error); task.phase = 'needs-evidence'; }
     this.save(ctx); return job;
   }
+  async failedResumePreparation(task, candidate) {
+    if (this.settlePreparationFailure(candidate)) return true;
+    if (!isCli(candidate)) {
+      // Only a persisted checkpoint before the public Agent dispatch proves a
+      // native attempt never ran. Tool errors/legacy attempts remain ambiguous.
+      if (candidate.resume_dispatch_started !== false || !candidate.resume_from || !candidate.collected || candidate.valid ||
+          candidate.status !== 'error' || !candidate.error || candidate.result || candidate.artifact || candidate.result_hash) return false;
+      const prior = task.jobs.slice(0,task.jobs.indexOf(candidate)).find(j => j.run_id === candidate.resume_from);
+      if (!prior || !isWriter(prior.role) || isCli(prior) || !prior.collected || !prior.agent_id || prior.agent_id !== candidate.agent_id ||
+          prior.role !== candidate.role || prior.transport !== candidate.transport ||
+          JSON.stringify(prior.requested) !== JSON.stringify(candidate.requested) || JSON.stringify(prior.owned_paths) !== JSON.stringify(candidate.owned_paths)) return false;
+      const record = this.manager()?.getRecord(prior.agent_id);
+      if (!record?.session || ACTIVE.has(record.status)) return false;
+      try { assertReceipt(prior,record); return true; } catch { return false; }
+    }
+    // Older resume attempts shallow-copied the stopped owner's CLI binding. A
+    // different run with exactly that binding has no request/dispatch of its own.
+    // Never classify a prepared, attempted, copied, or merely missing owner this way.
+    const retainedFailure = typeof candidate.resume_preparation_failure === 'string' && candidate.resume_preparation_failure.length > 0;
+    if (!isCli(candidate) || !candidate.collected || candidate.valid || candidate.result || candidate.artifact || candidate.result_hash ||
+        (!retainedFailure && (!['unknown','error','unavailable'].includes(candidate.status) || !candidate.error)) || !candidate.cli?.frozen) return false;
+    const index = task.jobs.indexOf(candidate);
+    const priors = task.jobs.slice(0,index).reverse().filter(j => isCli(j) && j.agent_id === candidate.agent_id && j.collected && j.cli?.frozen && j.run_id !== candidate.run_id);
+    const binding = j => {
+      const {observed, notified_status, evidence, ...cli} = j.cli;
+      return {role:j.role, transport:j.transport, agent_id:j.agent_id, requested:j.requested, owned_paths:j.owned_paths, cli};
+    };
+    for (const prior of priors) {
+      if (JSON.stringify(binding(prior)) !== JSON.stringify(binding(candidate))) continue;
+      const inherited = prior.cli.evidence, evidence = candidate.cli.evidence;
+      if (!Array.isArray(inherited) || !Array.isArray(evidence) || evidence.length < inherited.length ||
+          JSON.stringify(evidence.slice(0,inherited.length)) !== JSON.stringify(inherited)) continue;
+      const added = evidence.slice(inherited.length);
+      if (added.some(e => e.kind !== 'stop')) continue; // Never skip request/resume/launch evidence.
+      try {
+        await originalRequest(task,prior);
+        await this.claude.audit(candidate); // Includes inherited and all added immutable bytes.
+        for (const item of added) {
+          const stopped = JSON.parse(await readFile(item.path));
+          if (stopped.returncode !== 0 || typeof stopped.stdout !== 'string' || stopped.stdout.trim() !== `stopped ${candidate.cli.short_id}` ||
+              JSON.stringify(stopped.args) !== JSON.stringify(['stop',candidate.cli.short_id])) throw new Error('Added stop is not an exact-owner acknowledgment.');
+        }
+        return true;
+      } catch { /* Corruption, dispatch evidence, or an unbound earlier attempt cannot prove recovery. */ }
+    }
+    return false;
+  }
   async resume(task, job, p, ctx, signal) {
     if (!isWriter(job.role)) throw new Error('Reviews and adjudications always use fresh sessions.');
     if (!job.collected || !p.prompt?.trim()) throw new Error('Collect the previous run and provide a bounded follow-up prompt.');
     if (this.activeJobs(task.cwd).length) throw new Error('Collect/stop active work before resuming the implementation owner.');
-    const latestOwner = [...task.jobs].reverse().find(j => j.agent_id === job.agent_id && isWriter(j.role));
+    let latestOwner;
+    for (const candidate of [...task.jobs].reverse()) {
+      if (candidate.agent_id !== job.agent_id || !isWriter(candidate.role)) continue;
+      if (await this.failedResumePreparation(task,candidate)) continue;
+      latestOwner = candidate; break;
+    }
     if (latestOwner !== job) throw new Error('Resume only the latest run of the original implementation owner.');
     const latestReview = [...task.jobs].reverse().find(j => j.role === 'reviewer');
     if (latestReview?.valid && latestReview.result?.verdict === 'changes_required') {
@@ -639,23 +723,27 @@ export class Workflow {
         await originalRequest(task,job);
         if (job.artifact) await this.readCliReport(task,job,ctx);
       } catch (error) { job.valid = false; job.error = String(error); this.save(ctx); throw error; }
-      const follow = {...job, run_id:randomUUID(), collected:false, valid:false, result:undefined, artifact:undefined, result_hash:undefined, status:'queued', error:undefined};
+      const follow = {...job, run_id:randomUUID(), resume_from:job.run_id, agent_id:null, cli:{frozen:false,evidence:[]}, collected:false, valid:false, summary:undefined, result:undefined, artifact:undefined, result_hash:undefined, status:'queued', error:undefined};
       task.jobs.push(follow); task.accepted = false; task.target_id = null; task.phase = 'implementation';
       try {
         // Fresh observational baseline; preserving user work stays an instruction.
         await this.prepareCli(task,follow,ctx,job.cli.checks,job.cli);
+        follow.agent_id = job.agent_id;
         this.save(ctx);
         await this.cliOperation('resume', follow,task.cwd,await this.cliPrompt(task,follow,`Continue only original authorized design scope ${task.design_authorization.scope}; preserve Opus design decisions unless explicit user/functional constraints require changes.\n${p.prompt}`));
         this.save(ctx); return follow;
-      } catch (error) { this.assertOperationActive(); follow.status = 'unknown'; follow.error = String(error); follow.collected = true; this.save(ctx); throw error; }
+      } catch (error) { this.assertOperationActive(); follow.status = 'unknown'; follow.error = String(error); follow.collected = true; this.settlePreparationFailure(follow); this.save(ctx); throw error; }
     }
     const record = this.manager()?.getRecord(job.agent_id);
     if (!record?.session) throw new Error('Original live child session unavailable. Use Tintinweb @handle session recovery; no replacement owner was launched.');
     assertReceipt(job, record);
     task.accepted = false; task.target_id = null; task.phase = 'implementation';
-    const follow = { ...job, run_id:randomUUID(), collected:false, valid:false, result:undefined, artifact:undefined, receipt_path:undefined, receipt_hash:undefined, result_hash:undefined, status:'running', error:undefined };
-    task.jobs.push(follow); this.save(ctx);
+    const follow = { ...job, run_id:randomUUID(), resume_from:job.run_id, resume_dispatch_started:false, collected:false, valid:false, summary:undefined, result:undefined, artifact:undefined, receipt_path:undefined, receipt_hash:undefined, result_hash:undefined, status:'running', error:undefined };
+    task.jobs.push(follow);
     try {
+      this.save(ctx);
+      follow.resume_dispatch_started = true;
+      this.save(ctx);
       // Public native Agent tool supports resumption; RPC intentionally strips resume fields.
       const reply = await ctx.executeTool('Agent', { subagent_type:`astraeus-${job.role}`, resume:job.agent_id, prompt:job.role === 'designer' ? `Continue only the original authorized design scope ${task.design_authorization.scope}; preserve Opus design decisions unless explicit user or functional constraints require a change.\n${p.prompt}` : p.prompt, description:`Continue ${task.task_id}`, run_in_background:true }, {signal});
       const updated = this.manager()?.getRecord(job.agent_id);

@@ -151,6 +151,35 @@ test('follow-up work resumes the original implementation owner and invalidates p
   const follow=await f.act({op:'resume',run_id:job.run_id,prompt:'Bounded follow-up'});
   assert.equal(follow.agent_id,job.agent_id); assert.notEqual(follow.run_id,job.run_id); assert.equal(f.workflow.tasks.task.target_id,null);
 });
+test('native pre-dispatch failure permits original owner retry but attempted dispatch does not',async t=>{
+  const f=await fixture(t), job=await f.delegate('worker');
+  f.complete(job,'Original bounded work'); await f.act({op:'collect',run_id:job.run_id});
+  const append=f.host.appendEntry;
+  f.host.appendEntry=(type,data)=>{
+    if(data.tasks.task.jobs.at(-1).resume_dispatch_started===false) {
+      f.host.appendEntry=append; throw new Error('fixture preparation persistence failure');
+    }
+    append(type,data);
+  };
+  await assert.rejects(f.act({op:'resume',run_id:job.run_id,prompt:'Bounded follow-up'}),/preparation persistence/);
+  assert.equal(f.records.get(job.agent_id).status,'completed');
+  f.workflow.restore(f.ctx);
+  const failure=f.workflow.tasks.task.jobs.at(-1), diagnostic=failure.error;
+  const failed=await f.act({op:'collect',run_id:failure.run_id});
+  assert.equal(failed.valid,false); assert.equal(failed.status,'error'); assert.equal(failed.error,diagnostic);
+  assert.equal(failed.summary,undefined); assert.equal(failed.receipt_path,undefined);
+  await f.act({op:'stop',run_id:failure.run_id});
+  assert.equal(f.records.get(job.agent_id).status,'completed','an undispatched attempt must not stop the shared original owner');
+  await assert.rejects(f.act({op:'accept'}),/unresolved failed or incomplete/);
+  await f.act({op:'status'}); f.workflow.restore(f.ctx);
+  const follow=await f.act({op:'resume',run_id:job.run_id,prompt:'Retry original owner'});
+  assert.equal(follow.agent_id,job.agent_id);
+  f.complete(follow,'Completed correction'); await f.act({op:'collect',run_id:follow.run_id});
+  f.ctx.executeTool=async()=>{throw new Error('ambiguous dispatch failure');};
+  await assert.rejects(f.act({op:'resume',run_id:follow.run_id,prompt:'Attempted correction'}),/ambiguous dispatch/);
+  await assert.rejects(f.act({op:'resume',run_id:follow.run_id,prompt:'Do not skip attempt'}),/latest run/);
+});
+
 test('branch restore marks lost active children unavailable, not successful',async t=>{
   const f=await fixture(t); await f.delegate('worker'); f.records.clear();
   const restored=new Workflow(f.host); restored.restore(f.ctx);

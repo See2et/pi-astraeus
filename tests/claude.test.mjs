@@ -121,6 +121,92 @@ test('failed original run resumes with exact freeze and no successful report, re
   });
 });
 
+test('preparation failure preserves the frozen owner and permits retry after restore',async t=>{
+  const f=await fixture(t), job=await f.delegate(); await f.report(job); f.idle();
+  assert.equal((await f.act({op:'collect',run_id:job.run_id})).valid,true);
+  const original=structuredClone(job), prepare=f.workflow.prepareCli.bind(f.workflow);
+  f.workflow.prepareCli=async()=>{throw new Error('fixture baseline preparation failed');};
+  await assert.rejects(f.act({op:'resume',run_id:job.run_id,prompt:'Bounded fix'}),/preparation failed/);
+  assert.deepEqual(job,original,'failed preparation must not alias or change the original binding');
+  const failed=f.workflow.tasks.design.jobs.at(-1), launches=f.calls.filter(a=>a[0]==='--bg').length;
+  f.workflow.save(f.ctx); f.workflow.restore(f.ctx); f.workflow.prepareCli=prepare;
+  const follow=await f.act({op:'resume',run_id:job.run_id,prompt:'Retry bounded fix'});
+  assert.equal(follow.agent_id,job.agent_id);
+  assert.equal(f.calls.filter(a=>a[0]==='--bg').length,launches+1);
+  assert.equal(f.workflow.tasks.design.jobs.find(j=>j.run_id===failed.run_id).valid,false);
+  await f.report(follow); f.idle(); assert.equal((await f.act({op:'collect',run_id:follow.run_id})).valid,true);
+  f.workflow.tasks.design.consequential=false;
+  assert.equal((await f.act({op:'accept'})).accepted,true,'failed preparation is not a separate unresolved owner');
+  await assert.rejects(f.act({op:'resume',run_id:job.run_id,prompt:'Stale owner'}),/latest run/);
+});
+
+test('legacy inherited preparation binding is skipped only with intact original evidence',async t=>{
+  const f=await fixture(t), job=await f.delegate(); await f.report(job); f.idle();
+  assert.equal((await f.act({op:'collect',run_id:job.run_id})).valid,true);
+  // Persisted shape produced by the old shallow-cloned resume before prepareCli returned.
+  const failed={...structuredClone(job),run_id:'legacy-failed-resume',collected:true,valid:false,
+    result:undefined,artifact:undefined,result_hash:undefined,status:'unknown',error:'fixture preparation failed'};
+  f.workflow.tasks.design.jobs.push(failed,{...structuredClone(failed),run_id:'legacy-second-preparation-failure'});
+  f.workflow.save(f.ctx); f.workflow.restore(f.ctx);
+  await f.act({op:'status'});
+  f.workflow.save(f.ctx); f.workflow.restore(f.ctx);
+  await f.act({op:'status'});
+  const observedFailure=f.workflow.tasks.design.jobs.at(-1);
+  assert.equal(observedFailure.resume_preparation_failure,'fixture preparation failed');
+  assert.equal(observedFailure.error,'fixture preparation failed'); assert.equal(observedFailure.valid,false);
+  await assert.rejects(f.act({op:'resume',run_id:failed.run_id,prompt:'Wrong request run'}));
+  const path=join(job.cli.directory,'request.json'), bytes=await readFile(path);
+  await writeFile(path,'{}');
+  await assert.rejects(f.act({op:'resume',run_id:job.run_id,prompt:'Do not bypass evidence'}));
+  await writeFile(path,bytes);
+  const follow=await f.act({op:'resume',run_id:job.run_id,prompt:'Recover original bounded fix'});
+  assert.equal(follow.agent_id,job.agent_id); assert.notEqual(follow.run_id,failed.run_id);
+  assert.equal(f.workflow.tasks.design.jobs.find(j=>j.run_id===failed.run_id).valid,false);
+});
+
+test('failed acceptance before status retains legacy preparation recovery',async t=>{
+  const f=await fixture(t), job=await f.delegate(); await f.report(job); f.idle();
+  assert.equal((await f.act({op:'collect',run_id:job.run_id})).valid,true);
+  const failed={...structuredClone(job),run_id:'legacy-accept-first',collected:true,valid:false,
+    result:undefined,artifact:undefined,result_hash:undefined,status:'unknown',error:'fixture preparation failed'};
+  f.workflow.tasks.design.jobs.push(failed); f.workflow.save(f.ctx); f.workflow.restore(f.ctx);
+  await assert.rejects(f.act({op:'accept'}),/unresolved failed or incomplete/);
+  assert.equal(f.workflow.tasks.design.accepted,false);
+  f.workflow.save(f.ctx); f.workflow.restore(f.ctx);
+  const follow=await f.act({op:'resume',run_id:job.run_id,prompt:'Recover original after failed acceptance'});
+  assert.equal(follow.agent_id,job.agent_id); assert.notEqual(follow.run_id,failed.run_id);
+  const retained=f.workflow.tasks.design.jobs.find(j=>j.run_id===failed.run_id);
+  assert.equal(retained.resume_preparation_failure,'fixture preparation failed');
+  assert.equal(retained.valid,false); assert.equal(retained.error,'fixture preparation failed');
+});
+
+test('legacy stop and collection retain recovery without ignoring new lifecycle evidence',async t=>{
+  const f=await fixture(t), job=await f.delegate(); await f.report(job); f.idle();
+  assert.equal((await f.act({op:'collect',run_id:job.run_id})).valid,true);
+  const failed={...structuredClone(job),run_id:'legacy-stopped-failure',collected:true,valid:false,
+    result:undefined,artifact:undefined,result_hash:undefined,status:'unknown',error:'fixture preparation failed'};
+  f.workflow.tasks.design.jobs.push(failed);
+  await f.act({op:'stop',run_id:failed.run_id});
+  const stopped=failed.cli.evidence.at(-1), count=failed.cli.evidence.length;
+  assert.equal(stopped.kind,'stop'); assert.equal(count,job.cli.evidence.length+1);
+  const collected=await f.act({op:'collect',run_id:failed.run_id});
+  assert.equal(collected.valid,false); assert.equal(collected.collected,true);
+  assert.equal(collected.resume_preparation_failure,'fixture preparation failed');
+  f.workflow.save(f.ctx); f.workflow.restore(f.ctx);
+  const retained=f.workflow.tasks.design.jobs.find(j=>j.run_id===failed.run_id);
+  const extra=retained.cli.evidence.at(-1), bytes=await readFile(extra.path);
+  await writeFile(extra.path,'changed stop evidence');
+  await assert.rejects(f.act({op:'resume',run_id:job.run_id,prompt:'Do not ignore corrupted stop evidence'}));
+  await writeFile(extra.path,bytes);
+  extra.kind='resume';
+  await assert.rejects(f.act({op:'resume',run_id:job.run_id,prompt:'Do not skip a dispatch receipt'}));
+  extra.kind='stop';
+  const follow=await f.act({op:'resume',run_id:job.run_id,prompt:'Recover original after legacy stop/collect'});
+  assert.equal(follow.agent_id,job.agent_id); assert.notEqual(follow.run_id,failed.run_id);
+  assert.equal(retained.valid,false); assert.equal(retained.cli.evidence.length,count);
+  assert.deepEqual(await readFile(extra.path),bytes,'recovery retains original lifecycle evidence bytes');
+});
+
 test('documented unique launch short ID only; unknown/ambiguous output fails closed',()=>{
   assert.equal(launchId('\x1b[32mbackgrounded · 12345678 · Foo\x1b[0m\n'),'12345678');
   for (const value of ['session 12345678','backgrounded · 12345678\nbackgrounded · abcdef12\n','backgrounded · not-a-uuid']) assert.throws(()=>launchId(value),/Unknown or ambiguous/);
