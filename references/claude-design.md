@@ -102,8 +102,11 @@ status. Idle/done alone can still have a live process; it is not a writer freeze
 Unknown or missing lifecycle does not become successful completion. Stop preserves files
 and conversation, but does not upgrade a blocked/failed report.
 
-Resume requires the latest collected/frozen run of the original owner and the existing
-adopted-fix review/adjudication gates. It stops the exact owner again before invoking:
+Resume requires the latest collected/frozen, successfully validated run of the original
+owner and the existing adopted-fix review/adjudication gates. Before creating a follow-up
+baseline, it revalidates the published report, CLI evidence and current owned delta against
+the preserved previous baseline. Failed collection or later report/source mutations remain
+blocking; a saved `valid` flag alone is insufficient. It stops the exact owner again before invoking:
 
 ```sh
 claude --bg --resume OBSERVED_FULL_UUID -- "Run-specific bounded follow-up"
@@ -113,7 +116,9 @@ No configuration overrides (model, effort, settings, permission flags) are repea
 2.1.288 retains saved options, and overrides or a live idle session can cause a copy.
 The resume receipt must emit the original short ID and public inspection must confirm
 the identical full UUID/cwd. An unexpected emitted copy is verified and stopped exactly,
-with evidence retained; it never replaces the owner binding. A failed/unknown copy stop
+with evidence retained; it never replaces the owner binding. Even a successfully stopped
+copy remains unsuccessful: its report cannot be collected as valid or used to authorize
+resume or acceptance, including when restoring state from an older version. A failed/unknown copy stop
 keeps freezing unresolved. Inspect changes/evidence before recovery, never retry blindly.
 
 Deploying a new Pi package changes only new initial launches. Existing sessions retain

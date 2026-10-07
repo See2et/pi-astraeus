@@ -269,6 +269,28 @@ for (const mode of ['outside','ignored','dirty','files','checks','remaining','bi
   const result=await f.act({op:'collect',run_id:job.run_id}); assert.equal(result.valid,false); assert.ok(result.error); assert.equal(result.artifact,undefined);
   assert.ok(job.cli.evidence.some(e=>e.kind==='stop'));
 });
+test('failed owned-delta collection cannot be erased by a resume baseline',async t=>{
+  const f=await fixture(t),job=await f.delegate();
+  await writeFile(join(f.cwd,'ui.txt'),'new UI'); await writeFile(join(f.cwd,'outside.txt'),'escape');
+  await f.report(job); f.idle();
+  assert.equal((await f.act({op:'collect',run_id:job.run_id})).valid,false);
+  const baseline=structuredClone(job.cli.baseline), count=f.workflow.tasks.design.jobs.length;
+  await assert.rejects(f.act({op:'resume',run_id:job.run_id,prompt:'Bounded follow-up'}),/validated implementation/);
+  assert.equal(f.workflow.tasks.design.jobs.length,count); assert.deepEqual(job.cli.baseline,baseline);
+  assert.equal(f.calls.filter(a=>a[0]==='--bg'&&a[1]==='--resume').length,0);
+  assert.equal(await readFile(join(f.cwd,'outside.txt'),'utf8'),'escape');
+});
+for(const mutation of ['source','report','evidence']) test(`resume revalidates collected ${mutation} rather than trusting saved valid flag`,async t=>{
+  const f=await fixture(t),job=await f.delegate(); await f.report(job,{changed_files:[]}); f.idle();
+  assert.equal((await f.act({op:'collect',run_id:job.run_id})).valid,true);
+  if(mutation==='source') await writeFile(join(f.cwd,'outside.txt'),'late outside mutation');
+  if(mutation==='report') await writeFile(job.artifact,'{}');
+  if(mutation==='evidence') await writeFile(job.cli.evidence.find(e=>e.kind==='stop').path,'{}');
+  const restored=new Workflow(f.host,{claude:f.cli}); restored.restore(f.ctx);
+  await assert.rejects(restored.execute({op:'resume',task_id:'design',run_id:job.run_id,prompt:'Bounded follow-up'},f.ctx));
+  assert.equal(restored.tasks.design.jobs.length,1); assert.equal(restored.tasks.design.jobs[0].valid,false);
+  assert.equal(f.calls.filter(a=>a[0]==='--bg'&&a[1]==='--resume').length,0);
+});
 test('overlapping preexisting user changes and symlink scope are refused without changing files',async t=>{
   const f=await fixture(t);
   await assert.rejects(f.delegate({owned_paths:['user.txt']}),/existing user changes/);
@@ -285,6 +307,23 @@ test('resume copy is stopped exactly, retained and never rebound to original own
   assert.equal(follow.cli.session_id,ID); assert.equal(follow.cli.unexpected_copy.session_id,COPY); assert.equal(follow.cli.copy_frozen,true);
   assert.ok(f.calls.some(a=>a[0]==='stop'&&a[1]==='abcdef12'));
   assert.equal(follow.valid,false); assert.equal(f.workflow.activeJobs(f.cwd).length,1);
+  await f.report(follow,{changed_files:[]});
+  const collected=await f.act({op:'collect',run_id:follow.run_id});
+  assert.equal(collected.valid,false); assert.match(collected.error,/Unexpected copy/);
+  assert.equal(follow.artifact,undefined); assert.equal(follow.cli.copy_frozen,true);
+  assert.equal(f.workflow.activeJobs(f.cwd).length,0,'Exact cleanup remains effective, not successful work');
+  const restored=new Workflow(f.host,{claude:f.cli}); restored.restore(f.ctx);
+  const act=params=>restored.execute({task_id:'design',...params},f.ctx);
+  assert.equal((await act({op:'collect',run_id:follow.run_id})).valid,false);
+  await assert.rejects(act({op:'resume',run_id:follow.run_id,prompt:'Retry copied work'}));
+  assert.equal(restored.tasks.design.jobs.length,2);
+  assert.equal(f.calls.filter(a=>a[0]==='--bg'&&a[1]==='--resume').length,1);
+  // Older versions could persist a successful flag after copy cleanup.
+  const legacy=restored.tasks.design.jobs.at(-1); legacy.valid=true; restored.save(f.ctx);
+  const legacyRestored=new Workflow(f.host,{claude:f.cli}); legacyRestored.restore(f.ctx);
+  await assert.rejects(legacyRestored.execute({op:'accept',task_id:'design'},f.ctx),/Unexpected Claude copy/);
+  await assert.rejects(legacyRestored.execute({op:'resume',task_id:'design',run_id:follow.run_id,prompt:'Legacy copied work'},f.ctx),/Unexpected copy/);
+  assert.equal(legacyRestored.tasks.design.jobs.length,2);
 });
 test('unexpected emitted copy with mismatched cwd is never stopped blindly, rebound or accepted',async t=>{
   const f=await fixture(t),job=await f.delegate(); await f.report(job,{changed_files:[]}); f.idle();

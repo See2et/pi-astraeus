@@ -346,6 +346,7 @@ export class Workflow {
       for (const writer of cliOwners.values()) {
         await this.cliOperation('observe', writer, task.cwd);
         if (!writer.cli.frozen || (writer.cli.unexpected_copy && !writer.cli.copy_frozen)) throw new Error('Freeze exact Claude writer before acceptance.');
+        if (writer.valid && writer.cli.unexpected_copy) throw new Error('Unexpected Claude copy cannot be accepted as successful work.');
         if (writer.valid) {
           if (writer.result_hash !== hash(await readFile(writer.artifact, 'utf8'))) throw new Error('Saved implementation report bytes changed.');
           await this.claude.audit(writer);
@@ -490,7 +491,7 @@ export class Workflow {
         }
         await this.cliOperation('stop', job, task.cwd);
       }
-      if (job.cli.unexpected_copy && !job.cli.copy_frozen) throw new Error('Unexpected copy remains unfrozen.');
+      if (job.cli.unexpected_copy) throw new Error('Unexpected copy cannot produce a successful implementation report, even after exact cleanup.');
       job.collected = true;
       const before = await snapshot(task.cwd), paths = delta(job.cli.baseline, before, job.owned_paths);
       const candidate = job.artifact || job.cli.pending;
@@ -567,6 +568,12 @@ export class Workflow {
     if (isCli(job)) {
       await this.cliOperation('observe', job,task.cwd);
       if (!job.cli.frozen) throw new Error('Collect/freeze the original Claude writer before resume.');
+      if (job.cli.unexpected_copy) throw new Error('Unexpected copy cannot be resumed as original-owner work.');
+      if (!job.valid || !job.artifact || !job.result_hash) throw new Error('Resume requires a collected validated implementation report and owned delta; reconcile failed evidence first.');
+      // Reuse collection's full report/source/delta checks against the preserved
+      // baseline. A stale valid flag cannot authorize a fresh baseline.
+      const checked = await this.collectCli(task,job,ctx);
+      if (!checked.valid) throw new Error('Resume requires a currently validated implementation: ' + job.error);
       const follow = {...job, run_id:randomUUID(), collected:false, valid:false, result:undefined, artifact:undefined, result_hash:undefined, status:'queued', error:undefined};
       task.jobs.push(follow); task.accepted = false; task.target_id = null; task.phase = 'implementation';
       try {
