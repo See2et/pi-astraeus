@@ -102,6 +102,83 @@ test('public CLI lifecycle binds observed UUID, preserves user baseline, freezes
   const fixed=await restored.execute({op:'collect',task_id:'design',run_id:follow.run_id},f.ctx); assert.equal(fixed.valid,true,fixed.error);
   await assert.rejects(restored.execute({op:'resume',task_id:'design',run_id:job.run_id,prompt:'Stale run'},f.ctx),/latest run/);
 });
+test('initial shared-cwd setting is the only launch argv change; exact model and permission/auth route remain',async t=>{
+  const f=await fixture(t),job=await f.delegate({checks:['npm test']});
+  const args=f.calls.find(a=>a[0]==='--bg');
+  const allows=['Read','Glob','Grep',`Edit(/${f.cwd}/ui.txt)`,`Edit(/${f.cwd}/ui.txt/**)`,`Write(/${f.cwd}/ui.txt)`,`Write(/${f.cwd}/ui.txt/**)`,
+    `Edit(/${job.cli.report_directory}/**)`,`Write(/${job.cli.report_directory}/**)`,'Bash(npm test)'];
+  const denies=['Agent','Task','Bash(git push *)','Bash(git -C * push *)','Bash(gh *)','Bash(glab *)','Bash(curl *)','Bash(wget *)',
+    `Edit(/${f.cwd}/.git)`,`Edit(/${f.cwd}/.git/**)`,`Write(/${f.cwd}/.git)`,`Write(/${f.cwd}/.git/**)`];
+  const originalSettings={permissions:{defaultMode:'dontAsk',allow:allows,deny:denies}};
+  const settings=JSON.parse(args[args.indexOf('--settings')+1]);
+  assert.deepEqual(settings,{...originalSettings,worktree:{bgIsolation:'none'}});
+  const originalArgs=[...args]; delete settings.worktree;
+  originalArgs[originalArgs.indexOf('--settings')+1]=JSON.stringify(settings);
+  assert.deepEqual(originalArgs,['--bg','--safe-mode','--model','claude-opus-5-5','--effort','high','--permission-mode','dontAsk','--setting-sources','','--settings',JSON.stringify(originalSettings),
+    '--tools','Read,Edit,Write,Glob,Grep,Bash','--allowedTools',...allows,'--disallowedTools',...denies,'--add-dir',job.cli.directory,'--strict-mcp-config','--mcp-config','{"mcpServers":{}}','--',args.at(-1)]);
+  assert.equal(f.ctx.modelRegistry.getAvailable().length,0,'installed CLI, not Pi Anthropic credentials/catalog');
+});
+test('binding requires one exact UUID and canonical cwd, with minimal refusal evidence',async t=>{
+  const f=await fixture(t),record={id:'12345678',sessionId:ID,cwd:f.cwd,state:'stopped',pid:null};
+  f.state.records=[record];
+  assert.equal((await f.cli.match(record.id,f.cwd,ID)).session_id,ID);
+  const alias=join(f.agentDir,'cwd-alias'); await symlink(f.cwd,alias);
+  f.state.records=[{...record,cwd:alias,session_id:ID}];
+  assert.equal((await f.cli.match(record.id,f.cwd,ID)).cwd,f.cwd);
+  const wrongFull='12345678-9999-2222-3333-444444444444';
+  const cases=[
+    ['missing-record',[]],['ambiguous-record',[record,record]],
+    ['missing-uuid',[{...record,sessionId:undefined}]],
+    ['invalid-uuid',[{...record,sessionId:'PRIVATE-INVALID-UUID'}]],
+    ['uuid-prefix-mismatch',[{...record,sessionId:COPY}]],
+    ['expected-uuid-mismatch',[{...record,sessionId:wrongFull}]],
+    ['conflicting-uuid-aliases',[{...record,session_id:wrongFull}]],
+    ['missing-cwd',[{...record,cwd:undefined}]],
+    ['invalid-cwd',[{...record,cwd:17}]],
+    ['cwd-unresolvable',[{...record,cwd:join(f.cwd,'nonexistent')}]],
+    ['canonical-cwd-mismatch',[{...record,cwd:f.agentDir}]],
+    ['unknown-response',{records:[record],private:'PRIVATE-RESPONSE'}],
+  ];
+  for(const [reason,records] of cases) {
+    f.state.records=records;
+    const count=f.calls.length;
+    await assert.rejects(f.cli.match(record.id,f.cwd,ID),error=>{
+      assert.equal(error.code,'CLAUDE_BINDING_REFUSED'); assert.equal(error.reason,reason);
+      assert.equal(error.evidence.short_id,record.id); assert.equal(error.evidence.expected_uuid,ID);
+      assert.ok(error.message.includes(reason)); assert.ok(error.message.length<1024);
+      assert.ok(!error.message.includes('PRIVATE')); assert.ok(!error.message.includes('nonexistent'));
+      return true;
+    });
+    assert.equal(f.calls.length-count,1,'one public read, never readiness retry or mutation');
+  }
+  f.cli.invoke=async()=>({returncode:0,stdout:'{"private":"PRIVATE-MALFORMED',stderr:''});
+  await assert.rejects(f.cli.match(record.id,f.cwd,ID),error=>{
+    assert.equal(error.reason,'unknown-response'); assert.ok(!error.message.includes('PRIVATE')); return true;
+  });
+});
+test('same-short resume mismatch remains bound to original UUID and retains diagnostic across restore',async t=>{
+  const f=await fixture(t),job=await f.delegate(); await f.report(job,{changed_files:[]}); f.idle();
+  assert.equal((await f.act({op:'collect',run_id:job.run_id})).valid,true);
+  const invoke=f.cli.invoke,wrongFull='12345678-9999-2222-3333-444444444444';
+  f.cli.invoke=async(...args)=>{
+    const result=await invoke(...args);
+    if(args[1][0]==='--bg' && args[1][1]==='--resume') f.state.records[0].sessionId=wrongFull;
+    return result;
+  };
+  await assert.rejects(f.act({op:'resume',run_id:job.run_id,prompt:'Same owner fix'}),/expected-uuid-mismatch/);
+  const follow=f.workflow.tasks.design.jobs.at(-1);
+  assert.equal(follow.cli.session_id,ID); assert.equal(follow.agent_id,job.agent_id);
+  assert.equal(follow.valid,false); assert.equal(follow.cli.unexpected_copy,undefined);
+  assert.equal(f.calls.filter(a=>a[0]==='--bg'&&a[1]==='--resume').length,1);
+  const resumeArgs=f.calls.find(a=>a[0]==='--bg'&&a[1]==='--resume');
+  assert.deepEqual(resumeArgs,['--bg','--resume',ID,'--',resumeArgs.at(-1)]);
+  assert.match(resumeArgs.at(-1),/Same owner fix/);
+  assert.equal(f.calls.some(a=>a[0]==='stop'&&a[1]===wrongFull.slice(0,8)&&f.calls.indexOf(a)>f.calls.indexOf(resumeArgs)),false,'never stop a conflicting same-short identity');
+  const restored=new Workflow(f.host,{claude:f.cli}); restored.restore(f.ctx);
+  const saved=restored.tasks.design.jobs.at(-1);
+  assert.match(saved.error,/expected-uuid-mismatch/); assert.match(saved.error,new RegExp(ID)); assert.match(saved.error,new RegExp(wrongFull));
+  assert.equal(restored.activeJobs(f.cwd).length,1);
+});
 test('initial terminal launch and real same-owner resume notify separately without auto-freezing or collection',async t=>{
   for (const state of ['done','blocked','stopped','mystery']) {
     const f=await fixture(t), notices=[];
@@ -144,7 +221,8 @@ test('resume takes fresh trust snapshot after stop saves config, preserving save
   const launch=f.calls.findIndex(a=>a[0]==='--bg');
   assert.ok(f.calls.slice(0,launch).some(a=>a[0]==='agents'&&a[1]==='--json'));
   const resumeArgs=f.calls.filter(a=>a[0]==='--bg').at(-1);
-  assert.equal(resumeArgs.length,5); assert.deepEqual(resumeArgs.slice(0,4),['--bg','--resume',ID,'--']);
+  assert.deepEqual(resumeArgs,['--bg','--resume',ID,'--',resumeArgs.at(-1)]);
+  assert.match(resumeArgs.at(-1),/Bounded fix/);
 });
 test('resume preflight failure leaves exact owner stopped and never launches or changes unsafe config',async t=>{
   const f=await fixture(t),job=await f.delegate(); await f.report(job,{changed_files:[]}); f.idle();
@@ -207,6 +285,22 @@ test('resume copy is stopped exactly, retained and never rebound to original own
   assert.equal(follow.cli.session_id,ID); assert.equal(follow.cli.unexpected_copy.session_id,COPY); assert.equal(follow.cli.copy_frozen,true);
   assert.ok(f.calls.some(a=>a[0]==='stop'&&a[1]==='abcdef12'));
   assert.equal(follow.valid,false); assert.equal(f.workflow.activeJobs(f.cwd).length,1);
+});
+test('unexpected emitted copy with mismatched cwd is never stopped blindly, rebound or accepted',async t=>{
+  const f=await fixture(t),job=await f.delegate(); await f.report(job,{changed_files:[]}); f.idle();
+  assert.equal((await f.act({op:'collect',run_id:job.run_id})).valid,true);
+  f.state.copy=true; const invoke=f.cli.invoke;
+  f.cli.invoke=async(...args)=>{
+    const result=await invoke(...args);
+    if(args[1][0]==='--bg'&&args[1][1]==='--resume') f.state.records.find(r=>r.sessionId===COPY).cwd=f.agentDir;
+    return result;
+  };
+  await assert.rejects(f.act({op:'resume',run_id:job.run_id,prompt:'Bounded follow-up'}),/canonical-cwd-mismatch/);
+  const follow=f.workflow.tasks.design.jobs.at(-1);
+  assert.equal(follow.cli.session_id,ID); assert.equal(follow.agent_id,job.agent_id); assert.equal(follow.valid,false);
+  assert.equal(f.calls.some(a=>a[0]==='stop'&&a[1]===COPY.slice(0,8)),false);
+  assert.equal(f.calls.filter(a=>a[0]==='--bg'&&a[1]==='--resume').length,1);
+  assert.equal(f.workflow.activeJobs(f.cwd).length,1);
 });
 test('capability absence and invalid effort/checks never launch; no Pi Anthropic catalog required',async t=>{
   const f=await fixture(t);

@@ -111,8 +111,13 @@ requirement or functional constraint requires change.
 This path uses installed Claude Code `--bg`, retaining its existing authentication and
 permissions. It requires supported CLI capabilities, not Pi Anthropic credentials or a
 catalog entry. No installation, login change, API/print fallback or permission bypass
-is performed. The current repository cwd and managed disjoint ownership remain; no
-linked worktree or OS sandbox is claimed. Collection stops the exact observed writer,
+is performed. New initial launches explicitly set `worktree.bgIsolation: "none"` in
+`--settings`, alongside unchanged permission rules, to use the current shared checkout.
+`--safe-mode`, exact model/effort, `dontAsk`, empty `--setting-sources` and strict MCP
+remain. Managed disjoint ownership remains; no linked worktree or OS sandbox is claimed.
+Existing sessions keep saved options on resume: deployment does not retroactively change
+an old worktree guard, and adding resume overrides to force this can create a copy.
+Collection stops the exact observed writer,
 validates its run-bound report/checks and actual baseline delta, and rejects changes
 outside literal ownership. Existing dirty user files cannot be owned on initial dispatch;
 narrow ownership or resolve that conflict manually, never reset/stash user changes.
@@ -121,6 +126,12 @@ Before start/resume, GPT registers only the actual canonical Git root under cano
 operation. Outside that boundary workspace trust remains manual. Unsafe config,
 unknown/active sessions or observed concurrent writes block a needed update and launch.
 `CLAUDE_CONFIG_DIR` overrides fail closed because their config mapping is not established.
+Binding errors retain specific refusal reasons and minimal UUID/canonical-cwd fingerprint
+evidence, not whole public records. Conflicting UUID aliases, missing/ambiguous identities
+and cwd mismatches fail closed; no automatic readiness retry or owner replacement occurs.
+A later exact match is current evidence, not reconstruction of an unsaved error-time record.
+Safe resume still requires the exact original owner, latest collected/frozen report and
+owned delta, bounded scope and required adopted fixes; old saved guards may remain blocked.
 See [Claude design delegation](references/claude-design.md) for lifecycle, trust and recovery.
 
 Session-scoped monitoring observes only each Claude owner's latest uncollected run.

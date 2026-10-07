@@ -34,8 +34,13 @@ GPT taste into requirements. Astra remains preferred for visual acceptance; miss
 Astra/render access must be disclosed. A report or source review is not visual acceptance.
 
 New designers use installed Claude Code `--bg` in the current managed Git-root cwd,
-not a new linked worktree. Managed disjoint literal ownership and cross-task review
-freezing remain. Initial ownership overlapping existing dirty user files is refused;
+not a new linked worktree. Initial explicit `--settings` includes
+`worktree: {bgIsolation: "none"}` beside the existing `permissions` object. This is the
+requested shared-working-copy policy: it disables the background worktree requirement,
+not tool permission gates. `--safe-mode`, `dontAsk`, literal Edit/Write ownership,
+allowed checks, denied tools/publication, empty `--setting-sources`, strict empty MCP
+configuration and exact model/effort remain unchanged. Managed disjoint literal ownership
+and cross-task review freezing remain. Initial ownership overlapping existing dirty user files is refused;
 narrow it or ask the user to resolve the conflict manually. Never reset/stash/commit
 user work to prepare dispatch. The initial snapshot preserves content/modes, Git index
 and HEAD, including ignored outputs; collection rejects changes outside literal owned
@@ -76,6 +81,16 @@ exactly one documented `backgrounded · <eight-hex-short-id>` stdout line, then 
 exactly one public `claude agents --json --all` record matching that short ID, full UUID
 prefix and canonical cwd. It never binds by cwd/time alone. Missing/ambiguous IDs,
 changed cwd, unknown output or failed launch are explicit unresolved states, not done.
+Conflicting `sessionId`/`session_id` aliases are refused rather than choosing one.
+Binding refusals carry a reason and bounded identity-only evidence in the saved workflow
+error: expected short/full UUID, matching-record count, valid observed UUID aliases, and
+SHA-256 fingerprints of canonical cwd paths when resolved. Malformed identity values,
+raw paths, parser snippets and whole public records are not included. Fingerprints compare
+canonical paths, not directory contents. Same-short resume inspection supplies the original
+full UUID to this matcher; it cannot turn a conflicting identity into copy cleanup or a
+new owner. Inspection uses one bounded public query, with no readiness retry, inferred
+success from cwd/time, or automatic relaunch/resume. Without an error-time public record,
+a later matching record cannot reconstruct the earlier refusal or prove a transient race.
 Status/restore/active-job/review/accept gates track the CLI writer even without a native
 manager. Existing native designer jobs keep their recorded native behavior or require
 explicit recovery; they are never silently migrated to CLI.
@@ -100,6 +115,26 @@ The resume receipt must emit the original short ID and public inspection must co
 the identical full UUID/cwd. An unexpected emitted copy is verified and stopped exactly,
 with evidence retained; it never replaces the owner binding. A failed/unknown copy stop
 keeps freezing unresolved. Inspect changes/evidence before recovery, never retry blindly.
+
+Deploying a new Pi package changes only new initial launches. Existing sessions retain
+their saved settings on resume; old launch receipts without `worktree.bgIsolation` do not
+acquire `none` retroactively. The old background worktree guard may therefore persist.
+Do not add settings/model/permission overrides to an existing resume to force it off:
+that can copy the session and is not supported owner migration.
+
+For manual recovery, first inspect the retained launch/resume/stop receipts and latest
+workflow error, then obtain one bounded public observation for the exact owner and cwd.
+A current exact match establishes only current identity/lifecycle. Recover and validate
+the latest run-specific report and actual owned delta through collection, including exact
+stop acknowledgment and affirmative frozen lifecycle; missing/invalid reports, ambiguous
+identity, unknown lifecycle, unresolved copy freezes or out-of-scope changes remain
+blocking. Preserve the original owner, latest collected/frozen run, bounded task scope and
+any required adopted-fix decision before invoking managed `resume`. This does not promise
+that an old session can edit the shared checkout under its saved guard. If it remains
+blocked, leave it unresolved and ask the user for an explicit recovery/migration decision,
+rather than editing private sessions/config, overriding saved options or launching a
+replacement automatically. Historical offending records not retained cannot be recovered
+from a later status listing. No real affected-session resume is required for deployment QA.
 
 ## Workspace trust preflight
 

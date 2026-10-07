@@ -94,16 +94,50 @@ export class ClaudeBackground {
     } finally { clearTimeout(timer); signal?.removeEventListener('abort', off); }
   }
   async records(cwd, signal) {
-    const records = JSON.parse(await this.checked(['agents','--json','--all'], cwd, {signal}));
-    if (!Array.isArray(records)) throw new Error('Unknown Claude agents JSON format.');
+    const stdout = await this.checked(['agents','--json','--all'], cwd, {signal});
+    let records;
+    try { records = JSON.parse(stdout); } catch { /* Never echo a parser snippet/public record. */ }
+    if (!Array.isArray(records)) {
+      const error = new Error('Unknown Claude agents JSON format.');
+      error.code = 'CLAUDE_AGENTS_FORMAT'; throw error;
+    }
     return records;
   }
   async match(short, cwd, full, signal) {
-    const found = (await this.records(cwd, signal)).filter(r => r && r.id === short);
-    if (found.length !== 1) throw new Error('Bound Claude session missing or ambiguous; unknown is not done.');
-    const record = found[0], id = record.sessionId ?? record.session_id;
-    if (!uuid(id) || !id.startsWith(short + '-') || (full && full !== id) || typeof record.cwd !== 'string' || await realpath(record.cwd) !== await realpath(cwd)) throw new Error('Claude full UUID/cwd binding mismatch.');
-    return {id:short, session_id:id, cwd:await realpath(cwd), state:record.state ?? null, status:record.status ?? null, pid:record.pid ?? null};
+    // Keep bounded identity-only evidence in the error message: workflow state
+    // persists it across restore, without retaining unrelated public records or paths.
+    const evidence = {short_id:/^[a-f0-9]{8}$/.test(short) ? short : null, expected_uuid:uuid(full) ? full : null};
+    const refuse = reason => {
+      const error = new Error(`Claude full UUID/cwd binding mismatch: ${reason}; unknown is not done. ${JSON.stringify(evidence)}`);
+      error.code = 'CLAUDE_BINDING_REFUSED'; error.reason = reason; error.evidence = {...evidence};
+      throw error;
+    };
+    let records;
+    try { records = await this.records(cwd, signal); }
+    catch (error) { if (error.code === 'CLAUDE_AGENTS_FORMAT') refuse('unknown-response'); throw error; }
+    const found = records.filter(r => r && r.id === short);
+    evidence.match_count = found.length;
+    if (!found.length) refuse('missing-record');
+    if (found.length !== 1) refuse('ambiguous-record');
+    const record = found[0];
+    const camel = Object.hasOwn(record,'sessionId'), snake = Object.hasOwn(record,'session_id');
+    evidence.sessionId = uuid(record.sessionId) ? record.sessionId : null;
+    evidence.session_id = uuid(record.session_id) ? record.session_id : null;
+    if (camel && snake && record.sessionId !== record.session_id) refuse('conflicting-uuid-aliases');
+    const id = camel ? record.sessionId : record.session_id;
+    if (id === null || id === undefined) refuse('missing-uuid');
+    if (!uuid(id)) refuse('invalid-uuid');
+    if (!id.startsWith(short + '-')) refuse('uuid-prefix-mismatch');
+    if (full !== undefined && full !== id) refuse('expected-uuid-mismatch');
+    if (record.cwd === null || record.cwd === undefined) refuse('missing-cwd');
+    if (typeof record.cwd !== 'string' || !record.cwd) refuse('invalid-cwd');
+    let expectedCwd, observedCwd;
+    try { expectedCwd = await realpath(cwd); } catch { refuse('expected-cwd-unresolvable'); }
+    evidence.expected_cwd_sha256 = digest(expectedCwd);
+    try { observedCwd = await realpath(record.cwd); } catch { refuse('cwd-unresolvable'); }
+    evidence.observed_cwd_sha256 = digest(observedCwd);
+    if (observedCwd !== expectedCwd) refuse('canonical-cwd-mismatch');
+    return {id:short, session_id:id, cwd:expectedCwd, state:record.state ?? null, status:record.status ?? null, pid:record.pid ?? null};
   }
   async evidence(job, kind, args, cwd) {
     const result = await this.call(args, cwd);
@@ -158,7 +192,7 @@ export class ClaudeBackground {
     const denies = ['Agent','Task','Bash(git push *)','Bash(git -C * push *)','Bash(gh *)','Bash(glab *)','Bash(curl *)','Bash(wget *)',
       `Edit(/${cwd}/.git)`, `Edit(/${cwd}/.git/**)`, `Write(/${cwd}/.git)`, `Write(/${cwd}/.git/**)`];
     // No broad Edit/Write allow on the control directory: only this pending report.
-    const settings = {permissions:{defaultMode:'dontAsk', allow:allows, deny:denies}};
+    const settings = {permissions:{defaultMode:'dontAsk', allow:allows, deny:denies}, worktree:{bgIsolation:'none'}};
     const args = ['--bg','--safe-mode','--model','claude-opus-5-5','--effort',job.requested.effort,'--permission-mode','dontAsk','--setting-sources','','--settings',JSON.stringify(settings),'--tools','Read,Edit,Write,Glob,Grep,Bash','--allowedTools',...allows,'--disallowedTools',...denies,'--add-dir',job.cli.directory,'--strict-mcp-config','--mcp-config','{"mcpServers":{}}','--',prompt];
     await this.preflight(cwd);
     const result = await this.evidence(job, 'launch', args, cwd);
@@ -176,7 +210,9 @@ export class ClaudeBackground {
     job.cli.frozen = false;
     if (result.returncode !== 0) throw new Error('Claude resume failed; retained evidence, no retry.');
     const short = launchId(result.stdout);
-    const resumed = await this.match(short,cwd);
+    // Same-short replies must prove the saved full UUID at the binding boundary.
+    // A different emitted short ID is inspected only for exact copy cleanup below.
+    const resumed = await this.match(short,cwd,short === job.cli.short_id ? job.cli.session_id : undefined);
     if (short !== job.cli.short_id || resumed.session_id !== job.cli.session_id) {
       // Only stop the exact emitted copy after verifying UUID/cwd; never rebind owner.
       const copy = resumed;
