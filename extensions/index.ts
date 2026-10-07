@@ -2,6 +2,7 @@ import { Type } from 'typebox';
 import { getAgentDir, parseFrontmatter, type ExtensionAPI } from '@earendil-works/pi-coding-agent';
 import { getSupportedThinkingLevels } from '@earendil-works/pi-ai';
 import { Workflow, ROOT, isWriter } from './core.mjs';
+import { lifecycleDelivery } from './notice-delivery.js';
 import { modelView, modelToolResult, sanitizeContext, sanitizeSummaryEntries } from './model-view.mjs';
 import { join } from 'node:path';
 import { realpathSync } from 'node:fs';
@@ -23,10 +24,11 @@ const parameters = Type.Object({
   generated_outputs: Type.Optional(Type.Array(Type.Unknown(), {description:'Deprecated compatibility input; ignored. reconcile_generated now recollects without generated-output approvals.'})),
 });
 export default function (pi: ExtensionAPI) {
+  const delivery = lifecycleDelivery(pi);
   const workflow = new Workflow({
     events:pi.events, appendEntry:(type:string, data:unknown) => pi.appendEntry(type, data),
-    notify:(notice:unknown) => pi.sendMessage({customType:'pi-astraeus:claude-lifecycle', display:true,
-      content:JSON.stringify(modelView(notice)), details:modelView(notice)}, {deliverAs:'followUp', triggerTurn:true}),
+    notify:(notice:unknown) => delivery.notify({customType:'pi-astraeus:claude-lifecycle', display:true,
+      content:JSON.stringify(modelView(notice)), details:modelView(notice)}),
     agentDir:getAgentDir, parseFrontmatter,
     supportedThinking:getSupportedThinkingLevels,
     manager:() => (globalThis as any)[Symbol.for('pi-subagents:manager')],
@@ -65,9 +67,11 @@ export default function (pi: ExtensionAPI) {
       } catch (error) { if (ctx.hasUI) ctx.ui.notify(JSON.stringify(modelView({error:String(error)})), 'error'); else throw error; }
     },
   });
-  pi.on('session_start', (_event, ctx) => workflow.restore(ctx));
-  pi.on('session_tree', (_event, ctx) => workflow.restore(ctx));
-  pi.on('session_shutdown', () => workflow.dispose());
+  pi.on('session_start', (_event, ctx) => { delivery.start(ctx); workflow.restore(ctx); });
+  pi.on('session_tree', (_event, ctx) => { delivery.start(ctx); workflow.restore(ctx); });
+  pi.on('session_shutdown', () => { delivery.dispose(); workflow.dispose(); });
+  pi.on('agent_start', () => delivery.agentStart());
+  pi.on('agent_settled', () => delivery.settled());
   pi.on('before_agent_start', async (_event, ctx) => {
     workflow.ensureMonitoring(ctx);
     const state = await workflow.execute({op:'status'}, ctx);

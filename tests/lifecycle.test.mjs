@@ -120,8 +120,15 @@ async function notificationFixture(t, initialState = 'done') {
   const {DefaultResourceLoader,SettingsManager,SessionManager,createAgentSession,ModelRuntime,createEventBus}=await import('@earendil-works/pi-coding-agent');
   const {createAssistantMessageEventStream}=await import('@earendil-works/pi-ai');
   let parentRequests=0;
+  const prompts={hold:false, finishes:[], contexts:[], input:null, commands:0, attempts:0};
   const navigation={cancel:false, treeEvents:0, summaryMode:null, summaryRequests:0, finish:null};
   const fake=pi => {
+    pi.registerCommand('fixture-immediate',{description:'Deterministic command',handler:async () => {prompts.commands++;}});
+    pi.on('input', async () => {
+      if (!prompts.input) return;
+      const input=prompts.input; prompts.input=null; input.started=true;
+      await input.promise; return input.result;
+    });
     pi.on('session_before_tree', () => navigation.cancel ? {cancel:true} : undefined);
     pi.on('session_tree', () => {navigation.treeEvents++;});
     pi.registerProvider('local-notice', {api:'local-notice-api', apiKey:'fixture-only',baseUrl:'http://invalid.local',
@@ -143,7 +150,9 @@ async function notificationFixture(t, initialState = 'done') {
         if(options?.signal?.aborted) abort();
       } else {
         parentRequests++;
-        queueMicrotask(() => {stream.push({type:'done',reason:'stop',message}); stream.end(message);});
+        prompts.contexts.push(structuredClone(_context.messages));
+        const finish=() => {stream.push({type:'done',reason:'stop',message}); stream.end(message);};
+        if(prompts.hold) prompts.finishes.push(finish); else queueMicrotask(finish);
       }
       return stream;
     }});
@@ -154,15 +163,158 @@ async function notificationFixture(t, initialState = 'done') {
   await loader.reload(); assert.deepEqual(loader.getExtensions().errors,[]);
   const manager=SessionManager.inMemory(cwd); manager.appendCustomEntry(ENTRY,{version:1,tasks:{fixture:task(cwd)}});
   const {session}=await createAgentSession({cwd,agentDir,modelRuntime:runtime,model:runtime.getModel('openai','gpt-6.1-sol'),settingsManager:settings,sessionManager:manager,resourceLoader:loader});
-  const notices=[]; const send=session.sendCustomMessage.bind(session);
+  const notices=[], errors=[];
+  const prompt=session.agent.prompt.bind(session.agent);
+  session.agent.prompt=(...args) => {prompts.attempts++; return prompt(...args);};
+  const send=session.sendCustomMessage.bind(session);
   session.sendCustomMessage=(message,options) => {notices.push({message,options}); return send(message,options);};
   t.after(async () => {await session.extensionRunner.emit({type:'session_shutdown',reason:'quit'}); session.dispose();});
-  await session.bindExtensions({}); await session.setModel(runtime.getModel('local-notice','stub'));
-  const tool=session.agent.state.tools.find(t => t.name==='astraeus_workflow');
-  const status=() => tool.execute('fixture-status',{op:'status'},new AbortController().signal);
-  return {session, manager, notices, navigation, record, recordPath, startedPath, status, parentRequests:() => parentRequests,
+  await session.bindExtensions({onError:error => errors.push(error)}); await session.setModel(runtime.getModel('local-notice','stub'));
+  const status=() => session.agent.state.tools.find(t => t.name==='astraeus_workflow').execute('fixture-status',{op:'status'},new AbortController().signal);
+  return {session, manager, notices, errors, navigation, prompts, runtime, record, recordPath, startedPath, status, parentRequests:() => parentRequests,
     publish:() => writeFile(recordPath,JSON.stringify([record]))};
 }
+
+for (const state of ['done','blocked']) test(`actual prompt ${state} refresh preserves the user run instead of racing agent.prompt`, async t => {
+  const f=await notificationFixture(t,'working');
+  await until(() => f.manager.getBranch().filter(e => e.type==='custom'&&e.customType===ENTRY).at(-1).data.tasks.fixture.jobs[0].cli.notified_status==='running');
+  // Actual resource/runtime reload must install a fresh owner without stacking
+  // observers or losing the per-session prompt reservation.
+  if(state==='done') await f.session.reload();
+  f.record.state=state; f.record.status='idle'; await f.publish();
+  f.prompts.hold=true;
+  const user='Original user input, exactly once';
+  const outcome=f.session.prompt(user).then(() => ({ok:true}),error => ({error}));
+  await until(() => f.parentRequests()===1);
+  // Hold the deterministic provider so the old lifecycle wake remains active
+  // when the user's preflight attempts its own low-level agent.prompt.
+  await delay(30);
+  f.prompts.hold=false; f.prompts.finishes.splice(0).forEach(finish => finish());
+  const result=await outcome;
+  assert.equal(result.error,undefined,`user prompt rejected: ${result.error?.message}`);
+  await f.session.waitForIdle();
+  const messages=f.manager.buildSessionContext().messages;
+  assert.equal(messages.filter(m => m.role==='user'&&m.content.some(c => c.type==='text'&&c.text===user)).length,1);
+  assert.equal(messages.filter(m => m.customType==='pi-astraeus:claude-lifecycle').length,1);
+  assert.equal(f.notices[0].message.details.status,state==='done'?'work-ended':'blocked');
+  assert.deepEqual(f.notices[0].options,{deliverAs:'followUp',triggerTurn:false});
+  assert.equal(f.parentRequests(),1,'notice is included in the original request, not a duplicate parent run');
+  assert.equal(f.prompts.attempts,1,'no competing low-level agent.prompt attempt');
+  assert.deepEqual(f.errors,[]);
+  assert.ok(JSON.stringify(f.prompts.contexts[0]).includes(user));
+  assert.ok(JSON.stringify(f.prompts.contexts[0]).includes(f.notices[0].message.details.diagnostic));
+  await f.status(); assert.equal(f.parentRequests(),1,'unchanged observation cannot loop');
+});
+
+test('actual monitor during awaited authentication adds attention to the upcoming user context', async t => {
+  const f=await notificationFixture(t,'working');
+  await until(() => f.manager.getBranch().filter(e => e.type==='custom'&&e.customType===ENTRY).at(-1).data.tasks.fixture.jobs[0].cli.notified_status==='running');
+  let release, authenticating=false;
+  const configured=f.runtime.hasConfiguredAuth, check=f.runtime.checkAuth;
+  f.runtime.hasConfiguredAuth=() => false;
+  f.runtime.checkAuth=async () => {authenticating=true; return new Promise(resolve => {release=resolve;});};
+  const user='User held during authentication';
+  const outcome=f.session.prompt(user).then(() => ({ok:true}),error => ({error}));
+  await until(() => authenticating);
+  f.record.state='blocked'; f.record.status='idle'; await f.publish();
+  // No explicit status refresh: the actual session monitor ticks in the gap.
+  await until(() => f.notices.length===1,6500);
+  assert.equal(f.parentRequests(),0,'isIdle during preflight is not permission to wake');
+  assert.equal(f.prompts.attempts,0);
+  assert.deepEqual(f.notices[0].options,{deliverAs:'followUp',triggerTurn:false});
+  f.runtime.hasConfiguredAuth=configured; f.runtime.checkAuth=check; release('fixture-only');
+  assert.equal((await outcome).error,undefined);
+  assert.equal(f.parentRequests(),1);
+  assert.ok(JSON.stringify(f.prompts.contexts[0]).includes(user));
+  assert.ok(JSON.stringify(f.prompts.contexts[0]).includes('Needs attention; NOT successful completion.'));
+  assert.equal(f.manager.getBranch().filter(e => e.customType==='pi-astraeus:claude-wake').length,0);
+});
+
+for (const exit of ['handled','auth-error']) test(`actual ${exit} preflight releases notification reservation without masking errors`, async t => {
+  const f=await notificationFixture(t,'working');
+  await until(() => f.manager.getBranch().filter(e => e.type==='custom'&&e.customType===ENTRY).at(-1).data.tasks.fixture.jobs[0].cli.notified_status==='running');
+  let release;
+  const gate={promise:new Promise(resolve => {release=resolve;}),started:false,result:{action:'handled'}};
+  const configured=f.runtime.hasConfiguredAuth, check=f.runtime.checkAuth;
+  if(exit==='handled') f.prompts.input=gate;
+  else {
+    f.runtime.hasConfiguredAuth=() => false;
+    f.runtime.checkAuth=async () => {gate.started=true; await gate.promise; return undefined;};
+  }
+  const outcome=f.session.prompt('Unaccepted fixture input').then(() => ({ok:true}),error => ({error}));
+  await until(() => gate.started);
+  f.record.state='done'; f.record.status='idle'; await f.publish(); await f.status();
+  assert.equal(f.parentRequests(),0);
+  f.runtime.hasConfiguredAuth=configured; f.runtime.checkAuth=check; release();
+  const result=await outcome;
+  if(exit==='handled') assert.equal(result.ok,true);
+  else assert.match(result.error.message,/No API key found/,'unrelated auth error is propagated, not caught or retried');
+  await until(() => f.parentRequests()===1); await f.session.waitForIdle();
+  assert.equal(f.manager.buildSessionContext().messages.filter(m => m.role==='user').length,0,'handled/failed input is not resubmitted');
+  assert.equal(f.manager.getBranch().filter(e => e.customType==='pi-astraeus:claude-lifecycle').length,1);
+  assert.equal(f.manager.getBranch().filter(e => e.customType==='pi-astraeus:claude-wake').length,1);
+  assert.ok(JSON.stringify(f.prompts.contexts[0]).includes('ready to attempt collect, NOT implementation success.'));
+  f.record.state='blocked'; await f.publish(); await f.status();
+  await until(() => f.parentRequests()===2); await f.session.waitForIdle();
+  assert.deepEqual(f.notices.at(-1).options,{deliverAs:'followUp',triggerTurn:true},'future idle notifications remain enabled');
+  await f.status(); assert.equal(f.parentRequests(),2);
+});
+
+test('actual reload shutdown retires the pending preparation wake without an old-owner run', async t => {
+  const f=await notificationFixture(t,'working');
+  await until(() => f.manager.getBranch().filter(e => e.type==='custom'&&e.customType===ENTRY).at(-1).data.tasks.fixture.jobs[0].cli.notified_status==='running');
+  let release;
+  const gate={promise:new Promise(resolve => {release=resolve;}),started:false,result:{action:'handled'}};
+  f.prompts.input=gate;
+  const prompt=f.session.prompt('Input consumed by fixture extension');
+  await until(() => gate.started);
+  f.record.state='done'; f.record.status='idle'; await f.publish(); await f.status();
+  assert.equal(f.notices.length,1); assert.equal(f.prompts.attempts,0);
+  await f.session.extensionRunner.emit({type:'session_shutdown',reason:'reload'});
+  release(); await prompt; await delay(30);
+  assert.equal(f.prompts.attempts,0,'retired delivery does not wake when preflight finally exits');
+  assert.equal(f.manager.getBranch().filter(e => e.customType==='pi-astraeus:claude-wake').length,0);
+  assert.deepEqual(f.errors,[]);
+});
+
+test('actual streaming lifecycle notice remains a native followUp, not a competing prompt', async t => {
+  const f=await notificationFixture(t,'working');
+  f.prompts.hold=true;
+  const user='Streaming original input';
+  const outcome=f.session.prompt(user).then(() => ({ok:true}),error => ({error}));
+  await until(() => f.parentRequests()===1);
+  await assert.rejects(f.session.prompt('Ordinary concurrent input'),/Specify streamingBehavior/,'ordinary prompt errors are not masked');
+  f.record.state='blocked'; f.record.status='idle'; await f.publish(); await f.status();
+  assert.deepEqual(f.notices[0].options,{deliverAs:'followUp',triggerTurn:true});
+  assert.equal(f.parentRequests(),1,'followUp waits for the streaming turn');
+  f.prompts.hold=false; f.prompts.finishes.splice(0).forEach(finish => finish());
+  assert.equal((await outcome).error,undefined); await f.session.waitForIdle();
+  assert.equal(f.parentRequests(),2,'one legitimate queued followUp, no loop');
+  assert.equal(f.prompts.attempts,1,'followUp remains inside the same low-level run');
+  assert.deepEqual(f.errors,[]);
+  assert.equal(f.manager.buildSessionContext().messages.filter(m => m.role==='user'&&m.content.some(c => c.text===user)).length,1);
+  assert.equal(f.manager.getBranch().filter(e => e.customType==='pi-astraeus:claude-lifecycle').length,1);
+  await f.status(); assert.equal(f.parentRequests(),2);
+});
+
+test('actual user arriving after an idle notification wake waits before submission, without retry', async t => {
+  const f=await notificationFixture(t,'working');
+  await until(() => f.manager.getBranch().filter(e => e.type==='custom'&&e.customType===ENTRY).at(-1).data.tasks.fixture.jobs[0].cli.notified_status==='running');
+  f.prompts.hold=true;
+  f.record.state='done'; f.record.status='idle'; await f.publish(); await f.status();
+  await until(() => f.parentRequests()===1);
+  // A slash command remains immediate even while the notification provider is held.
+  const command=f.session.prompt('/fixture-immediate');
+  await until(() => f.prompts.commands===1); await command;
+  const user='User after notification-owned wake';
+  const outcome=f.session.prompt(user).then(() => ({ok:true}),error => ({error}));
+  await delay(30); assert.equal(f.parentRequests(),1);
+  f.prompts.hold=false; f.prompts.finishes.splice(0).forEach(finish => finish());
+  assert.equal((await outcome).error,undefined); await f.session.waitForIdle();
+  assert.equal(f.parentRequests(),2);
+  assert.equal(f.manager.buildSessionContext().messages.filter(m => m.role==='user'&&m.content.some(c => c.text===user)).length,1);
+  assert.equal(f.manager.getBranch().filter(e => e.customType==='pi-astraeus:claude-lifecycle').length,1);
+});
 
 test('actual extension lifecycle wiring wakes idle parent with followUp + triggerTurn using only fake public CLI/local provider', async t => {
   const f=await notificationFixture(t);

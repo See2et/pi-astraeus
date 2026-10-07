@@ -145,8 +145,19 @@ automatically accepted. Old saved permissions/guards may remain blocked.
 See [Claude design delegation](references/claude-design.md) for lifecycle, trust and recovery.
 
 Session-scoped monitoring observes only each Claude owner's latest uncollected run.
-Transitions send bounded `followUp` messages with `triggerTurn: true`, including when
-root is idle. `work-ended` means public done/idle evidence, ready to attempt collect,
+Transitions send bounded lifecycle messages: streaming roots receive native `followUp`
+messages, and idle roots wake automatically. During user-prompt preparation, notices
+are appended without starting a competing turn and enter the upcoming user context.
+Pi 1.0.4 reports idle during awaited prompt preparation and has no preparation-exit
+extension event. The extension therefore observes the exported `AgentSession.prompt`
+method with per-session reservations and `finally` cleanup, including handled inputs
+and errors; it does not edit upstream Pi or retry rejected user prompts. If preparation
+exits without a run, a hidden wake message processes the already-appended notice once.
+A user arriving during a notification-owned wake waits before submission; registered
+commands still execute immediately and explicit streaming delivery choices are unchanged.
+The observer is shared across reloads; retired extension owners cannot deliver later wakes. This runtime adaptation is tested
+against the pinned Pi version and needs compatibility checks on Pi upgrades.
+`work-ended` means public done/idle evidence, ready to attempt collect,
 not implementation success. `blocked`, external `stopped`, and `unknown` require
 attention and never imply success. Repeated observations do not wake root again;
 a resumed run has a new notification identity. Observation remains separate from
