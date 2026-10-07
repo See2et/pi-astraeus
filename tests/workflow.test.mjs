@@ -6,6 +6,8 @@ import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { parseFrontmatter } from '@earendil-works/pi-coding-agent';
 import { Workflow, ROOT, ENTRY, exactModel, hash, rpc, parseReport } from '../extensions/core.mjs';
+import { ClaudeBackground } from '../extensions/claude.mjs';
+import { originalRequest } from '../extensions/generated-output.mjs';
 
 const CLAUDE = {provider:'anthropic',id:'claude-opus-5-5',reasoning:true};
 const MODEL = {provider:'openai',id:'gpt-6.1-sol',reasoning:true};
@@ -178,6 +180,101 @@ test('native pre-dispatch failure permits original owner retry but attempted dis
   f.ctx.executeTool=async()=>{throw new Error('ambiguous dispatch failure');};
   await assert.rejects(f.act({op:'resume',run_id:follow.run_id,prompt:'Attempted correction'}),/ambiguous dispatch/);
   await assert.rejects(f.act({op:'resume',run_id:follow.run_id,prompt:'Do not skip attempt'}),/latest run/);
+});
+
+// Public CLI/manager fixtures only: no inference, trust/config writes or real sessions.
+async function legacyStoppedFixture(t) {
+  const f=await fixture(t), task=f.workflow.tasks.task;
+  await f.act({op:'authorize_design',...auth});
+  const uuid='12345678-1111-2222-3333-444444444444', calls=[];
+  const record={id:uuid.slice(0,8),sessionId:uuid,cwd:f.cwd,state:'stopped',status:'idle',pid:null};
+  const records=[record];
+  f.workflow.claude=new ClaudeBackground({trust:{run:async()=>{}},invoke:async(_command,args,cwd)=>{
+    assert.equal(cwd,f.cwd); calls.push(args);
+    if(args[0]==='agents') return {returncode:0,stdout:JSON.stringify(records),stderr:''};
+    if(args[0]==='stop') return {returncode:0,stdout:`stopped ${record.id}\n`,stderr:''};
+    assert.equal(args[0],'--bg');
+    if(args[1]==='--resume') { assert.equal(args[2],uuid); record.state='working'; record.status='running'; record.pid=123; }
+    return {returncode:0,stdout:`backgrounded · ${record.id} · Fixture\n`,stderr:''};
+  }});
+  const job={run_id:'d2f9d8b5-85df-4b25-bf7d-68191f2e0863',role:'designer',transport:'claude-code-bg-v1',
+    agent_id:`claude:${uuid}`,status:'stopped',collected:false,valid:false,owned_paths:['source.txt'],requested:{model:'anthropic/claude-opus-5-5',effort:'high'}};
+  task.jobs.push(job);
+  await f.workflow.prepareCli(task,job,f.ctx,[]);
+  Object.assign(job.cli,{short_id:record.id,session_id:uuid,frozen:true});
+  await f.workflow.claude.evidence(job,'launch',['--bg','--model','claude-opus-5-5','--effort','high','--','Fixture original'],f.cwd);
+  await f.workflow.claude.evidence(job,'stop',['stop',record.id],f.cwd);
+  await writeFile(job.cli.pending,JSON.stringify({schema_version:1,kind:'implementation',task_id:'task',run_id:job.run_id,
+    target_id:job.cli.dispatch_target,status:'complete',summary:'Fixture original work',changed_files:[],checks:[],remaining:[]}));
+  assert.equal((await f.act({op:'collect',run_id:job.run_id})).valid,true);
+  // Old runtime observed the shallow-copy failure as stopped, then an attempted
+  // recovery overwrote its preparation error with originalRequest's run mismatch.
+  const failed={...structuredClone(job),run_id:'cec98fd8-eee4-4c83-987b-ba7bc565aaaa',valid:false,collected:true,
+    status:'stopped',summary:undefined,result:undefined,artifact:undefined,result_hash:undefined,
+    error:'Error: Submodule/directory baseline unsupported: captured-workspace/'};
+  try { await originalRequest(task,failed); assert.fail('Inherited request must not bind this failed run'); }
+  catch(error) { assert.match(String(error),/baseline\/ownership\/check\/run binding changed/); failed.error=String(error); }
+  return {...f,task,job,failed,calls,record,cliRecords:records};
+}
+test('legacy already-stopped preparation failure resumes only the original owner under adopted-fix gate',async t=>{
+  const f=await legacyStoppedFixture(t), {job,failed}=f;
+  const review=await f.delegate('reviewer'), report=f.report(review);
+  report.verdict='changes_required'; report.bugs=[{location:'source.txt',claim:'Fixture defect',evidence:'Fixture requirement'}];
+  f.complete(review,report); assert.equal((await f.act({op:'collect',run_id:review.run_id})).valid,true);
+  f.task.jobs.push(failed); f.workflow.save(f.ctx); f.workflow.restore(f.ctx);
+  let retained=f.workflow.tasks.task.jobs.find(j=>j.run_id===failed.run_id);
+  assert.equal(retained.status,'stopped'); assert.equal(retained.resume_preparation_failure,undefined);
+  assert.match(retained.error,/baseline\/ownership\/check\/run binding changed/);
+  const count=f.calls.filter(a=>a[0]==='--bg').length, evidence=structuredClone(retained.cli.evidence);
+  await assert.rejects(f.act({op:'resume',run_id:job.run_id,prompt:'Do not bypass adjudication'}),/adopted fixes/);
+  assert.equal(f.calls.filter(a=>a[0]==='--bg').length,count);
+  const judge=await f.delegate('adjudicator');
+  f.complete(judge,{schema_version:1,kind:'adjudication',task_id:'task',target_id:judge.target_id,status:'complete',summary:'Fixture adopted fix',
+    verdict:'changes_required',review_sha256:review.result_hash,decisions:[{ref:'bugs/0',action:'fix',basis:'Original requirement',evidence:'Fixture evidence',rationale:'Authorized correction'}],
+    checked_scope:['source.txt'],evidence:['Fixture requirement'],unresolved:[]});
+  const decision=await f.act({op:'collect',run_id:judge.run_id}); assert.equal(decision.valid,true,decision.error);
+  await f.act({op:'status'}); f.workflow.restore(f.ctx);
+  retained=f.workflow.tasks.task.jobs.find(j=>j.run_id===failed.run_id);
+  assert.equal(retained.resume_preparation_failure,failed.error,'observation retains verified unsuccessful provenance');
+  const follow=await f.act({op:'resume',run_id:job.run_id,prompt:'Apply only adopted correction'});
+  assert.equal(follow.resume_from,job.run_id); assert.equal(follow.agent_id,job.agent_id);
+  assert.deepEqual(f.calls.filter(a=>a[0]==='--bg').at(-1).slice(0,4),['--bg','--resume',job.cli.session_id,'--']);
+  assert.equal(retained.valid,false); assert.equal(retained.error,failed.error); assert.equal(retained.result,undefined);
+  assert.equal(retained.artifact,undefined); assert.deepEqual(retained.cli.evidence,evidence);
+  assert.equal(f.workflow.tasks.task.accepted,false);
+});
+test('stopped inherited candidates with preparation, dispatch, copy or ambiguous binding still block recovery',async t=>{
+  const f=await legacyStoppedFixture(t), {job,failed}=f;
+  const request=join(job.cli.directory,'request.json'), requestBytes=await readFile(request);
+  const mutations=[
+    ['prepared binding',candidate=>{ candidate.cli.directory=join(f.agentDir,'prepared'); }],
+    ['attempted dispatch',candidate=>{ candidate.cli.evidence.push({...candidate.cli.evidence.at(-1),kind:'resume'}); }],
+    ['copy',candidate=>{ candidate.cli.unexpected_copy={id:'abcdef12',session_id:'abcdef12-1111-2222-3333-444444444444'}; }],
+    ['mutated request',async()=>{ await writeFile(request,'{}'); }],
+    ['mutated evidence',candidate=>{ candidate.cli.evidence[0].sha256='0'.repeat(64); }],
+    ['ambiguous original binding',(_candidate,task)=>{ task.jobs.unshift(structuredClone(job)); }],
+  ];
+  const count=f.calls.filter(a=>a[0]==='--bg').length;
+  for(const [label,mutate] of mutations) {
+    const candidate=structuredClone(failed); f.task.jobs=[job,candidate];
+    await mutate(candidate,f.task);
+    await assert.rejects(f.act({op:'resume',run_id:job.run_id,prompt:label}),/latest run|Collect\/stop active work/,label);
+    assert.equal(candidate.valid,false); assert.equal(candidate.resume_preparation_failure,undefined);
+    assert.equal(f.calls.filter(a=>a[0]==='--bg').length,count,label);
+    await writeFile(request,requestBytes);
+  }
+  const frozenOriginal=structuredClone(job);
+  for(const listing of [
+    [{...f.record,sessionId:'12345678-9999-2222-3333-444444444444'}],
+    [f.record,f.record],
+    [{...f.record,cwd:f.agentDir}],
+  ]) {
+    Object.assign(job,structuredClone(frozenOriginal));
+    f.task.jobs=[job,structuredClone(failed)];
+    f.cliRecords.splice(0,f.cliRecords.length,...listing);
+    await assert.rejects(f.act({op:'resume',run_id:job.run_id,prompt:'Do not dispatch on ambiguous identity'}),/full UUID\/cwd binding mismatch/);
+    assert.equal(f.calls.filter(a=>a[0]==='--bg').length,count);
+  }
 });
 
 test('branch restore marks lost active children unavailable, not successful',async t=>{

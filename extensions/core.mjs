@@ -664,17 +664,21 @@ export class Workflow {
       try { assertReceipt(prior,record); return true; } catch { return false; }
     }
     // Older resume attempts shallow-copied the stopped owner's CLI binding. A
-    // different run with exactly that binding has no request/dispatch of its own.
+    // different run with exactly one audited original binding has no request/dispatch
+    // of its own. Older observers could already have rewritten its status to stopped
+    // and collection could have overwritten its error with a request/run mismatch.
+    // Neither lifecycle nor diagnostic text proves preparation; immutable bytes do.
     // Never classify a prepared, attempted, copied, or merely missing owner this way.
     const retainedFailure = typeof candidate.resume_preparation_failure === 'string' && candidate.resume_preparation_failure.length > 0;
-    if (!isCli(candidate) || !candidate.collected || candidate.valid || candidate.result || candidate.artifact || candidate.result_hash ||
-        (!retainedFailure && (!['unknown','error','unavailable'].includes(candidate.status) || !candidate.error)) || !candidate.cli?.frozen) return false;
+    if (!isCli(candidate) || candidate.collected !== true || candidate.valid !== false || candidate.result || candidate.artifact || candidate.result_hash ||
+        (!retainedFailure && (!['unknown','error','unavailable','stopped'].includes(candidate.status) || typeof candidate.error !== 'string' || !candidate.error)) || candidate.cli?.frozen !== true) return false;
     const index = task.jobs.indexOf(candidate);
     const priors = task.jobs.slice(0,index).reverse().filter(j => isCli(j) && j.agent_id === candidate.agent_id && j.collected && j.cli?.frozen && j.run_id !== candidate.run_id);
     const binding = j => {
       const {observed, notified_status, evidence, ...cli} = j.cli;
       return {role:j.role, transport:j.transport, agent_id:j.agent_id, requested:j.requested, owned_paths:j.owned_paths, cli};
     };
+    let originals = 0;
     for (const prior of priors) {
       if (JSON.stringify(binding(prior)) !== JSON.stringify(binding(candidate))) continue;
       const inherited = prior.cli.evidence, evidence = candidate.cli.evidence;
@@ -690,10 +694,10 @@ export class Workflow {
           if (stopped.returncode !== 0 || typeof stopped.stdout !== 'string' || stopped.stdout.trim() !== `stopped ${candidate.cli.short_id}` ||
               JSON.stringify(stopped.args) !== JSON.stringify(['stop',candidate.cli.short_id])) throw new Error('Added stop is not an exact-owner acknowledgment.');
         }
-        return true;
+        originals++;
       } catch { /* Corruption, dispatch evidence, or an unbound earlier attempt cannot prove recovery. */ }
     }
-    return false;
+    return originals === 1; // Duplicate original request/run bindings are ambiguous.
   }
   async resume(task, job, p, ctx, signal) {
     if (!isWriter(job.role)) throw new Error('Reviews and adjudications always use fresh sessions.');
