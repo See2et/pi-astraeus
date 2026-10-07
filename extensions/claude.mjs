@@ -158,6 +158,7 @@ export class ClaudeBackground {
     const observed = await this.match(job.cli.short_id, cwd, job.cli.session_id, signal);
     job.cli.observed = observed;
     if (job.cli.unexpected_copy) {
+      if (!uuid(job.cli.unexpected_copy.session_id)) throw new Error('Unexpected Claude copy binding is unverified; retained emitted ID cannot authorize cleanup or success.');
       const copy = await this.match(job.cli.unexpected_copy.id,cwd,job.cli.unexpected_copy.session_id, signal);
       job.cli.copy_frozen = job.cli.copy_frozen && ['done','stopped'].includes(copy.state) && copy.pid === null && [null,'idle'].includes(copy.status);
       if (!job.cli.copy_frozen) throw new Error('Unexpected Claude copy is not affirmatively frozen.');
@@ -210,14 +211,20 @@ export class ClaudeBackground {
     job.cli.frozen = false;
     if (result.returncode !== 0) throw new Error('Claude resume failed; retained evidence, no retry.');
     const short = launchId(result.stdout);
+    if (short !== job.cli.short_id) {
+      // Retain failure provenance before inspection or cleanup can throw. A later
+      // public record must not retroactively bind this unverified emitted writer.
+      job.cli.unexpected_copy = {id:short, session_id:null};
+      job.cli.copy_frozen = false;
+    }
     // Same-short replies must prove the saved full UUID at the binding boundary.
     // A different emitted short ID is inspected only for exact copy cleanup below.
     const resumed = await this.match(short,cwd,short === job.cli.short_id ? job.cli.session_id : undefined);
     if (short !== job.cli.short_id || resumed.session_id !== job.cli.session_id) {
       // Only stop the exact emitted copy after verifying UUID/cwd; never rebind owner.
       const copy = resumed;
-      const stopped = await this.evidence(job, 'stop-unexpected-copy', ['stop',copy.id], cwd);
       job.cli.unexpected_copy = copy;
+      const stopped = await this.evidence(job, 'stop-unexpected-copy', ['stop',copy.id], cwd);
       if (stopped.returncode !== 0 || stopped.stdout.trim() !== `stopped ${copy.id}`) throw new Error('Unexpected Claude copy could not be stopped; retained evidence.');
       const frozen = await this.match(copy.id, cwd, copy.session_id);
       job.cli.copy_frozen = ['done','stopped'].includes(frozen.state) && frozen.pid === null && [null,'idle'].includes(frozen.status);

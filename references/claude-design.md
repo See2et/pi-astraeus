@@ -118,8 +118,10 @@ The resume receipt must emit the original short ID and public inspection must co
 the identical full UUID/cwd. An unexpected emitted copy is verified and stopped exactly,
 with evidence retained; it never replaces the owner binding. Even a successfully stopped
 copy remains unsuccessful: its report cannot be collected as valid or used to authorize
-resume or acceptance, including when restoring state from an older version. A failed/unknown copy stop
-keeps freezing unresolved. Inspect changes/evidence before recovery, never retry blindly.
+resume or acceptance, including when restoring state from an older version. If the
+emitted different ID fails binding inspection, its short ID is retained as unverified:
+no blind stop, automatic rebinding from a later listing, or successful report collection
+is permitted. A failed/unknown copy stop keeps freezing unresolved. Inspect changes/evidence before recovery, never retry blindly.
 
 Deploying a new Pi package changes only new initial launches. Existing sessions retain
 their saved settings on resume; old launch receipts without `worktree.bgIsolation` do not

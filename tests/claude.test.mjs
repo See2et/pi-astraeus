@@ -340,6 +340,22 @@ test('unexpected emitted copy with mismatched cwd is never stopped blindly, rebo
   assert.equal(f.calls.some(a=>a[0]==='stop'&&a[1]===COPY.slice(0,8)),false);
   assert.equal(f.calls.filter(a=>a[0]==='--bg'&&a[1]==='--resume').length,1);
   assert.equal(f.workflow.activeJobs(f.cwd).length,1);
+  await f.report(follow,{changed_files:[]});
+  assert.equal((await f.act({op:'collect',run_id:follow.run_id})).valid,false,'Matching report cannot erase refused emitted binding');
+  assert.equal(follow.artifact,undefined);
+  assert.deepEqual(follow.cli.unexpected_copy,{id:COPY.slice(0,8),session_id:null});
+  assert.equal(follow.cli.copy_frozen,false);
+  // A later matching public listing is not proof of the earlier writer identity.
+  f.state.records.find(r=>r.sessionId===COPY).cwd=f.cwd;
+  follow.valid=true; f.workflow.save(f.ctx); // legacy/stale success flag
+  const restored=new Workflow(f.host,{claude:f.cli}); restored.restore(f.ctx);
+  const act=params=>restored.execute({task_id:'design',...params},f.ctx);
+  await assert.rejects(act({op:'accept'}),/copy binding is unverified/);
+  assert.equal((await act({op:'collect',run_id:follow.run_id})).valid,false);
+  await assert.rejects(act({op:'resume',run_id:follow.run_id,prompt:'Retry unverified copy'}));
+  assert.equal(restored.tasks.design.jobs.length,2); assert.equal(restored.activeJobs(f.cwd).length,1);
+  assert.equal(f.calls.some(a=>a[0]==='stop'&&a[1]===COPY.slice(0,8)),false);
+  assert.equal(f.calls.filter(a=>a[0]==='--bg'&&a[1]==='--resume').length,1);
 });
 test('capability absence and invalid effort/checks never launch; no Pi Anthropic catalog required',async t=>{
   const f=await fixture(t);
