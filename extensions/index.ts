@@ -1,7 +1,8 @@
 import { Type } from 'typebox';
 import { getAgentDir, parseFrontmatter, type ExtensionAPI } from '@earendil-works/pi-coding-agent';
 import { getSupportedThinkingLevels } from '@earendil-works/pi-ai';
-import { Workflow, ROOT, ENTRY, isWriter } from './core.mjs';
+import { Workflow, ROOT, isWriter } from './core.mjs';
+import { modelView, modelToolResult, sanitizeContext, sanitizeSummaryEntries } from './model-view.mjs';
 import { join } from 'node:path';
 import { realpathSync } from 'node:fs';
 
@@ -27,6 +28,7 @@ export default function (pi: ExtensionAPI) {
     supportedThinking:getSupportedThinkingLevels,
     manager:() => (globalThis as any)[Symbol.for('pi-subagents:manager')],
   });
+  const guidance = (state:unknown) => `Apply ${join(ROOT, 'skills/pi-astraeus-orchestrate/SKILL.md')} to authorized project work. Simple tasks stay solo. Root owns scope and final acceptance. Use astraeus_workflow for managed consequential work, including when root implements directly (delegate is optional). Preserve project/user constraints and native Pi authentication for GPT. Explicit designer uses only installed Claude Code --bg, never as GPT fallback. Never claim strict sandbox assurance. Current workflow view (not fresh lifecycle evidence): ${JSON.stringify(modelView(state))}. Read-only role instructions are not OS isolation.`;
   const internalResume = new Map<string, string>();
   pi.registerTool({
     name:'astraeus_workflow', label:'Astraeus workflow', exposure:'model-only',
@@ -40,7 +42,9 @@ export default function (pi: ExtensionAPI) {
       }
       try {
         const result = await workflow.execute(params, ctx, signal);
-        return {content:[{type:'text',text:JSON.stringify(result, null, 2)}],details:result};
+        return modelToolResult(result);
+      } catch (error) {
+        return {...modelToolResult({diagnostic:'Astraeus operation failed; no success inferred.', error:String(error)}), isError:true};
       } finally { internalResume.delete(toolCallId); }
     },
   });
@@ -51,9 +55,9 @@ export default function (pi: ExtensionAPI) {
         const policy = await workflow.policy(ctx);
         const tasks = await workflow.execute({op:'status', task_id:args.trim() || undefined}, ctx);
         const available = ctx.modelRegistry.getAvailable().map(m => `${m.provider}/${m.id}`);
-        const summary = JSON.stringify({policy, available_models:available, tasks, tintinweb_available:!!workflow.manager(), assurance_limit:'Pi does not attest an OS read-only sandbox; strict review is blocked.'}, null, 2);
+        const summary = JSON.stringify(modelView({policy, available_models:available, tasks, tintinweb_available:!!workflow.manager(), assurance_limit:'Pi does not attest an OS read-only sandbox; strict review is blocked.'}));
         if (ctx.hasUI) ctx.ui.notify(summary, 'info');
-      } catch (error) { if (ctx.hasUI) ctx.ui.notify(String(error), 'error'); else throw error; }
+      } catch (error) { if (ctx.hasUI) ctx.ui.notify(JSON.stringify(modelView({error:String(error)})), 'error'); else throw error; }
     },
   });
   pi.on('session_start', (_event, ctx) => workflow.restore(ctx));
@@ -62,8 +66,23 @@ export default function (pi: ExtensionAPI) {
     const state = await workflow.execute({op:'status'}, ctx);
     return { message: {
       customType:'pi-astraeus:guidance', display:false,
-      content:`Apply ${join(ROOT, 'skills/pi-astraeus-orchestrate/SKILL.md')} to authorized project work. Simple tasks stay solo. Root owns scope and final acceptance. Use astraeus_workflow for managed consequential work, including when root implements directly (delegate is optional). Preserve project/user constraints and native Pi authentication for GPT. Explicit designer uses only installed Claude Code --bg, never as GPT fallback. Never claim strict sandbox assurance. Current workflow state: ${JSON.stringify(state)}. Read-only role instructions are not OS isolation.`,
+      content:guidance(state),
     }};
+  });
+  pi.on('context', event => ({messages:sanitizeContext(event.messages, guidance(Object.values(workflow.tasks)))}));
+  // Pi compaction has its own summarization path, outside the context event.
+  // Change only request-local preparations, not branchEntries/raw session history.
+  pi.on('session_before_compact', event => {
+    const current = guidance(Object.values(workflow.tasks));
+    event.preparation.messagesToSummarize = sanitizeContext(event.preparation.messagesToSummarize, current);
+    event.preparation.turnPrefixMessages = sanitizeContext(event.preparation.turnPrefixMessages, current);
+  });
+  pi.on('session_before_tree', event => {
+    // Pi 1.0.4 retains this request-local array for generateBranchSummary;
+    // replace its elements with sanitized copies, never persisted entry objects.
+    const entries = event.preparation.entriesToSummarize;
+    const sanitized = sanitizeSummaryEntries(entries, guidance(Object.values(workflow.tasks)));
+    entries.splice(0, entries.length, ...sanitized);
   });
   pi.on('tool_call', (event, ctx) => {
     const tasks = (Object.values(workflow.tasks) as any[]).filter(task => task.cwd === realpathSync(ctx.cwd));

@@ -167,6 +167,30 @@ pending/final result artifacts live in an additional `RUN` directory. Its collec
 baseline includes ignored files, unlike the source review target. Result/receipt hashes are checked again
 at acceptance; adjudication binds to the exact original review bytes.
 
+Model-facing tool text **and details**, startup guidance and `/astraeus` diagnostics
+use an allowlisted orchestration view, not raw workflow snapshots. The view keeps run
+identity, status/valid/collected flags, requested versus observed settings, actionable
+findings and artifact references; it excludes the designer baseline/files/index.
+Strings are limited to 1,024 characters, arrays to 12 items, and each serialized view
+to 8 KiB (the complete registered tool response stays below 24 KiB). Tasks and jobs
+show newest first. Omission counts and total/attention-job counts are explicit:
+omitted evidence is not a successful check or permission to accept. Narrow status to
+a task and read referenced reports/receipts/lifecycle artifacts in bounded slices.
+Full snapshots, including ignored files, remain in non-context custom metadata and
+designer request artifacts; collection and ownership verification still use them.
+
+On restored legacy sessions, the Pi `context` hook replaces only Astraeus tool-result
+payloads and guidance before model input, including giant results retained by
+compaction. It preserves tool-call IDs/error flags and leaves signed assistant
+reasoning, unrelated messages and raw history unchanged. Legacy JSON text-only
+results are projected; malformed payloads (or text over the 16 Mi-character recovery
+parse limit) become a compact diagnostic, never an echo of the original. Repeated old
+guidance is replaced by one bounded current view, not fresh lifecycle evidence.
+Compaction and branch-summary preparation receive the same payload sanitation.
+Existing anonymous compaction/branch summary prose is not rewritten, nor are
+exports/raw history or private sessions migrated; restart with the updated extension
+to enable recovery.
+
 Workflow snapshots use Pi custom session entries and restore from the active branch,
 not abandoned branches. Pi session identity controls ownership; there is no extra
 session database. If a process restart loses a live Tintinweb child record, it is
@@ -190,6 +214,9 @@ uv run --with 'jsonschema>=4.23,<5' python -m unittest discover -s tests/python 
 uv run --with 'jsonschema>=4.23,<5' python -c 'import os,subprocess,sys; os.environ["PI_ASTRAEUS_PYTHON"]=sys.executable; sys.exit(subprocess.call(["npm","test"]))'
 ```
 
+Registration-level context regressions use 15,173 synthetic baseline files, legacy
+retained tool responses, startup/compaction hooks and many long tasks/jobs/findings.
+They assert bounded output and intact restored baseline/out-of-ownership checks.
 Tests cover target invalidation, schema/hash binding, verdict transitions, fallback
 rejection, role overrides, writer ownership and branch recovery. The native test loads
 both real extension factories with Pi 1.0.4 and exercises real child sessions using a
