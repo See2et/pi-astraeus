@@ -25,7 +25,7 @@ async function fixture(t) {
   events.on('subagents:rpc:ping', p => events.emit(`subagents:rpc:ping:reply:${p.requestId}`,{success:true,data:{version:2}}));
   events.on('subagents:rpc:spawn', p => {
     const id=`child-${++count}`;
-    const record={id,type:p.type,status:'running',session:{model:p.options.model,thinkingLevel:p.options.thinkingLevel},result:''};
+    const record={id,type:p.type,description:p.options.description,isBackground:p.options.isBackground,status:'running',session:{model:p.options.model,thinkingLevel:p.options.thinkingLevel},result:''};
     records.set(id,record); p.options.onSpawned(id);
     events.emit(`subagents:rpc:spawn:reply:${p.requestId}`,{success:true,data:{id}});
   });
@@ -68,6 +68,12 @@ test('legacy pin requires explicit policy and unavailable pin never substitutes 
   f.complete(job,'Verified explicitly pinned legacy route');
   assert.equal((await f.act({op:'collect',run_id:job.run_id})).valid,true);
   assert.throws(()=>exactModel({getAvailable:()=>[MODEL]},'openai/gpt-5.5',explicit),/Unavailable/);
+});
+test('native delegation supplies a task-specific description for background completion delivery',async t=>{
+  const f=await fixture(t), job=await f.delegate('worker');
+  const record=f.records.get(job.agent_id);
+  assert.equal(record.description,'task: worker');
+  assert.equal(record.isBackground,true);
 });
 test('RPC times out and removes its reply listener',async()=>{
   const bus=new Bus(); await assert.rejects(rpc(bus,'ping',{},5),/timed out/);

@@ -311,7 +311,7 @@ export class Workflow {
         await this.claude.start(job, task.cwd, await this.cliPrompt(task, job, prompt), job.cli.checks);
         this.save(ctx); return job;
       }
-      const response = await rpc(this.host.events, 'spawn', { type: `astraeus-${role}`, prompt, options: { model, thinkingLevel:p.thinking, inheritContext:false, isBackground:true, cwd:ctx.cwd, onSpawned: id => { job.agent_id = id; this.save(ctx); } } });
+      const response = await rpc(this.host.events, 'spawn', { type: `astraeus-${role}`, prompt, options: { description:`${task.task_id}: ${role}`, model, thinkingLevel:p.thinking, inheritContext:false, isBackground:true, cwd:ctx.cwd, onSpawned: id => { job.agent_id = id; this.save(ctx); } } });
       job.agent_id = response.id; job.status = this.manager()?.getRecord(response.id)?.status ?? 'running'; this.save(ctx);
       return job;
     } catch (error) { job.status = isCli(job) ? 'unavailable' : this.manager()?.getRecord(job.agent_id)?.status ?? (job.agent_id ? 'unavailable' : 'error'); job.error = String(error); this.save(ctx); throw error; }
