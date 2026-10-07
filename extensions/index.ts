@@ -17,15 +17,10 @@ const parameters = Type.Object({
   role: Type.Optional(Type.Union(['worker', 'designer', 'reviewer', 'adjudicator'].map(x => Type.Literal(x)))),
   model: Type.Optional(Type.String({description:'Exact authorized provider/model ID; no fuzzy matching or fallback'})),
   thinking: Type.Optional(Type.Union(['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'].map(x => Type.Literal(x)))),
-  prompt: Type.Optional(Type.String()), owned_paths: Type.Optional(Type.Array(Type.String())),
+  prompt: Type.Optional(Type.String()), owned_paths: Type.Optional(Type.Array(Type.String({description:'Bounded assignment/scheduling scope; advisory like native GPT ownership, not CLI edit permissions'}))),
   checks: Type.Optional(Type.Array(Type.String({description:'Designer-only exact simple verification commands; absent means []'}))),
   run_id: Type.Optional(Type.String()),
-  generated_outputs: Type.Optional(Type.Array(Type.Object({
-    path: Type.String({description:'Exact literal ignored node_modules/.vite/vitest/<40hex>/results.json path; not source ownership'}),
-    before: Type.Union([Type.String({description:'Preserved baseline mode:sha256 fingerprint'}), Type.Null()]),
-    after: Type.String({description:'Exact current regular-file mode:sha256 fingerprint'}),
-    reason: Type.String({minLength:1, description:'Evidence-based reason this required Vitest check generated the output'}),
-  }, {additionalProperties:false}))),
+  generated_outputs: Type.Optional(Type.Array(Type.Unknown(), {description:'Deprecated compatibility input; ignored. reconcile_generated now recollects without generated-output approvals.'})),
 });
 export default function (pi: ExtensionAPI) {
   const workflow = new Workflow({
@@ -40,7 +35,7 @@ export default function (pi: ExtensionAPI) {
   const internalResume = new Map<string, string>();
   pi.registerTool({
     name:'astraeus_workflow', label:'Astraeus workflow', exposure:'model-only',
-    description:`Manage evidence-bound Astraeus work. Trivial work stays solo. For consequential work, start with requirements/acceptance/constraints, delegate only useful bounded work with exact model+thinking, collect results, use fresh reviewer then fresh adjudicator only after complete changes_required, resume the original implementation owner for adopted fixes, and accept after evidence and current-target checks. For explicit Claude design only, record original design_request and design_scope at start/authorize_design, then use designer with matching scope and exact anthropic/claude-opus-5-5 (logical pin), installed Claude Code --bg with supported CLI effort and optional checks. GPT routes stay native; no CLI/API fallback. Designer collect stops the exact bound writer and validates a run-specific structured report and owned baseline delta. Explicit reconcile_generated may approve only exact ignored Vitest results caches after failed ownership collection, with generated_outputs before/after fingerprints and reasons; it never widens ownership or permissions. These are caller attestations, not authenticated user consent. Status does not infer success. Role policies: ${join(ROOT, 'skills')}.`,
+    description:`Manage evidence-bound Astraeus work. Trivial work stays solo. For consequential work, start with requirements/acceptance/constraints, delegate only useful bounded work with exact model+thinking, collect results, use fresh reviewer then fresh adjudicator only after complete changes_required, resume the original implementation owner for adopted fixes, and accept after evidence and current-target checks. For explicit Claude design only, record original design_request and design_scope at start/authorize_design, then use designer with matching scope and exact anthropic/claude-opus-5-5 (logical pin), installed Claude Code --bg with supported CLI effort and optional checks. GPT routes stay native; no CLI/API fallback. Designer owned_paths is advisory assignment/scheduling, with repository-scoped edit permissions and protected Git/workflow artifacts. Preserve user changes and explicit design scope. Collect freezes the exact UUID/cwd and records run-bound outcomes separately from acceptance; outside/ignored/shared-cwd deltas are not collection gates. Failed original collected runs may resume after verified identity/freeze/evidence without a successful prior report. reconcile_generated is a deprecated recollection alias for persisted failures; no cache fingerprints or new approvals. Existing Claude sessions retain saved permissions on resume and are not migrated. These are caller attestations, not authenticated user consent. Status does not infer success. Role policies: ${join(ROOT, 'skills')}.`,
     parameters,
     async execute(toolCallId, params, signal, _onUpdate, ctx) {
       workflow.ensureMonitoring(ctx);

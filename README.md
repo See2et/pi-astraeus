@@ -58,7 +58,7 @@ status to one task. Root uses the model-only `astraeus_workflow` tool as follows
 | `authorize_design` | `task_id`, original explicit user quote in `design_request`, bounded `design_scope`; record once for an existing task. The same optional fields may be included at `start`. |
 | `delegate` | `task_id`, `role`, exact `model` provider/id, supported `thinking`, bounded `prompt`; worker/designer `owned_paths` are literal relative paths, default `.`. Designer optionally supplies `checks` (absent means `[]`). |
 | `collect` | `task_id`, `run_id`; reports running promptly, validates settled outcomes. No repeated tight polling. |
-| `reconcile_generated` | `task_id`, original frozen failed designer `run_id`, explicit `generated_outputs` with literal Vitest cache `path`, baseline `before` (mode:sha256 or null), current `after`, and `reason`; never widens source ownership. See [bounded recovery](references/claude-design.md#explicit-generated-verification-output-recovery). |
+| `reconcile_generated` | Deprecated compatibility alias for recollecting the latest original collected/frozen designer; no cache fingerprints/approval needed, `generated_outputs` ignored. Prefer `collect`. See [retired reconciliation](references/claude-design.md#retired-generated-output-reconciliation). |
 | `resume` | `task_id`, original worker/designer `run_id`, follow-up `prompt`; uses native Agent continuation for workers/legacy native designers, or exact stopped Claude UUID for CLI designers; never resumes a reviewer/adjudicator. |
 | `stop` | `task_id`, `run_id`; stops only this managed child, then collect its incomplete outcome. |
 | `status` | Optional `task_id`; checks current target and restores explicit incomplete states. |
@@ -116,15 +116,19 @@ This path uses installed Claude Code `--bg`, retaining its existing authenticati
 permissions. It requires supported CLI capabilities, not Pi Anthropic credentials or a
 catalog entry. No installation, login change, API/print fallback or permission bypass
 is performed. New initial launches explicitly set `worktree.bgIsolation: "none"` in
-`--settings`, alongside unchanged permission rules, to use the current shared checkout.
+`--settings` to use the current shared checkout. Edit/Write permissions cover the repository,
+with Git/workflow controls protected; bounded pending reports are separately writable.
 `--safe-mode`, exact model/effort, `dontAsk`, empty `--setting-sources` and strict MCP
 remain. Managed disjoint ownership remains; no linked worktree or OS sandbox is claimed.
 Existing sessions keep saved options on resume: deployment does not retroactively change
-an old worktree guard, and adding resume overrides to force this can create a copy.
-Collection stops the exact observed writer,
-validates its run-bound report/checks and actual baseline delta, and rejects changes
-outside literal ownership. Existing dirty user files cannot be owned on initial dispatch;
-narrow ownership or resolve that conflict manually, never reset/stash user changes.
+old ownership permissions or a worktree guard, and adding resume overrides to force
+migration can create a copy. `owned_paths` is advisory assignment/scheduling like native
+GPT workers, not per-file edit restrictions or baseline-delta acceptance gates; explicit
+design scope remains bounded. Dirty assigned files do not blanket-block dispatch:
+preserve user work by instruction, never reset/stash it. Collection stops the exact
+UUID/cwd writer and records run-bound outcomes separately from acceptance. Outside-source,
+ignored-generated and later shared-cwd deltas alone do not block collection/recollection
+or acceptance; root still judges scope, user work and unauthorized staging/history.
 Before start/resume, GPT registers only the actual canonical Git root under canonical
 `~/ghq` in writable `~/.claude.json`; existing true is a no-write/no-session-inspection
 operation. Outside that boundary workspace trust remains manual. Unsafe config,
@@ -134,8 +138,10 @@ Binding errors retain specific refusal reasons and minimal UUID/canonical-cwd fi
 evidence, not whole public records. Conflicting UUID aliases, missing/ambiguous identities
 and cwd mismatches fail closed; no automatic readiness retry or owner replacement occurs.
 A later exact match is current evidence, not reconstruction of an unsaved error-time record.
-Safe resume still requires the exact original owner, latest collected/frozen report and
-owned delta, bounded scope and required adopted fixes; old saved guards may remain blocked.
+Safe resume requires the exact original owner, latest collected/frozen run, immutable
+evidence integrity, bounded scope and required adopted fixes. Failed original runs can
+resume for correction without a successful prior report; incomplete/failed work is not
+automatically accepted. Old saved permissions/guards may remain blocked.
 See [Claude design delegation](references/claude-design.md) for lifecycle, trust and recovery.
 
 Session-scoped monitoring observes only each Claude owner's latest uncollected run.

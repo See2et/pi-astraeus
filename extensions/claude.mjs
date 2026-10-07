@@ -183,15 +183,14 @@ export class ClaudeBackground {
     await this.capabilities(cwd, job.requested.effort);
     if (/[*?\[\]()\r\n]/.test(cwd + job.cli.directory + job.cli.report_directory)) throw new Error('Claude cwd/control paths contain permission-rule metacharacters.');
     const allows = ['Read','Glob','Grep'];
-    for (const path of job.owned_paths) {
-      const absolute = resolve(cwd, path);
-      allows.push(`Edit(/${absolute})`, `Edit(/${absolute}/**)`, `Write(/${absolute})`, `Write(/${absolute}/**)`);
-    }
+    // Like native GPT ownership, owned_paths guides assignment/scheduling, not
+    // per-file permissions. The CLI boundary is the managed repository.
+    allows.push(`Edit(/${cwd}/**)`, `Write(/${cwd}/**)`);
     // Saved permissions survive resume. Only pending reports get a stable bounded
     // directory allow; requests, evidence and validated final reports never do.
     allows.push(`Edit(/${job.cli.report_directory}/**)`, `Write(/${job.cli.report_directory}/**)`, ...checks.map(c => `Bash(${c})`));
     const denies = ['Agent','Task','Bash(git push *)','Bash(git -C * push *)','Bash(gh *)','Bash(glab *)','Bash(curl *)','Bash(wget *)',
-      `Edit(/${cwd}/.git)`, `Edit(/${cwd}/.git/**)`, `Write(/${cwd}/.git)`, `Write(/${cwd}/.git/**)`];
+      ...['.git','.astraeus'].flatMap(path => [`Edit(/${cwd}/${path})`, `Edit(/${cwd}/${path}/**)`, `Write(/${cwd}/${path})`, `Write(/${cwd}/${path}/**)`])];
     // No broad Edit/Write allow on the control directory: only this pending report.
     const settings = {permissions:{defaultMode:'dontAsk', allow:allows, deny:denies}, worktree:{bgIsolation:'none'}};
     const args = ['--bg','--safe-mode','--model','claude-opus-5-5','--effort',job.requested.effort,'--permission-mode','dontAsk','--setting-sources','','--settings',JSON.stringify(settings),'--tools','Read,Edit,Write,Glob,Grep,Bash','--allowedTools',...allows,'--disallowedTools',...denies,'--add-dir',job.cli.directory,'--strict-mcp-config','--mcp-config','{"mcpServers":{}}','--',prompt];
@@ -264,11 +263,10 @@ export async function snapshot(cwd) {
   for (const args of [['diff','--name-only','--no-renames','--no-ext-diff','--no-textconv','-z'],['diff','--cached','--name-only','--no-renames','--no-ext-diff','--no-textconv','-z'],['ls-files','--others','--exclude-standard','-z']]) for (const p of (await git(args)).split('\0').filter(Boolean)) dirty.add(p);
   return {files, head:head.returncode === 0 ? head.stdout.trim() : null, index:await git(['ls-files','--stage','-z']), dirty:[...dirty].sort()};
 }
-export function delta(before, after, owned) {
-  if (before.head !== after.head || before.index !== after.index) throw new Error('Designer changed Git HEAD/index; preserve existing user staging/history.');
-  const changed = [...new Set([...Object.keys(before.files), ...Object.keys(after.files)])].filter(p => before.files[p] !== after.files[p]).sort();
-  for (const p of changed) if (!owned.some(o => o === '.' || p === o || p.startsWith(o + '/'))) throw new Error(`Out-of-ownership baseline delta: ${p}`);
-  return changed;
+// Observational only: shared-cwd changes cannot be attributed to one owner.
+// Root judges scope, user-work preservation and staging/history in final review.
+export function delta(before, after) {
+  return [...new Set([...Object.keys(before.files), ...Object.keys(after.files)])].filter(p => before.files[p] !== after.files[p]).sort();
 }
 export async function publish(pending, final, bytes) {
   if ((await lstat(pending)).isSymbolicLink() || !Buffer.from(await readFile(pending)).equals(Buffer.from(bytes))) throw new Error('Pending implementation result changed.');

@@ -51,7 +51,7 @@ async function fixture(t) {
   return {session, manager, baseline, job, task, cwd, tool};
 }
 
-test('registered tool and startup guidance bound 15k-file restored state without weakening internal ownership', async t => {
+test('registered tool and startup guidance bound 15k-file restored state with observational baseline', async t => {
   const f = await fixture(t);
   const result = await f.tool.execute('status-call', {op:'status'}, new AbortController().signal);
   bounded(result); bounded(result.content); const details = bounded(result.details);
@@ -66,7 +66,7 @@ test('registered tool and startup guidance bound 15k-file restored state without
   const restored = internal.tasks.legacy.jobs[0].cli.baseline;
   assert.equal(Object.keys(restored.files).length, 15173); assert.equal(restored.index, f.baseline.index);
   const after = structuredClone(restored); after.files[Object.keys(after.files)[15172]] = 'changed';
-  assert.throws(() => delta(restored, after, ['ui']), /Out-of-ownership/);
+  assert.deepEqual(delta(restored, after), [Object.keys(after.files)[15172]]);
   const collected = await f.tool.execute('collect-call', {op:'collect', task_id:'legacy', run_id:'run-fixture'}, new AbortController().signal);
   bounded(collected); assert.equal(collected.details.valid, false); assert.equal(collected.details.run_id, 'run-fixture');
   bounded(await f.tool.execute('invalidate-call', {op:'invalidate', task_id:'legacy'}, new AbortController().signal));

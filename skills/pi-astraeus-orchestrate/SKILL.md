@@ -67,8 +67,12 @@ No auth changes, permission bypass or API/print fallback. GPT's narrowly authori
 runtime preflight sets only canonical `~/ghq` Git-root workspace trust before start/resume,
 preserving all other config/auth/session values; outside that boundary trust stays manual.
 Collect freezes the exact
-observed UUID and validates a run-specific report, required checks and owned baseline
-delta. Resume the stopped original owner without configuration overrides; reject copies.
+observed UUID/cwd and records run-specific outcomes separately from acceptance.
+Owned paths remain advisory assignment/scheduling like native GPT workers, not CLI
+path permissions or baseline-delta gates; preserve user work and authorized design scope.
+Failed collected runs may resume with verified original identity/freeze/evidence, without
+a successful prior report. Resume without configuration overrides; reject copies.
+Existing Claude sessions retain saved permissions; deployment does not migrate them.
 
 Prioritize Astra for design direction and visual acceptance. For an authorized Claude
 task, Opus owns design choices; GPT review assesses brief and function without

@@ -6,7 +6,7 @@ import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 import { ClaudeBackground, observedStatus, CLAUDE_TRANSPORT, CLI_EFFORTS, validatePaths, validateChecks, snapshot, publish } from './claude.mjs';
-import { approvedDelta, proposalDelta, originalRequest, requiredVitest, writeReconciliation, snapshotHash } from './generated-output.mjs';
+import { originalRequest } from './generated-output.mjs';
 export const isCli = job => job.transport === CLAUDE_TRANSPORT;
 export const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 export const ENTRY = 'pi-astraeus:state-v1';
@@ -380,7 +380,9 @@ export class Workflow {
             await this.claude.audit(writer);
             const ownerTask = Object.values(this.tasks).find(t=>t.jobs.includes(writer));
             const before = await snapshot(task.cwd);
-            const {bytes} = await this.readCliReport(ownerTask, writer, ctx, await approvedDelta(ownerTask, writer, before));
+            await originalRequest(ownerTask, writer);
+            const {bytes,result} = await this.readCliReport(ownerTask, writer, ctx);
+            this.requireCliComplete(writer, result);
             await this.cliOperation('observe', writer, task.cwd);
             if (!writer.cli.frozen || JSON.stringify(await snapshot(task.cwd)) !== JSON.stringify(before) || hash(await readFile(writer.artifact)) !== hash(bytes)) throw new Error('Claude writer/source/report changed during final audit.');
           } catch (error) {
@@ -493,7 +495,7 @@ export class Workflow {
     if (directory === task.cwd || directory.startsWith(task.cwd + '/')) throw new Error('Claude control artifacts must be outside the managed cwd.');
     await mkdir(directory, {recursive:true, mode:0o700});
     const baseline = await snapshot(task.cwd);
-    // Existing dirty user files are never handed to an external writer. No reset/stash.
+    // Ownership remains bounded assignment; preserve dirty user work by instruction.
     for (const path of Object.keys(baseline.files)) {
       if (!job.owned_paths.some(o => o === '.' || path === o || path.startsWith(o + '/'))) continue;
       if ((await lstat(join(task.cwd,path))).isSymbolicLink()) {
@@ -502,7 +504,6 @@ export class Workflow {
       }
     }
     const dirty = prior ? prior.user_dirty : baseline.dirty;
-    if (!prior && dirty.some(path => job.owned_paths.some(o => o === '.' || path === o || path.startsWith(o + '/')))) throw new Error('Designer ownership overlaps existing user changes; narrow ownership or resolve manually without reset/stash.');
     const report_directory = prior ? prior.report_directory : join(directory,'pending');
     await mkdir(report_directory,{recursive:true, mode:0o700});
     job.cli = {directory, report_directory, pending:join(report_directory,`${job.run_id}.json`), checks, baseline, dispatch_target:await this.target(ctx), user_dirty:dirty, evidence:prior ? [...prior.evidence] : [], frozen:false,
@@ -515,9 +516,9 @@ export class Workflow {
   async cliPrompt(task, job, prompt) {
     const schema = await readFile(join(this.root,'schemas/implementation.json'),'utf8');
     const role = await readFile(join(this.root,'agents/astraeus-designer.md'),'utf8');
-    return `${prompt}\n\nDesigner role contract (native frontmatter is not CLI isolation):\n${role}\n\nInstalled Claude Code background task, exact requested model claude-opus-5-5. Do not launch nested agents, create worktrees, commit/stage/reset/stash, push, publish, or edit outside literal ownership. Preserve existing user changes. Permissions are not an OS sandbox. Run required checks exactly: ${JSON.stringify(job.cli.checks)}. Report failed/denied checks truthfully. Missing checks means checks: [].\nWrite one JSON implementation result only to ${job.cli.pending}; do not edit control metadata or publish a final result. task_id=${JSON.stringify(task.task_id)}, run_id=${JSON.stringify(job.run_id)}, target_id=${JSON.stringify(job.cli.dispatch_target)}. changed_files must match the actual delta from this run's baseline, not preexisting changes. Complete requires completed authorized work, all required checks passed, remaining: []. Schema:\n${schema}`;
+    return `${prompt}\n\nDesigner role contract (native frontmatter is not CLI isolation):\n${role}\n\nInstalled Claude Code background task, exact requested model claude-opus-5-5. Do not launch nested agents, create worktrees, commit/stage/reset/stash, push, publish, or edit workflow control metadata. Stay within the assigned paths and explicitly authorized design scope; owned_paths is advisory assignment, not a permission sandbox. Preserve existing user changes. Permissions are not an OS sandbox. Run required checks exactly: ${JSON.stringify(job.cli.checks)}. Report failed/denied checks truthfully. Missing checks means checks: [].\nWrite one JSON implementation result only to ${job.cli.pending}; do not edit control metadata or publish a final result. task_id=${JSON.stringify(task.task_id)}, run_id=${JSON.stringify(job.run_id)}, target_id=${JSON.stringify(job.cli.dispatch_target)}. changed_files reports your actual edits for this run, not preexisting or other writers' changes; shared-cwd baseline deltas are not exact attribution. Complete requires completed authorized work, all required checks passed, remaining: []. Schema:\n${schema}`;
   }
-  async readCliReport(task, job, ctx, paths) {
+  async readCliReport(task, job, ctx) {
     const candidate = job.artifact || job.cli.pending;
     if (!(await lstat(candidate)).isFile() || (await lstat(candidate)).isSymbolicLink()) throw new Error('Symlinked/nonregular implementation report.');
     const bytes = await readFile(candidate,'utf8');
@@ -526,32 +527,22 @@ export class Workflow {
     const validation = join(job.cli.directory,`validation-${randomUUID()}.json`);
     await writeFile(validation,bytes,{mode:0o600, flag:'wx'});
     const result = JSON.parse(await this.bridge(['validate-result',validation,'--kind','implementation','--task-id',task.task_id,'--target-id',job.cli.dispatch_target],ctx)).result;
-    if (result.run_id !== job.run_id || result.status !== 'complete' || result.remaining.length) throw new Error('Implementation report has wrong run binding, incomplete work or remaining issues.');
-    const checks = new Map(result.checks.map(c => [c.command,c]));
-    if (checks.size !== result.checks.length || result.checks.some(c => c.outcome !== 'passed') || job.cli.checks.some(c => !checks.has(c))) throw new Error('Required checks missing, failed or not run.');
-    if (JSON.stringify([...result.changed_files].sort()) !== JSON.stringify(paths)) throw new Error('Implementation changed_files differs from actual owned baseline delta.');
+    if (result.run_id !== job.run_id) throw new Error('Implementation report has wrong run binding.');
     return {bytes,result};
   }
+  requireCliComplete(job, result) {
+    if (result.status !== 'complete' || result.remaining.length) throw new Error('Implementation report has incomplete work or remaining issues.');
+    const checks = new Map(result.checks.map(c => [c.command,c]));
+    if (checks.size !== result.checks.length || result.checks.some(c => c.outcome !== 'passed') || job.cli.checks.some(c => !checks.has(c))) throw new Error('Required checks missing, failed or not run.');
+  }
   async reconcileGenerated(task, job, p, ctx) {
-    const failure = job.cli?.ownership_failure?.error || job.error;
-    if (!isCli(job) || job.role !== 'designer' || !job.collected || job.valid || job.artifact ||
-        !job.cli.frozen || job.cli.generated_reconciliation || !/^Error: Out-of-ownership baseline delta: /.test(failure || '') ||
-        [...task.jobs].reverse().find(j=>isWriter(j.role)) !== job) throw new Error('Reconcile only the latest original frozen failed ownership collection.');
-    await this.cliOperation('observe', job, task.cwd);
-    if (!job.cli.frozen || job.cli.unexpected_copy || this.activeJobs(task.cwd).length) throw new Error('Generated recovery requires stopped exact original owner and frozen writers.');
-    const request = await originalRequest(task,job);
-    const before = await snapshot(task.cwd);
-    const paths = await proposalDelta(task,job,before,p.generated_outputs);
-    const {bytes,result} = await this.readCliReport(task,job,ctx,paths);
-    const check = await requiredVitest(task,job,result,before);
-    await this.cliOperation('observe',job,task.cwd);
-    if (!job.cli.frozen || JSON.stringify(await snapshot(task.cwd)) !== JSON.stringify(before) || hash(await readFile(job.cli.pending)) !== hash(bytes)) throw new Error('Claude writer/source/report changed during reconciliation.');
-    // Preserve the historical error before ordinary collection can clear its active diagnostic.
-    job.cli.ownership_failure ??= {error:failure, provenance:'Retained failed collection state; pre-recovery report/source hashes were not captured by the older collector.'};
-    const approval = await writeReconciliation(task,job,before,p.generated_outputs,bytes,request,check);
-    job.cli.generated_reconciliation = approval;
-    job.cli.evidence.push({kind:'generated-reconciliation',path:approval.path,sha256:approval.sha256.slice(7)});
-    this.save(ctx);
+    // Compatibility operation for persisted ownership failures. No new approval,
+    // cache fingerprints or Vitest receipt is needed under advisory ownership.
+    if (!isCli(job) || job.role !== 'designer' || !job.collected || !job.cli.frozen ||
+        [...task.jobs].reverse().find(j=>isWriter(j.role)) !== job) throw new Error('Recollect only the latest original frozen designer.');
+    if (job.error && !job.cli.ownership_failure && /^Error: Out-of-ownership baseline delta: /.test(job.error)) {
+      job.cli.ownership_failure = {error:job.error, provenance:'Historical failed collection; no historical hashes reconstructed.'};
+    }
     return this.collectCli(task,job,ctx);
   }
   async collectCli(task, job, ctx) {
@@ -570,8 +561,8 @@ export class Workflow {
       if (job.cli.unexpected_copy) throw new Error('Unexpected copy cannot produce a successful implementation report, even after exact cleanup.');
       job.collected = true;
       before = await snapshot(task.cwd);
-      const paths = await approvedDelta(task,job,before);
-      const {bytes,result} = await this.readCliReport(task,job,ctx,paths);
+      await originalRequest(task,job);
+      const {bytes,result} = await this.readCliReport(task,job,ctx);
       job.result = result;
       await this.cliOperation('observe', job,task.cwd);
       if (!job.cli.frozen || JSON.stringify(await snapshot(task.cwd)) !== JSON.stringify(before)) throw new Error('Claude writer/source changed during collection.');
@@ -579,20 +570,14 @@ export class Workflow {
         const final = join(job.cli.directory,'result.json');
         await publish(job.cli.pending,final,bytes); job.artifact = final;
       } else if (job.result_hash !== hash(bytes)) throw new Error('Published implementation result changed.');
-      job.result_hash = hash(bytes); job.summary = result.summary; job.valid = true;
+      job.result_hash = hash(bytes); job.summary = result.summary;
+      // Publication records the outcome, including blocked/failed checks. It is
+      // not acceptance and cannot promote incomplete work to success.
+      this.requireCliComplete(job, result);
+      job.valid = true;
       task.phase = 'verification'; task.target_id = null; delete job.error;
     } catch (error) {
       this.assertOperationActive(); job.collected = true; job.error = String(error); task.phase = 'needs-evidence';
-      if (before && /^Error: Out-of-ownership baseline delta: /.test(job.error) && !job.cli.ownership_failure) {
-        const failure = {error:job.error, baseline_sha256:snapshotHash(job.cli.baseline), current_sha256:snapshotHash(before), frozen_observation:job.cli.observed};
-        try {
-          if ((await lstat(job.cli.pending)).isFile()) failure.report_sha256 = hash(await readFile(job.cli.pending));
-        } catch { /* Missing report is not fabricated; explicit reconciliation still requires it. */ }
-        const path = join(job.cli.directory,`ownership-failure-${randomUUID()}.json`), bytes = JSON.stringify(failure,null,2);
-        await writeFile(path,bytes,{mode:0o600,flag:'wx'});
-        job.cli.ownership_failure = failure;
-        job.cli.evidence.push({kind:'ownership-failure',path,sha256:hash(bytes).slice(7)});
-      }
     }
     this.save(ctx); return job;
   }
@@ -648,15 +633,16 @@ export class Workflow {
       await this.cliOperation('observe', job,task.cwd);
       if (!job.cli.frozen) throw new Error('Collect/freeze the original Claude writer before resume.');
       if (job.cli.unexpected_copy) throw new Error('Unexpected copy cannot be resumed as original-owner work.');
-      if (!job.valid || !job.artifact || !job.result_hash) throw new Error('Resume requires a collected validated implementation report and owned delta; reconcile failed evidence first.');
-      // Reuse collection's full report/source/delta checks against the preserved
-      // baseline. A stale valid flag cannot authorize a fresh baseline.
-      const checked = await this.collectCli(task,job,ctx);
-      if (!checked.valid) throw new Error('Resume requires a currently validated implementation: ' + job.error);
+      // Correction needs exact original-owner/freeze/evidence, not successful
+      // previous work. Never erase the failed run or silently repair its report.
+      try {
+        await originalRequest(task,job);
+        if (job.artifact) await this.readCliReport(task,job,ctx);
+      } catch (error) { job.valid = false; job.error = String(error); this.save(ctx); throw error; }
       const follow = {...job, run_id:randomUUID(), collected:false, valid:false, result:undefined, artifact:undefined, result_hash:undefined, status:'queued', error:undefined};
       task.jobs.push(follow); task.accepted = false; task.target_id = null; task.phase = 'implementation';
       try {
-        // Follow-up may edit the previous owner's delta, but not preexisting user files.
+        // Fresh observational baseline; preserving user work stays an instruction.
         await this.prepareCli(task,follow,ctx,job.cli.checks,job.cli);
         this.save(ctx);
         await this.cliOperation('resume', follow,task.cwd,await this.cliPrompt(task,follow,`Continue only original authorized design scope ${task.design_authorization.scope}; preserve Opus design decisions unless explicit user/functional constraints require changes.\n${p.prompt}`));

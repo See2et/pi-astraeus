@@ -6,10 +6,13 @@ research, and implementation may use concise prose when parsing offers little va
 Empty lists are valid where there is nothing to report. Do not manufacture findings.
 The Claude Code designer transport requires implementation JSON, including `run_id`
 equal to this run and `target_id` equal to its dispatch baseline. It writes only the
-run-specific pending path; root stops the exact CLI writer, checks required commands,
-complete status/no remaining work and actual changed_files, then publishes the original
-validated bytes. Absent requested checks means `checks: []`, never fabricated checks.
-This is post-validation, not generation-time schema enforcement or final acceptance.
+run-specific pending path; root stops the exact UUID/cwd writer and publishes original
+schema/binding-validated bytes as an outcome, including unsuccessful work. Complete status,
+passed required commands and no remaining work are success prerequisites, not prerequisites
+to recording the outcome or resuming a failed original frozen owner for correction.
+`changed_files` reports the owner's edits, not exact attribution against shared-cwd deltas.
+Absent requested checks means `checks: []`, never fabricated checks. Collection is
+post-validation, not generation-time schema enforcement or final acceptance.
 
 Common fields: `schema_version: 1`, `kind`, `task_id`, `target_id`, `status`
 (`complete|blocked|failed`), and a short `summary`.

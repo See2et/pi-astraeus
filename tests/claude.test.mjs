@@ -68,143 +68,56 @@ async function fixture(t) {
   return {cwd,home,config,trust,agentDir,workflow,ctx,act,delegate,report,idle,state,calls,host,cli};
 }
 
-const CACHE = 'node_modules/.vite/vitest/da39a3ee5e6b4b0d3255bfef95601890afd80709/results.json';
-async function generatedFixture(t,{existing=true,script='vitest run --root .',checks=['npm test','npm run typecheck']}={}) {
-  const f=await fixture(t);
-  await writeFile(join(f.cwd,'.gitignore'),'build/\nnode_modules/\n');
-  await writeFile(join(f.cwd,'package.json'),JSON.stringify({scripts:{test:script,typecheck:'tsc --noEmit'}}));
-  execFileSync('git',['add','.gitignore','package.json'],{cwd:f.cwd});
-  execFileSync('git',['-c','user.name=Test','-c','user.email=test@example.invalid','commit','-qm','verification fixture'],{cwd:f.cwd});
-  const path=join(f.cwd,CACHE); await mkdir(join(path,'..'),{recursive:true});
-  if(existing) await writeFile(path,'{"old":"fixture results"}');
-  const job=await f.delegate({checks});
-  await writeFile(join(f.cwd,'ui.txt'),'designed'); await writeFile(path,'{"new":"fixture results"}');
-  await f.report(job); f.idle();
-  const bytes=await readFile(job.cli.pending,'utf8');
-  assert.equal((await f.act({op:'collect',run_id:job.run_id})).valid,false);
-  assert.match(job.error,/Out-of-ownership baseline delta/);
-  const current=await snapshot(f.cwd);
-  const outputs=[{path:CACHE,before:job.cli.baseline.files[CACHE]??null,after:current.files[CACHE],reason:'Required npm test resolved to Vitest; its generated results cache is not UI source.'}];
-  return {...f,job,bytes,outputs,recover:extra=>f.act({op:'reconcile_generated',run_id:job.run_id,generated_outputs:outputs,...extra})};
-}
-
-test('explicit cache reconciliation preserves original failed evidence/report/ownership across restore, then resumes same owner',async t=>{
-  const f=await generatedFixture(t), job=f.job, baseline=structuredClone(job.cli.baseline), error=job.error;
-  const failure=job.cli.evidence.find(e=>e.kind==='ownership-failure'), failureBytes=await readFile(failure.path,'utf8');
-  f.workflow.save(f.ctx);
-  const restored=new Workflow(f.host,{claude:f.cli}); restored.restore(f.ctx);
-  const act=p=>restored.execute({task_id:'design',...p},f.ctx);
-  const recovered=await act({op:'reconcile_generated',run_id:job.run_id,generated_outputs:f.outputs});
-  assert.equal(recovered.valid,true,recovered.error); assert.deepEqual(recovered.cli.baseline,baseline);
-  assert.deepEqual(recovered.owned_paths,['ui.txt']); assert.equal(recovered.agent_id,job.agent_id);
-  assert.equal(await readFile(recovered.artifact,'utf8'),f.bytes);
-  assert.equal(await readFile(failure.path,'utf8'),failureBytes);
-  const receipt=JSON.parse(await readFile(recovered.cli.generated_reconciliation.path,'utf8'));
-  assert.equal(receipt.failure.error,error); assert.equal(receipt.report_sha256,recovered.result_hash);
-  assert.deepEqual(receipt.generated_outputs,f.outputs); assert.equal(receipt.required_vitest_check,'npm test');
-  assert.ok(recovered.cli.generated_reconciliation.path.startsWith(f.agentDir+'/'));
-  const view=modelView(recovered);
-  assert.deepEqual(view.cli.generated_reconciliation,recovered.cli.generated_reconciliation);
-  assert.equal(view.cli.ownership_failure.error,error); assert.equal(view.cli.baseline,undefined);
-  assert.equal((await act({op:'collect',run_id:job.run_id})).valid,true);
-  // Final audit has to check ignored output too, not merely the native Git review target.
-  restored.tasks.design.consequential=false;
-  assert.equal((await act({op:'accept'})).accepted,true);
-  const follow=await act({op:'resume',run_id:job.run_id,prompt:'Bounded original UI fix'});
-  assert.equal(follow.agent_id,job.agent_id); assert.deepEqual(follow.owned_paths,job.owned_paths);
-  assert.equal(follow.cli.baseline.files[CACHE],f.outputs[0].after);
-  assert.equal(follow.cli.generated_reconciliation,undefined,'approval never grants blanket cache ownership on a later run');
-  const initial=f.calls.find(a=>a[0]==='--bg'), settings=JSON.parse(initial[initial.indexOf('--settings')+1]);
-  assert.ok(!settings.permissions.allow.some(a=>a.includes('node_modules')));
-  assert.deepEqual(f.calls.filter(a=>a[0]==='--bg').at(-1).slice(0,4),['--bg','--resume',ID,'--']);
-  await writeFile(join(f.cwd,'ui.txt'),'bounded fix'); await writeFile(join(f.cwd,CACHE),'follow-up verification');
-  await f.report(follow); f.idle();
-  const failed=await act({op:'collect',run_id:follow.run_id}); assert.equal(failed.valid,false);
-  assert.match(failed.error,/Out-of-ownership/);
-  await assert.rejects(act({op:'resume',run_id:follow.run_id,prompt:'No implicit reapproval'}),/validated implementation/);
-  const current=await snapshot(f.cwd);
-  const again=await act({op:'reconcile_generated',run_id:follow.run_id,generated_outputs:[{...f.outputs[0],before:follow.cli.baseline.files[CACHE],after:current.files[CACHE],reason:'Explicit follow-up required Vitest results'}]});
-  assert.equal(again.valid,true,again.error); assert.deepEqual(again.owned_paths,['ui.txt']);
-});
-
-test('legacy failed collection with newly created cache is revalidated without inventing historical hashes',async t=>{
-  const f=await generatedFixture(t,{existing:false});
-  delete f.job.cli.ownership_failure; // Older collector persisted only error + baseline/lifecycle evidence.
-  f.job.cli.evidence=f.job.cli.evidence.filter(e=>e.kind!=='ownership-failure');
+test('legacy ownership failure recollects without cache approvals, retaining historical evidence',async t=>{
+  const f=await fixture(t), job=await f.delegate();
+  await writeFile(join(f.cwd,'ui.txt'),'designed'); await f.report(job); f.idle();
+  await f.act({op:'stop',run_id:job.run_id});
+  job.collected=true; job.error='Error: Out-of-ownership baseline delta: build/results.json';
+  const historical=join(job.cli.directory,'ownership-failure-old.json');
+  const bytes=JSON.stringify({error:job.error}); await writeFile(historical,bytes);
+  const {createHash}=await import('node:crypto');
+  job.cli.evidence.push({kind:'ownership-failure',path:historical,sha256:createHash('sha256').update(bytes).digest('hex')});
+  job.cli.ownership_failure={error:job.error};
+  // Old approval metadata remains evidence, but its obsolete source fingerprints
+  // do not create a delta gate after deployment.
+  job.cli.generated_reconciliation={path:'/obsolete/receipt',sha256:'obsolete'};
   f.workflow.save(f.ctx); f.workflow.restore(f.ctx);
-  const job=f.workflow.tasks.design.jobs[0];
-  assert.equal((await f.act({op:'status'}))[0].jobs[0].cli.ownership_failure.error,f.job.error);
-  const result=await f.act({op:'reconcile_generated',run_id:job.run_id,generated_outputs:f.outputs});
-  assert.equal(result.valid,true,result.error); assert.equal(f.outputs[0].before,null);
-  const receipt=JSON.parse(await readFile(result.cli.generated_reconciliation.path,'utf8'));
-  assert.match(receipt.failure.provenance,/not captured/); assert.equal(receipt.failure.report_sha256,undefined);
-  assert.equal(await readFile(result.artifact,'utf8'),f.bytes);
-  const review={run_id:'old-procedural-review',role:'reviewer',valid:true,collected:true,result:{verdict:'changes_required',unresolved:['Missing collection evidence']}};
+  const result=await f.act({op:'reconcile_generated',run_id:job.run_id});
+  assert.equal(result.valid,true,result.error);
+  assert.equal(await readFile(historical,'utf8'),bytes);
+  assert.equal(result.cli.ownership_failure.error,JSON.parse(bytes).error);
+  assert.equal(modelView(result).cli.baseline,undefined);
+  await writeFile(join(f.cwd,'outside.txt'),'shared-cwd later edit');
+  await mkdir(join(f.cwd,'build')); await writeFile(join(f.cwd,'build/results.json'),'generated');
+  assert.equal((await f.act({op:'collect',run_id:job.run_id})).valid,true);
+  f.workflow.tasks.design.consequential=false;
+  assert.equal((await f.act({op:'accept'})).accepted,true);
+  const review={run_id:'old-review',role:'reviewer',valid:true,collected:true,result:{verdict:'changes_required'}};
   f.workflow.tasks.design.jobs.push(review);
-  await assert.rejects(f.act({op:'resume',run_id:job.run_id,prompt:'Do not bypass old review'}),/adopted fixes/);
-  assert.deepEqual(f.workflow.tasks.design.jobs.at(-1),review,'reconciliation does not waive or rewrite review gates');
+  await assert.rejects(f.act({op:'resume',run_id:job.run_id,prompt:'Do not bypass review'}),/adopted fixes/);
 });
 
-test('reconciliation refuses unsupported paths, changed evidence, source escapes, and unfrozen lifecycle',async t=>{
-  const cases={
-    'fingerprint':async f=>{f.outputs[0].after='33188:'+ '0'.repeat(64);},
-    'blank reason':async f=>{f.outputs[0].reason=' ';},
-    'glob':async f=>{f.outputs[0].path='node_modules/.vite/vitest/*/results.json';},
-    'arbitrary ignored source':async f=>{await mkdir(join(f.cwd,'build')); await writeFile(join(f.cwd,'build/source.mjs'),'source'); const s=await snapshot(f.cwd); f.outputs.push({path:'build/source.mjs',before:null,after:s.files['build/source.mjs'],reason:'not verification'});},
-    'extra unowned source':async f=>writeFile(join(f.cwd,'outside.txt'),'escape'),
-    'owned source changed after failure':async f=>writeFile(join(f.cwd,'ui.txt'),'later tamper'),
-    'report changed after failure':async f=>f.report(f.job,{summary:'different bytes'}),
-    'missing checks':async f=>f.report(f.job,{checks:[]}),
-    'failed check':async f=>f.report(f.job,{checks:[{command:'npm test',outcome:'failed',evidence:'Fixture failure'}]}),
-    'request tamper':async f=>writeFile(join(f.job.cli.directory,'request.json'),'{}'),
-    'baseline tamper':async f=>{f.job.cli.baseline.files[CACHE]=f.outputs[0].after;},
-    'historical failure tamper':async f=>{delete f.job.cli.ownership_failure.report_sha256;},
-    'tracked cache':async f=>execFileSync('git',['add','-f',CACHE],{cwd:f.cwd}),
-    'nonignored cache':async f=>writeFile(join(f.cwd,'.gitignore'),'build/\n'),
-    'deletion':async f=>rm(join(f.cwd,CACHE)),
-    'symlink':async f=>{await rm(join(f.cwd,CACHE)); await symlink(join(f.cwd,'ui.txt'),join(f.cwd,CACHE));},
-    'symlink parent':async f=>{await rm(join(f.cwd,'node_modules/.vite/vitest'),{recursive:true}); await symlink(f.agentDir,join(f.cwd,'node_modules/.vite/vitest'));},
-    'directory':async f=>{await rm(join(f.cwd,CACHE)); await mkdir(join(f.cwd,CACHE));},
-    'index':async f=>execFileSync('git',['add','ui.txt'],{cwd:f.cwd}),
-    'HEAD':async f=>execFileSync('git',['-c','user.name=Test','-c','user.email=test@example.invalid','commit','--allow-empty','-qm','tamper'],{cwd:f.cwd}),
-    'live owner':async f=>Object.assign(f.state.records[0],{state:'working',status:'running',pid:321}),
-    'unknown owner':async f=>Object.assign(f.state.records[0],{state:'mystery',status:null}),
-    'missing owner':async f=>{f.state.records=[];},
-    'copy':async f=>{f.job.cli.unexpected_copy={id:COPY.slice(0,8),session_id:null};},
-  };
-  for(const [name,mutate] of Object.entries(cases)) await t.test(name,async t=>{
-    const f=await generatedFixture(t),count=f.calls.filter(a=>a[0]==='--bg').length;
-    await mutate(f);
-    await assert.rejects(f.recover());
-    assert.equal(f.job.valid,false); assert.equal(f.job.artifact,undefined);
-    assert.deepEqual(f.job.owned_paths,['ui.txt']); assert.equal(f.job.cli.generated_reconciliation,undefined);
-    assert.equal(f.calls.filter(a=>a[0]==='--bg').length,count,'recovery never launches inference');
-  });
-});
-
-test('reconciliation requires an actual passed required Vitest command, not arbitrary verification',async t=>{
-  for(const options of [{script:'node test.mjs'}, {checks:[]}]) {
-    const f=await generatedFixture(t,options);
-    await assert.rejects(f.recover(),/required Vitest/);
-    assert.equal(f.job.cli.generated_reconciliation,undefined);
-  }
-});
-
-test('recollect, resume and final audit pin approved cache/source/report/receipt bytes',async t=>{
-  for(const mutation of ['cache','source','report','receipt']) await t.test(mutation,async t=>{
-    const f=await generatedFixture(t); assert.equal((await f.recover()).valid,true);
-    f.workflow.tasks.design.consequential=false;
-    if(mutation==='cache') await writeFile(join(f.cwd,CACHE),'later ignored mutation');
-    if(mutation==='source') await writeFile(join(f.cwd,'ui.txt'),'later owned mutation');
-    if(mutation==='report') await writeFile(f.job.artifact,'{}');
-    if(mutation==='receipt') await writeFile(f.job.cli.generated_reconciliation.path,'{}');
+test('failed original run resumes with exact freeze and no successful report, retaining failure',async t=>{
+  for(const report of ['missing','malformed','blocked','failed-check']) await t.test(report,async t=>{
+    const f=await fixture(t),job=await f.delegate({checks:['npm test']});
+    if(report==='malformed') await writeFile(job.cli.pending,'not JSON');
+    if(report==='blocked') await f.report(job,{status:'blocked',remaining:['unfinished']});
+    if(report==='failed-check') await f.report(job,{checks:[{command:'npm test',outcome:'failed',evidence:'Fixture failed'}]});
+    f.idle(); const collected=await f.act({op:'collect',run_id:job.run_id});
+    assert.equal(collected.valid,false); assert.equal(collected.cli.frozen,true);
+    const error=job.error;
+    if(['blocked','failed-check'].includes(report)) {
+      assert.ok(job.artifact); assert.equal(job.result.status,report==='blocked'?'blocked':'complete');
+    }
+    await assert.rejects(f.act({op:'accept'}),/unresolved failed or incomplete/);
     f.workflow.save(f.ctx); f.workflow.restore(f.ctx);
-    const count=f.calls.filter(a=>a[0]==='--bg').length;
-    await assert.rejects(f.act({op:'accept'}));
-    assert.equal(f.workflow.tasks.design.accepted,false);
-    await assert.rejects(f.act({op:'resume',run_id:f.job.run_id,prompt:'Must not trust saved valid'}));
-    const result=await f.act({op:'collect',run_id:f.job.run_id}); assert.equal(result.valid,false);
-    assert.equal(f.calls.filter(a=>a[0]==='--bg').length,count); assert.equal(f.workflow.tasks.design.jobs.length,1);
+    const follow=await f.act({op:'resume',run_id:job.run_id,prompt:'Correct original bounded design work'});
+    assert.equal(follow.agent_id,job.agent_id); assert.notEqual(follow.run_id,job.run_id);
+    assert.equal(f.workflow.tasks.design.jobs[0].error,error);
+    assert.equal(f.workflow.tasks.design.jobs[0].valid,false);
+    assert.deepEqual(f.calls.filter(a=>a[0]==='--bg').at(-1).slice(0,4),['--bg','--resume',ID,'--']);
+    await f.report(follow); f.idle(); assert.equal((await f.act({op:'collect',run_id:follow.run_id})).valid,true);
+    await assert.rejects(f.act({op:'accept'}),/Review target changed|complete validated review/);
   });
 });
 
@@ -243,13 +156,14 @@ test('public CLI lifecycle binds observed UUID, preserves user baseline, freezes
   const fixed=await restored.execute({op:'collect',task_id:'design',run_id:follow.run_id},f.ctx); assert.equal(fixed.valid,true,fixed.error);
   await assert.rejects(restored.execute({op:'resume',task_id:'design',run_id:job.run_id,prompt:'Stale run'},f.ctx),/latest run/);
 });
-test('initial shared-cwd setting is the only launch argv change; exact model and permission/auth route remain',async t=>{
+test('initial permissions are repo-scoped with Git/control protections; exact pins and shared cwd remain',async t=>{
   const f=await fixture(t),job=await f.delegate({checks:['npm test']});
   const args=f.calls.find(a=>a[0]==='--bg');
-  const allows=['Read','Glob','Grep',`Edit(/${f.cwd}/ui.txt)`,`Edit(/${f.cwd}/ui.txt/**)`,`Write(/${f.cwd}/ui.txt)`,`Write(/${f.cwd}/ui.txt/**)`,
+  const allows=['Read','Glob','Grep',`Edit(/${f.cwd}/**)`,`Write(/${f.cwd}/**)`,
     `Edit(/${job.cli.report_directory}/**)`,`Write(/${job.cli.report_directory}/**)`,'Bash(npm test)'];
   const denies=['Agent','Task','Bash(git push *)','Bash(git -C * push *)','Bash(gh *)','Bash(glab *)','Bash(curl *)','Bash(wget *)',
-    `Edit(/${f.cwd}/.git)`,`Edit(/${f.cwd}/.git/**)`,`Write(/${f.cwd}/.git)`,`Write(/${f.cwd}/.git/**)`];
+    `Edit(/${f.cwd}/.git)`,`Edit(/${f.cwd}/.git/**)`,`Write(/${f.cwd}/.git)`,`Write(/${f.cwd}/.git/**)`,
+    `Edit(/${f.cwd}/.astraeus)`,`Edit(/${f.cwd}/.astraeus/**)`,`Write(/${f.cwd}/.astraeus)`,`Write(/${f.cwd}/.astraeus/**)`];
   const originalSettings={permissions:{defaultMode:'dontAsk',allow:allows,deny:denies}};
   const settings=JSON.parse(args[args.indexOf('--settings')+1]);
   assert.deepEqual(settings,{...originalSettings,worktree:{bgIsolation:'none'}});
@@ -393,51 +307,63 @@ test('unknown/missing/changed-cwd session cannot collect, accept, or be declared
   await assert.rejects(f.act({op:'accept'}),/missing/);
   assert.equal(f.workflow.activeJobs(f.cwd).length,1);
 });
-for (const mode of ['outside','ignored','dirty','files','checks','remaining','binding','symlink','stop']) test(`collection rejects ${mode}, retaining failed evidence`,async t=>{
+for (const mode of ['checks','remaining','binding','symlink','stop']) test(`collection rejects ${mode}, retaining failed evidence`,async t=>{
   const f=await fixture(t),job=await f.delegate({checks:['npm test']});
   await writeFile(join(f.cwd,'ui.txt'),'new UI');
   let extra={};
-  if(mode==='outside') await writeFile(join(f.cwd,'outside.txt'),'escape');
-  if(mode==='ignored') { await mkdir(join(f.cwd,'build')); await writeFile(join(f.cwd,'build/result'),'output'); }
-  if(mode==='dirty') await writeFile(join(f.cwd,'user.txt'),'clobbered');
-  if(mode==='files') extra={changed_files:[]};
   if(mode==='checks') extra={checks:[]};
   if(mode==='remaining') extra={remaining:['unfinished']};
   if(mode==='binding') extra={target_id:'wrong'};
   await f.report(job,extra); f.idle();
   if(mode==='symlink') { const path=job.cli.pending; await rm(path); const external=join(f.agentDir,'report'); await writeFile(external,'{}'); await symlink(external,path); }
   if(mode==='stop') f.state.failStop=true;
-  const result=await f.act({op:'collect',run_id:job.run_id}); assert.equal(result.valid,false); assert.ok(result.error); assert.equal(result.artifact,undefined);
+  const result=await f.act({op:'collect',run_id:job.run_id}); assert.equal(result.valid,false); assert.ok(result.error);
+  if(['checks','remaining'].includes(mode)) assert.ok(result.artifact,'incomplete outcome is recorded, not accepted');
+  else assert.equal(result.artifact,undefined);
   assert.ok(job.cli.evidence.some(e=>e.kind==='stop'));
 });
-test('failed owned-delta collection cannot be erased by a resume baseline',async t=>{
+test('outside and ignored deltas collect without exact full-repo changed_files attribution',async t=>{
   const f=await fixture(t),job=await f.delegate();
   await writeFile(join(f.cwd,'ui.txt'),'new UI'); await writeFile(join(f.cwd,'outside.txt'),'escape');
   await f.report(job); f.idle();
-  assert.equal((await f.act({op:'collect',run_id:job.run_id})).valid,false);
-  const baseline=structuredClone(job.cli.baseline), count=f.workflow.tasks.design.jobs.length;
-  await assert.rejects(f.act({op:'resume',run_id:job.run_id,prompt:'Bounded follow-up'}),/validated implementation/);
-  assert.equal(f.workflow.tasks.design.jobs.length,count); assert.deepEqual(job.cli.baseline,baseline);
-  assert.equal(f.calls.filter(a=>a[0]==='--bg'&&a[1]==='--resume').length,0);
+  await mkdir(join(f.cwd,'build')); await writeFile(join(f.cwd,'build/result'),'ignored generated output');
+  assert.equal((await f.act({op:'collect',run_id:job.run_id})).valid,true);
+  const baseline=structuredClone(job.cli.baseline);
+  // Later shared-cwd changes, staging and history are root scope-review evidence,
+  // not ownership-only collection failure or exact changed_files attribution.
+  execFileSync('git',['add','outside.txt'],{cwd:f.cwd});
+  execFileSync('git',['-c','user.name=Test','-c','user.email=test@example.invalid','commit','-qm','shared writer'],{cwd:f.cwd});
+  await writeFile(join(f.cwd,'ui.txt'),'later shared-cwd change');
+  assert.equal((await f.act({op:'collect',run_id:job.run_id})).valid,true);
+  const follow=await f.act({op:'resume',run_id:job.run_id,prompt:'Bounded follow-up'});
+  assert.equal(follow.agent_id,job.agent_id); assert.deepEqual(job.cli.baseline,baseline);
   assert.equal(await readFile(join(f.cwd,'outside.txt'),'utf8'),'escape');
 });
-for(const mutation of ['source','report','evidence']) test(`resume revalidates collected ${mutation} rather than trusting saved valid flag`,async t=>{
+for(const mutation of ['report','evidence','request']) test(`resume revalidates collected ${mutation} rather than trusting saved valid flag`,async t=>{
   const f=await fixture(t),job=await f.delegate(); await f.report(job,{changed_files:[]}); f.idle();
   assert.equal((await f.act({op:'collect',run_id:job.run_id})).valid,true);
-  if(mutation==='source') await writeFile(join(f.cwd,'outside.txt'),'late outside mutation');
   if(mutation==='report') await writeFile(job.artifact,'{}');
   if(mutation==='evidence') await writeFile(job.cli.evidence.find(e=>e.kind==='stop').path,'{}');
+  if(mutation==='request') await writeFile(join(job.cli.directory,'request.json'),'{}');
   const restored=new Workflow(f.host,{claude:f.cli}); restored.restore(f.ctx);
   await assert.rejects(restored.execute({op:'resume',task_id:'design',run_id:job.run_id,prompt:'Bounded follow-up'},f.ctx));
   assert.equal(restored.tasks.design.jobs.length,1); assert.equal(restored.tasks.design.jobs[0].valid,false);
   assert.equal(f.calls.filter(a=>a[0]==='--bg'&&a[1]==='--resume').length,0);
 });
-test('overlapping preexisting user changes and symlink scope are refused without changing files',async t=>{
+test('dirty assigned source is advisory; symlink scope escapes remain refused',async t=>{
   const f=await fixture(t);
-  await assert.rejects(f.delegate({owned_paths:['user.txt']}),/existing user changes/);
-  assert.equal(await readFile(join(f.cwd,'user.txt'),'utf8'),'existing user changes'); assert.equal(f.calls.filter(a=>a[0]==='--bg').length,0);
-  await symlink(f.agentDir,join(f.cwd,'escape'));
-  await assert.rejects(f.delegate({owned_paths:['escape']}),/escapes cwd through symlink/);
+  const job=await f.delegate({owned_paths:['user.txt']});
+  assert.equal(await readFile(join(f.cwd,'user.txt'),'utf8'),'existing user changes');
+  assert.match(f.calls.find(a=>a[0]==='--bg').at(-1),/Preserve existing user changes/);
+  await f.report(job,{status:'blocked',remaining:['Fix required'],checks:[]}); f.idle();
+  assert.equal((await f.act({op:'collect',run_id:job.run_id})).valid,false);
+  await assert.rejects(f.act({op:'accept'}),/unresolved failed or incomplete/);
+  const follow=await f.act({op:'resume',run_id:job.run_id,prompt:'Correct the blocked run'});
+  assert.equal(follow.agent_id,job.agent_id);
+  await f.act({op:'stop',run_id:follow.run_id});
+  const other=await fixture(t);
+  await symlink(other.agentDir,join(other.cwd,'escape'));
+  await assert.rejects(other.delegate({owned_paths:['escape']}),/escapes cwd through symlink/);
 });
 test('resume copy is stopped exactly, retained and never rebound to original owner',async t=>{
   const f=await fixture(t),job=await f.delegate(); await f.report(job,{changed_files:[]}); f.idle();
@@ -553,6 +479,14 @@ test('CLI designer integrates with native GPT fresh review/adjudication and curr
   await assert.rejects(f.act({op:'accept'}),/target changed/);
   const fresh=await reviewer(); assert.notEqual(fresh.agent_id,review.agent_id); complete(fresh,reviewReport(fresh));
   assert.equal((await f.act({op:'collect',run_id:fresh.run_id})).valid,true);
+  assert.equal((await f.act({op:'accept'})).accepted,true);
+  await writeFile(join(f.cwd,'outside.txt'),'later shared-cwd edit');
+  await mkdir(join(f.cwd,'build')); await writeFile(join(f.cwd,'build/output'),'ignored generated');
+  await assert.rejects(f.act({op:'accept'}),/Review target changed/);
+  // Fresh current-target native review replaces stale evidence, without forcing
+  // full-repository attribution back into the original designer report.
+  const current=await reviewer(); complete(current,reviewReport(current));
+  assert.equal((await f.act({op:'collect',run_id:current.run_id})).valid,true);
   assert.equal((await f.act({op:'accept'})).accepted,true);
   await writeFile(follow.artifact,'{}'); await assert.rejects(f.act({op:'accept'}),/report bytes changed/);
 });

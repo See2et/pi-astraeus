@@ -37,24 +37,27 @@ New designers use installed Claude Code `--bg` in the current managed Git-root c
 not a new linked worktree. Initial explicit `--settings` includes
 `worktree: {bgIsolation: "none"}` beside the existing `permissions` object. This is the
 requested shared-working-copy policy: it disables the background worktree requirement,
-not tool permission gates. `--safe-mode`, `dontAsk`, literal Edit/Write ownership,
-allowed checks, denied tools/publication, empty `--setting-sources`, strict empty MCP
-configuration and exact model/effort remain unchanged. Managed disjoint literal ownership
-and cross-task review freezing remain. Initial ownership overlapping existing dirty user files is refused;
-narrow it or ask the user to resolve the conflict manually. Never reset/stash/commit
-user work to prepare dispatch. The initial snapshot preserves content/modes, Git index
-and HEAD, including ignored outputs; collection rejects changes outside literal owned
-paths and Git staging/history changes. Concurrent disjoint writes can conservatively
-fail collection because a shared cwd cannot attribute outside-scope changes to their
-writer. Sequence them if the designer needs a clean collection baseline.
+not tool permission gates. `--safe-mode`, `dontAsk`, allowed checks, denied
+nested agents/publication, empty `--setting-sources`, strict empty MCP configuration
+and exact model/effort remain. Edit/Write allows cover the managed repository, excluding
+`.git` and `.astraeus` workflow controls; only the bounded external pending report
+directory gets an additional write allow. Request/lifecycle/final artifacts stay protected.
+
+`owned_paths` remains validated literal assignment/scheduling scope, advisory like native
+GPT workers. It does not broaden explicit design authorization. Disjoint scheduling and
+cross-task review freezing remain. Dirty assigned source does not blanket-block dispatch:
+preserve existing user work by instruction, never reset/stash/commit it to prepare dispatch.
+Snapshots retain content/modes, index and HEAD as evidence, not attribution. Outside-source,
+ignored-generated, later shared-cwd, index or HEAD deltas alone do not block collection,
+recollection, resume or acceptance. Root's current-target scope/evidence review must still
+judge unauthorized edits, user-work loss and staging/history. Collection is not acceptance.
 
 This is not an OS sandbox. CLI permission settings supplement prompt/scheduling checks
 and deny nested agents/publication; they cannot guarantee no writes outside the cwd.
 Checks must be simple exact trusted verification commands, supplied in optional
-`checks`; omitted means `[]`. Plan generated outputs explicitly; do not widen source
-ownership merely to include all ignored files. The narrow recovery below handles only
-known Vitest results caches after an ownership collection failure. Denied/failed
-checks remain failures, never justification to relax permissions. Existing authenticated
+`checks`; omitted means `[]`. Generated outputs need no ownership expansion or
+reconciliation approval. Denied/failed checks remain unsuccessful outcomes, never
+justification to relax permissions. Existing authenticated
 CLI access remains a prerequisite; workspace trust is separate from tool permissions.
 The bundled designer definition is checked against installed role definitions and its
 contract is supplied in the handoff; native Pi tools/frontmatter are not CLI isolation.
@@ -104,11 +107,13 @@ status. Idle/done alone can still have a live process; it is not a writer freeze
 Unknown or missing lifecycle does not become successful completion. Stop preserves files
 and conversation, but does not upgrade a blocked/failed report.
 
-Resume requires the latest collected/frozen, successfully validated run of the original
-owner and the existing adopted-fix review/adjudication gates. Before creating a follow-up
-baseline, it revalidates the published report, CLI evidence and current owned delta against
-the preserved previous baseline. Failed collection or later report/source mutations remain
-blocking; a saved `valid` flag alone is insufficient. It stops the exact owner again before invoking:
+Resume requires the latest collected/frozen run of the original owner and the existing
+adopted-fix review/adjudication gates. Failed, missing or malformed original reports may
+resume for correction: successful work is not a recovery prerequisite. Exact UUID/cwd,
+retained request/model/effort/lifecycle integrity, affirmative freeze and no unexpected copy
+remain prerequisites. Published report bytes/bindings are revalidated if present; tampering
+with immutable reports/evidence remains blocking. A new run does not erase the old failure
+or count it as success. It stops the exact owner again before invoking:
 
 ```sh
 claude --bg --resume OBSERVED_FULL_UUID -- "Run-specific bounded follow-up"
@@ -127,17 +132,18 @@ is permitted. A failed/unknown copy stop keeps freezing unresolved. Inspect chan
 
 Deploying a new Pi package changes only new initial launches. Existing sessions retain
 their saved settings on resume; old launch receipts without `worktree.bgIsolation` do not
-acquire `none` retroactively. The old background worktree guard may therefore persist.
-Do not add settings/model/permission overrides to an existing resume to force it off:
+acquire `none` retroactively. Old ownership-scoped permissions and the background
+worktree guard may therefore persist; repo-scoped permissions apply only to new initial
+launches. Do not add settings/model/permission overrides to an existing resume to force migration:
 that can copy the session and is not supported owner migration.
 
 For manual recovery, first inspect the retained launch/resume/stop receipts and latest
 workflow error, then obtain one bounded public observation for the exact owner and cwd.
-A current exact match establishes only current identity/lifecycle. Recover and validate
-the latest run-specific report and actual owned delta through collection, including exact
-stop acknowledgment and affirmative frozen lifecycle; missing/invalid reports, ambiguous
-identity, unknown lifecycle, unresolved copy freezes or out-of-scope changes remain
-blocking. Preserve the original owner, latest collected/frozen run, bounded task scope and
+A current exact match establishes only current identity/lifecycle. Collect the latest
+run's outcome, including failure, with exact stop acknowledgment and affirmative freeze.
+Missing/invalid reports do not prevent correction resume, but cannot authorize acceptance.
+Ambiguous identity, unknown lifecycle, changed immutable evidence and unexpected copies
+remain blocking. Preserve the original owner, latest collected/frozen run, bounded task scope and
 any required adopted-fix decision before invoking managed `resume`. This does not promise
 that an old session can edit the shared checkout under its saved guard. If it remains
 blocked, leave it unresolved and ask the user for an explicit recovery/migration decision,
@@ -145,51 +151,18 @@ rather than editing private sessions/config, overriding saved options or launchi
 replacement automatically. Historical offending records not retained cannot be recovered
 from a later status listing. No real affected-session resume is required for deployment QA.
 
-## Explicit generated verification output recovery
+## Retired generated-output reconciliation
 
-Ordinary `collect` still rejects every outside-ownership delta, including ignored output.
-After that failure, `reconcile_generated` can approve only literal ignored, untracked,
-regular `node_modules/.vite/vitest/<40 lowercase hex>/results.json` files for the latest
-original stopped/frozen designer. Supply each exact path, baseline `before` fingerprint
-(decimal file mode plus `:` plus SHA-256, or `null` for an absent baseline), exact current
-`after` fingerprint, and a nonempty evidence-based `reason`:
+The Vitest-specific approval/fingerprint mechanism is retired with hard ownership deltas.
+Ordinary `collect` now recollects persisted delta-only failures without generated-output
+receipts, exact cache hashes or Vitest-specific checks. Historical failure evidence and
+old approval bytes remain immutable evidence; their obsolete source fingerprints are not
+current collection/acceptance gates. No historical observations or success are fabricated.
 
-```json
-{"op":"reconcile_generated","task_id":"design-001","run_id":"ORIGINAL_RUN",
- "generated_outputs":[{"path":"node_modules/.vite/vitest/da39a3ee5e6b4b0d3255bfef95601890afd80709/results.json",
- "before":null,"after":"33188:EXACT_64_HEX_CONTENT_HASH",
- "reason":"Required npm test runs Vitest and produced this verification results cache."}]}
-```
-
-Read the original run's immutable `request.json` for baseline fingerprints and compute
-current mode/content fingerprints without editing source or private runtime state.
-Recovery rechecks the original request/baseline/ownership/model/effort, exact stopped
-UUID, retained CLI evidence, unchanged HEAD/index, complete original run-bound report,
-empty remaining work, all passed required checks, and exact reported owned delta.
-A required passed `vitest run` (also via `npx`/`npm exec`) or an `npm test`/`npm run SCRIPT`
-resolving to `vitest run` in unchanged baseline `package.json` is required. Every other
-outside delta remains blocking. Symlinks/parent aliases, directories, deletion, globs,
-tracked/nonignored paths, arbitrary ignored source, missing/failed checks, unknown/live
-owners and copies cannot use this recovery. These are recorded check attestations,
-not a claim that the tool observed Vitest executing or that permissions are an OS sandbox.
-
-The exclusive per-run `generated-reconciliation.json` outside the managed cwd pins the
-original failure, baseline/request/report/current-source hashes, owner, lifecycle evidence,
-exact before/after fingerprints and reasons. New collector failures also retain an exclusive
-`ownership-failure-*.json` with failure-time source/report hashes when available. For older
-failed collections that captured no such hashes, the receipt explicitly says so rather
-than inventing historical observations; current original evidence is still fully revalidated.
-Successful publication keeps the original report bytes and historical failure evidence.
-Approvals are separate from `owned_paths` and CLI tool allows. Recollection, resume and
-final acceptance recheck receipt bytes and approved current hashes, including ignored
-output and owned source; later mutation invalidates the approval.
-
-Use normal fresh review/adjudication gates before bounded managed `resume`; this operation
-neither rewrites nor waives any earlier review. Resume uses the same original UUID and
-ownership. Its new baseline pins the existing cache, but approval is **not inherited**:
-if follow-up required verification changes the cache again, collect fails and a new
-explicit run-bound reconciliation is required. No owner copy/replacement or saved option
-override is permitted.
+`reconcile_generated` remains a deprecated compatibility alias for recollection of the
+latest original collected/frozen designer; `generated_outputs` is ignored. Prefer `collect`.
+Exact identity/freeze/evidence/report checks and fresh native review/adjudication gates
+remain. No replacement owner, permission override or saved-session migration is performed.
 
 Editing this repository does not reload an already running installed Nix package/tool.
 The user must arrange the normal package update and fresh Pi process/reload before the
@@ -262,12 +235,16 @@ required command's truthful outcome/evidence, and remaining issues. Complete mea
 completed authorized work, required checks passed and no remaining work. Empty checks
 means `checks: []`, not an invented not_run verification.
 
-Collection checks JSON schema/duplicate keys/bindings, complete status, all required
-checks passed, remaining empty, and exact actual owned baseline delta. Symlinked reports,
-Git HEAD/index changes, out-of-owned changes including ignored files, or mismatched
-changed_files fail. Root rechecks the frozen bound session, lifecycle evidence, source
-snapshot and report before exclusive publication of the original validated bytes.
-Failed evidence stays available; stopping never repairs an invalid report automatically.
+Collection checks JSON schema/duplicate keys/task-run-target bindings and publishes the
+original captured bytes as an outcome, including blocked/failed work or failed checks.
+Only complete authorized work with all required checks passed and no remaining issues
+sets `valid`; incomplete/failed reports and missing reports cannot authorize acceptance.
+`changed_files` is the owner's edit report, not an exact match to full-repo baseline deltas
+that can include other writers. Symlinked reports and mutated immutable evidence fail.
+Root rechecks the frozen bound session, lifecycle evidence, source stability during
+collection and report before exclusive publication. Later shared-cwd changes require
+current-target review, not attribution against an old run baseline. Failed evidence stays
+available; stopping never repairs an invalid report automatically.
 
 Collection is not final acceptance. Consequential work still needs fresh native GPT
 review, optional separate adjudication only after complete changes_required, root diff
