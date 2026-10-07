@@ -135,9 +135,13 @@ Monitoring never stops, collects, or accepts work automatically.
 One owner is polled per tick, without overlapping workflow operations; failed
 observations back off from 3 seconds to at most 30 seconds. Public CLI queries have
 a 5-second timeout and 256-KiB combined output limit. Cancellation kills only the
-query child, never the background owner. Tree navigation, session replacement,
-reload and shutdown dispose monitoring; retired observations cannot mutate or
-notify the replacement session. Unhandled restored transitions remain noticeable.
+query child, never the background owner. Before tree navigation, monitoring retires
+in-flight reads and pauses while Pi reports non-idle navigation/summarization.
+Cancellation, summary abort or summary error automatically resumes polling on the
+unchanged branch, without a parent interaction. Successful navigation restores the
+selected branch with a fresh monitor generation. Session replacement, reload and
+shutdown dispose monitoring; retired observations cannot mutate or notify another
+branch/session. Unhandled restored transitions remain noticeable.
 
 ## Policy and evidence
 

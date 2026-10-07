@@ -90,7 +90,11 @@ export class Workflow {
   current(session) {
     if (session !== this.session || session?.controller.signal.aborted) return false;
     // Pi context accessors throw when their owning runtime/session is retired.
-    try { return session.ctx.sessionManager.getSessionId() === session.id; } catch { return false; }
+    try {
+      if (session.ctx.sessionManager.getSessionId() !== session.id) return false;
+      const anchor = session.treePause?.anchor;
+      return anchor == null || session.ctx.sessionManager.getBranch().some(entry => entry.id === anchor);
+    } catch { return false; }
   }
   ensureMonitoring(ctx) {
     if (!this.session || !this.current(this.session)) this.startMonitoring(ctx);
@@ -99,6 +103,12 @@ export class Workflow {
     this.dispose();
     const session = {ctx, id:ctx.sessionManager.getSessionId(), controller:new AbortController(), timer:null, cursor:0, failures:0};
     this.session = session; this.schedule(session, 0);
+  }
+  beforeTree(ctx) {
+    // Retire in-flight reads, but keep a session-owned timer: Pi emits no
+    // session_tree on cancellation, summary abort, or summary error.
+    this.startMonitoring(ctx);
+    this.session.treePause = {anchor:ctx.sessionManager.getLeafId()};
   }
   latestCli(tasks = Object.values(this.tasks)) {
     return [...new Map(tasks.flatMap(task => task.jobs.filter(isCli).map(job => [job.agent_id || job.run_id, {task, job}]))).values()];
@@ -114,6 +124,12 @@ export class Workflow {
       if (!this.current(session)) return;
       const next = this.queue.then(async () => {
         if (!this.current(session)) return;
+        if (session.treePause) {
+          // Public isIdle includes branch summarization in Pi 1.0.4. Do not
+          // append entries or trigger inference while navigation is pending.
+          if (!session.ctx.isIdle()) return;
+          delete session.treePause;
+        }
         const owners = this.latestCli().filter(({job}) => !job.collected);
         if (!owners.length) return;
         const {task, job} = owners[session.cursor++ % owners.length];
@@ -131,7 +147,7 @@ export class Workflow {
     session.timer.unref?.();
   }
   notice(task, job, ctx, session) {
-    if (!session || !this.current(session) || !this.host.notify || job.cli.notified_status === job.status) return;
+    if (!session || !this.current(session) || session.treePause || !this.host.notify || job.cli.notified_status === job.status) return;
     // Running clears the transition baseline but does not wake an idle parent.
     if (['work-ended', 'blocked', 'stopped', 'unknown'].includes(job.status)) {
       const meaning = job.status === 'work-ended' ? 'Observed work ended; ready to attempt collect, NOT implementation success.' : 'Needs attention; NOT successful completion.';

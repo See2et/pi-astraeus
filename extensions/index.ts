@@ -83,8 +83,8 @@ export default function (pi: ExtensionAPI) {
     event.preparation.messagesToSummarize = sanitizeContext(event.preparation.messagesToSummarize, current);
     event.preparation.turnPrefixMessages = sanitizeContext(event.preparation.turnPrefixMessages, current);
   });
-  pi.on('session_before_tree', event => {
-    workflow.dispose();
+  pi.on('session_before_tree', (event, ctx) => {
+    workflow.beforeTree(ctx);
     // Pi 1.0.4 retains this request-local array for generateBranchSummary;
     // replace its elements with sanitized copies, never persisted entry objects.
     const entries = event.preparation.entriesToSummarize;
