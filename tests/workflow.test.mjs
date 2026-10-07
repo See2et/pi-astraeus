@@ -202,7 +202,7 @@ test('lost reviewer can settle as failed and fresh evidence can complete the sam
   assert.equal((await f.act({op:'collect',run_id:fresh.run_id})).valid,true);
   assert.equal((await f.act({op:'accept'})).accepted,true);
 });
-for (const role of ['worker', 'designer']) test(`${role} adopted fixes return to original owner and require fresh review afterward`,async t=>{
+for (const role of ['worker']) test(`${role} adopted fixes return to original owner and require fresh review afterward`,async t=>{
   const f=await fixture(t); if (role === 'designer') await f.act({op:'authorize_design',...auth});
   const worker=await f.delegate(role,role === 'designer' ? designer : {}); f.complete(worker,'Implemented and verified'); await f.act({op:'collect',run_id:worker.run_id});
   const review=await f.delegate('reviewer'); const report=f.report(review); report.verdict='changes_required'; report.bugs=[{location:'source.txt',claim:'Defect',evidence:'Concrete example'}];
@@ -238,33 +238,17 @@ test('designer fails closed without explicit quote/scope; no general Anthropic r
   await writeFile(join(f.cwd,'astraeus.toml'),'allowed_models = ["anthropic/claude-opus-5-5"]\n');
   for (const role of ['worker','reviewer','adjudicator']) await assert.rejects(f.delegate(role,{model:designer.model}),/reserved/);
   f.ctx.modelRegistry={getAvailable:()=>[MODEL]};
-  await assert.rejects(f.delegate('designer',designer),/Unavailable.*No fallback/);
+  await assert.rejects(f.delegate('designer',{...designer,thinking:'off'}),/Unsupported thinking/);
   assert.equal(f.records.size,0);
 });
-test('designer persists authorization, owns same-session fixes and freezes writers across tasks', async t=>{
-  const f=await fixture(t);
-  await f.act({op:'authorize_design',...auth});
-  const job=await f.delegate('designer',{...designer,owned_paths:['ui']});
-  await f.act({op:'start',task_id:'other',requirements:'Other task',acceptance:'Verified'});
-  await assert.rejects(f.delegate('worker',{task_id:'other',owned_paths:['ui/a']}),/disjoint/);
-  await assert.rejects(f.delegate('reviewer',{task_id:'other'}),/Freeze writers/);
-  f.complete(job,'Designed, implemented and verified UI');
-  const collected=await f.act({op:'collect',run_id:job.run_id});
-  assert.equal(collected.valid,true,collected.error);
-  assert.equal(collected.receipt_path.endsWith('.receipt.json'),true);
-  await assert.rejects(f.delegate('worker'),/Resume the original/);
-  const restored=new Workflow(f.host); restored.restore(f.ctx);
-  assert.deepEqual(restored.tasks.task.design_authorization,f.workflow.tasks.task.design_authorization);
-  const follow=await restored.execute({op:'resume',task_id:'task',run_id:job.run_id,prompt:'Fix responsive overflow, preserve design'},f.ctx);
-  assert.equal(follow.agent_id,job.agent_id); assert.equal(follow.role,'designer');
-  f.complete(follow,'Fixed and verified');
-  assert.equal((await restored.execute({op:'collect',task_id:'task',run_id:follow.run_id},f.ctx)).valid,true);
-});
+// Designer lifecycle now lives in claude.test.mjs with no native Anthropic stub.
 test('new task does not inherit design authorization; lost designer still blocks acceptance', async t=>{
   const f=await fixture(t);
   await f.act({op:'start',task_id:'authorized',requirements:'UI task',acceptance:'Verified',...auth});
   await assert.rejects(f.delegate('designer',designer),/explicit design authorization/);
-  const job=await f.delegate('designer',{...designer,task_id:'authorized'}); f.records.clear();
+  // A recorded legacy native designer retains native recovery semantics, never migrates.
+  const job=await f.delegate('worker',{task_id:'authorized'});
+  job.role='designer'; job.transport='pi-native'; f.records.clear();
   const lost=await f.act({op:'collect',task_id:'authorized',run_id:job.run_id});
   assert.equal(lost.valid,false);
   await assert.rejects(f.act({op:'accept',task_id:'authorized'}),/unresolved/);

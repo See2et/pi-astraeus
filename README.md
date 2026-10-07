@@ -1,7 +1,8 @@
 # pi-astraeus
 
 Astraeus policy and evidence-bound review workflow for Pi Coding Agent, using
-[Tintinweb pi-subagents](https://github.com/tintinweb/pi-subagents) for child execution.
+[Tintinweb pi-subagents](https://github.com/tintinweb/pi-subagents) for native GPT child execution.
+Explicitly authorized designers use the already installed Claude Code `--bg` lifecycle.
 This package does not implement authentication, a model runtime, or an OS sandbox.
 
 ## What loads
@@ -50,9 +51,9 @@ status to one task. Root uses the model-only `astraeus_workflow` tool as follows
 |---|---|
 | `start` | `task_id`, `requirements`, `acceptance`; include constraints/non-goals/preserved contracts in `constraints`. `consequential` defaults true. Git repository root required. |
 | `authorize_design` | `task_id`, original explicit user quote in `design_request`, bounded `design_scope`; record once for an existing task. The same optional fields may be included at `start`. |
-| `delegate` | `task_id`, `role`, exact `model` provider/id, supported `thinking`, bounded `prompt`; worker/designer `owned_paths` are literal relative paths, default `.`. |
+| `delegate` | `task_id`, `role`, exact `model` provider/id, supported `thinking`, bounded `prompt`; worker/designer `owned_paths` are literal relative paths, default `.`. Designer optionally supplies `checks` (absent means `[]`). |
 | `collect` | `task_id`, `run_id`; reports running promptly, validates settled outcomes. No repeated tight polling. |
-| `resume` | `task_id`, original worker/designer `run_id`, follow-up `prompt`; uses native Agent continuation, never resumes a reviewer/adjudicator. |
+| `resume` | `task_id`, original worker/designer `run_id`, follow-up `prompt`; uses native Agent continuation for workers/legacy native designers, or exact stopped Claude UUID for CLI designers; never resumes a reviewer/adjudicator. |
 | `stop` | `task_id`, `run_id`; stops only this managed child, then collect its incomplete outcome. |
 | `status` | Optional `task_id`; checks current target and restores explicit incomplete states. |
 | `invalidate` | `task_id`; marks the reviewed target stale before new work. Does not waive pending children. |
@@ -78,10 +79,11 @@ implementation + ordinary verification (same owner)
      inconclusive     -> obtain bounded missing evidence -> fresh review
 ```
 
-Worker/designer output is concise prose describing actual changes and checks. Reviewer and
+Native worker output is concise prose describing actual changes and checks. CLI designers
+write a run-bound implementation JSON to their run-specific pending report. Reviewer and
 adjudicator output is exactly one JSON object (one JSON fence is tolerated), matching
-the supplied schema. Children cannot write report artifacts through their readonly
-tools; root captures and validates returned bytes. Failed, malformed, interrupted or
+the supplied schema. Readonly reviewers cannot write report artifacts; root captures
+and validates their returned bytes. Failed, malformed, interrupted or
 stale results stay incomplete. No fixed review-attempt cap is imposed.
 
 ## Explicit Claude design request
@@ -90,7 +92,8 @@ After the user explicitly requests Claude for design, root records `design_reque
 with the original user quote and `design_scope` as `design-direction`,
 `ui-implementation` (directly related UI work), or
 `design-direction-and-ui-implementation`. Then delegate role `designer`, exact
-`anthropic/claude-opus-5-5`, supported thinking, and the matching `design_scope`.
+`anthropic/claude-opus-5-5` (logical exact model pin), supported CLI effort in `thinking`,
+and the matching `design_scope`. CLI argv uses `claude-opus-5-5`, not an alias.
 No other Anthropic model or provider fallback is launched; regular worker/reviewer/
 adjudicator routes reject Anthropic even if allowlisted. This is a scoped exception
 outside regular GPT allowed_models, not a global model policy expansion.
@@ -103,11 +106,15 @@ fixes; `resume` continues that same owner. GPT performs fresh independent review
 adjudication and final acceptance, respecting Opus design choices unless a user
 requirement or functional constraint requires change.
 
-This path uses Pi's native Anthropic provider and existing authentication through
-Tintinweb, with the same repository as other writers. It does not invoke Claude Code,
-create a linked worktree or provide CLI snapshot/ownership isolation. Managed disjoint
-ownership and target checks are scheduling/evidence checks. See
-[Claude design delegation](references/claude-design.md) for exact boundaries.
+This path uses installed Claude Code `--bg`, retaining its existing authentication and
+permissions. It requires supported CLI capabilities, not Pi Anthropic credentials or a
+catalog entry. No installation, login change, API/print fallback or permission bypass
+is performed. The current repository cwd and managed disjoint ownership remain; no
+linked worktree or OS sandbox is claimed. Collection stops the exact observed writer,
+validates its run-bound report/checks and actual baseline delta, and rejects changes
+outside literal ownership. Existing dirty user files cannot be owned on initial dispatch;
+narrow ownership or resolve that conflict manually, never reset/stash user changes.
+See [Claude design delegation](references/claude-design.md) for lifecycle and recovery.
 
 ## Policy and evidence
 
@@ -121,7 +128,8 @@ See the [adopted routing assessment](references/routing-proposal.md) for dated r
 supported thinking guidance and verification limits. Older GPT models are excluded
 from defaults; preserve explicitly authorized legacy pins through project
 `allowed_models`. A bare ID restricts IDs; it never chooses a provider. Actual dispatch
-always requires an exact available provider/model and thinking level. No fuzzy matching, effort clamping, provider
+for GPT requires an exact available Pi provider/model and thinking level; the designer
+exception requires its exact logical pin and installed CLI capabilities. No fuzzy matching, effort clamping, provider
 substitution, API charging fallback, or account changes are used to recover.
 
 Example preserving an explicitly selected legacy pin (no automatic fallback):
@@ -147,7 +155,9 @@ Target hashing covers HEAD, staged/unstaged tracked diffs and nonignored untrack
 files. Ignored outputs, external services and dependencies are not hashed; root must
 identify relevant render/verification evidence separately. Results and receipts live
 outside the Git tree under `$PI_CODING_AGENT_DIR/astraeus/SESSION/TASK`, mode 0600,
-so saving them does not change target identity. Result/receipt hashes are checked again
+so saving them does not change target identity. Claude per-run request, launch/stop,
+pending/final result artifacts live in an additional `RUN` directory. Its collection
+baseline includes ignored files, unlike the source review target. Result/receipt hashes are checked again
 at acceptance; adjudication binds to the exact original review bytes.
 
 Workflow snapshots use Pi custom session entries and restore from the active branch,
@@ -157,7 +167,11 @@ shown as unavailable, never successful. Collecting a lost attempt settles it as
 unsuccessful while preserving history, so a fresh reviewer can supply new evidence
 in the same task. Lost implementation work still blocks acceptance; use Tintinweb's
 saved-session/@handle recovery controls, since managed continuation requires the
-original live record/session. Missing review evidence is never invented. Artifacts are local
+original live record/session. CLI designers restore their recorded transport and observed
+UUID from task state, verify it via public `agents --json --all`, and never read private
+transcripts. Missing/unknown lifecycle is not completion and blocks writer freezing.
+Legacy native designer jobs stay native or require explicit recovery, never migrate.
+Missing review evidence is never invented. Artifacts are local
 and are not automatically uploaded.
 
 ## Development and verification
@@ -172,7 +186,10 @@ uv run --with 'jsonschema>=4.23,<5' python -c 'import os,subprocess,sys; os.envi
 Tests cover target invalidation, schema/hash binding, verdict transitions, fallback
 rejection, role overrides, writer ownership and branch recovery. The native test loads
 both real extension factories with Pi 1.0.4 and exercises real child sessions using a
-local deterministic provider, including a stub exact Anthropic designer route and
-same-owner continuation. It never calls an external inference service or reads
-personal auth. Set `PI_ASTRAEUS_SUBAGENTS` to a built/pinned Tintinweb package root to
+local deterministic provider for GPT-route fresh review and same-owner continuation.
+The former Pi-native Anthropic designer regression is intentionally retired. Fake public
+Claude CLI lifecycle tests cover launch/stop evidence, observed UUID/cwd binding,
+stop-before-resume, copied-owner rejection, run reports, dirty baseline preservation,
+and owned/ignored deltas. Automated tests never invoke live inference or read personal
+auth; bounded live Claude QA is a separate explicitly authorized manual gate. Set `PI_ASTRAEUS_SUBAGENTS` to a built/pinned Tintinweb package root to
 qualify that exact source instead of the locked development npm package.

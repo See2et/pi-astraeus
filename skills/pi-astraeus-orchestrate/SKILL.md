@@ -56,12 +56,16 @@ disclose it and obtain authorized configuration instead of substituting silently
 Never change authentication, billing routes, or use another inference CLI to recover.
 Explain material routing changes. A root preference is not a runtime switch.
 
-Only an explicit user request permits Pi-native Claude design direction and directly
+Only an explicit user request permits installed Claude Code background design direction and directly
 related UI implementation. Read [Claude design delegation](../../references/claude-design.md)
 before dispatch: record the original quote and scope once, use exact
 `anthropic/claude-opus-5-5` with role `designer`, and keep follow-up fixes with that
 owner in the same task. General implementation, review, adjudication and acceptance
-stay on GPT. This exception uses Pi authentication, not a Claude Code CLI bridge.
+stay on native GPT. This exception uses installed Claude Code `--bg`, CLI model
+`claude-opus-5-5` and validated CLI effort, not Pi Anthropic credentials/catalog.
+No auth changes, permission bypass or API/print fallback. Collect freezes the exact
+observed UUID and validates a run-specific report, required checks and owned baseline
+delta. Resume the stopped original owner without configuration overrides; reject copies.
 
 Prioritize Astra for design direction and visual acceptance. For an authorized Claude
 task, Opus owns design choices; GPT review assesses brief and function without

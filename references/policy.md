@@ -1,7 +1,8 @@
 # Policy and host boundaries
 
 Astraeus is an instruction layer, not a scheduler or security boundary. Pi owns
-execution, authentication, threads, permissions, and model capabilities. Skill use
+native GPT execution, authentication, threads, permissions, and model capabilities.
+Explicit designers use installed Claude Code background execution and its existing auth. Skill use
 cannot guarantee that the host will always obey policy or load all instructions.
 
 Project `astraeus.toml` is optional. Read only the file at the working project root.
@@ -44,7 +45,8 @@ to invent a provider. If preferred routes are unavailable, obtain an authorized
 model pin or project policy; never silently substitute models. Legacy GPT pins remain
 valid when explicitly authorized by project `allowed_models`; they are excluded from
 automatic defaults. Fresh same-model review remains independent.
-No external inference CLI, alternate authentication engine, or charging fallback.
+No external inference CLI for GPT recovery, alternate authentication engine, or charging
+fallback. The explicit designer transport below is a user-authorized route, not recovery.
 Pi's current child runner does not enforce a read-only sandbox. Strict assurance must
 stop before review/adjudication; reported assurance may proceed with clear disclosure.
 A tool denial or model mismatch cannot be repaired by expanding permissions or silently
@@ -55,7 +57,7 @@ is absent, use unknown, with a short source explanation. Do not inspect auth fil
 private session history, unrelated personal skills, or billing to fill missing values.
 Under reported assurance, unobservable realized settings can proceed with disclosure;
 known mismatch cannot be called a successful pinned dispatch. Under strict assurance,
-missing evidence is blocking. No silent model substitution, external inference, or
+missing evidence is blocking. No silent model substitution, unauthorized external inference, or
 API charging fallback. User pins remain authoritative.
 
 Review target IDs can be supplied by a caller's immutable snapshot or by the bundled
@@ -74,7 +76,10 @@ The checker binds adjudication to the exact supplied review and checks dispositi
 coverage and acceptance consistency. It does not authenticate rationale, host receipts,
 role independence, or discover consequential changes: root checks those.
 
-The [explicit Claude design exception](claude-design.md) uses Pi-native Anthropic
-only for a recorded user-requested designer scope. It does not modify regular GPT
-allowed_models. General workers/reviewers/adjudicators reject Anthropic. Designer
-ownership, native continuation and review freezing use the existing managed lifecycle.
+The [explicit Claude design exception](claude-design.md) uses installed Claude Code
+`--bg` only for a recorded user-requested designer scope, logically pinned to exact
+`anthropic/claude-opus-5-5` (CLI model `claude-opus-5-5`). It does not modify regular GPT
+allowed_models or require Pi Anthropic availability. General workers/reviewers/adjudicators
+remain native and reject Anthropic. Managed ownership and review freezing remain;
+CLI stop/launch evidence and run-bound reports supplement source-target checks.
+No API/print fallback, auth modification, installation or permission bypass is allowed.

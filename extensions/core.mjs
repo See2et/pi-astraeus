@@ -1,10 +1,12 @@
 import { randomUUID, createHash } from 'node:crypto';
-import { readFile, writeFile, mkdir, realpath, readdir } from 'node:fs/promises';
+import { readFile, writeFile, mkdir, realpath, readdir, lstat } from 'node:fs/promises';
 import { existsSync, realpathSync } from 'node:fs';
 import { dirname, join, resolve, posix } from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
+import { ClaudeBackground, CLAUDE_TRANSPORT, CLI_EFFORTS, validatePaths, validateChecks, snapshot, delta, publish } from './claude.mjs';
+export const isCli = job => job.transport === CLAUDE_TRANSPORT;
 export const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 export const ENTRY = 'pi-astraeus:state-v1';
 export const ROLES = ['worker', 'designer', 'reviewer', 'adjudicator'];
@@ -17,9 +19,8 @@ export function designAuthorization(p) {
 }
 export function designModel(registry, value) {
   if (value !== DESIGN_MODEL) throw new Error(`Designer requires exact ${DESIGN_MODEL}; no lower-family or provider fallback.`);
-  const model = registry.getAvailable().find(m => `${m.provider}/${m.id}` === value);
-  if (!model) throw new Error(`Unavailable authorized model: ${value}. No fallback was launched.`);
-  return model;
+  // Logical pin: the installed CLI owns authentication and capability checks.
+  return {provider:'anthropic', id:'claude-opus-5-5'};
 }
 const ACTIVE = new Set(['running', 'queued']);
 export const hash = text => 'sha256:' + createHash('sha256').update(text).digest('hex');
@@ -77,8 +78,8 @@ export function run(command, args, cwd, signal) {
   });
 }
 export class Workflow {
-  constructor(host, { root = ROOT, python = process.env.PI_ASTRAEUS_PYTHON || 'python3' } = {}) {
-    this.host = host; this.root = root; this.python = python; this.tasks = {}; this.queue = Promise.resolve();
+  constructor(host, { root = ROOT, python = process.env.PI_ASTRAEUS_PYTHON || 'python3', claude = new ClaudeBackground() } = {}) {
+    this.host = host; this.root = root; this.python = python; this.claude = claude; this.tasks = {}; this.queue = Promise.resolve();
   }
   bridge(args, ctx) { return run(this.python, [join(this.root, 'scripts/astraeus.py'), ...args], ctx.cwd); }
   async policy(ctx) { return JSON.parse(await this.bridge(['policy', '--repo', ctx.cwd], ctx)); }
@@ -92,7 +93,7 @@ export class Workflow {
       if (entry.type === 'custom' && entry.customType === ENTRY && entry.data?.version === 1) this.tasks = structuredClone(entry.data.tasks);
     }
     for (const task of Object.values(this.tasks)) {
-      for (const job of task.jobs) if (ACTIVE.has(job.status) && !this.manager()?.getRecord(job.agent_id)) job.status = 'unavailable';
+      for (const job of task.jobs) if (!isCli(job) && ACTIVE.has(job.status) && !this.manager()?.getRecord(job.agent_id)) job.status = 'unavailable';
     }
     this.show(ctx);
   }
@@ -111,15 +112,20 @@ export class Workflow {
   activeJobs(cwd) {
     return Object.values(this.tasks).filter(task => task.cwd === cwd).flatMap(task => {
       const latest = new Map(task.jobs.map(job => [job.agent_id || job.run_id, job]));
-      return [...latest.values()].filter(job => ACTIVE.has(this.manager()?.getRecord(job.agent_id)?.status ?? job.status));
+      return [...latest.values()].filter(job => isCli(job) ? !job.cli.frozen || (job.cli.unexpected_copy && !job.cli.copy_frozen) : ACTIVE.has(this.manager()?.getRecord(job.agent_id)?.status ?? job.status));
     });
   }
   async status(ctx, id) {
     const tasks = id ? [this.task(id, ctx)] : Object.values(this.tasks);
     for (const task of tasks) {
       for (const job of task.jobs) {
-        const record = this.manager()?.getRecord(job.agent_id);
-        if (ACTIVE.has(job.status)) job.status = record?.status ?? 'unavailable';
+        if (isCli(job)) {
+          try { await this.claude.observe(job, task.cwd); job.status = job.cli.frozen ? 'stopped' : 'running'; delete job.error; }
+          catch (error) { job.status = 'unavailable'; job.cli.frozen = false; job.valid = false; job.error = String(error); }
+        } else {
+          const record = this.manager()?.getRecord(job.agent_id);
+          if (ACTIVE.has(job.status)) job.status = record?.status ?? 'unavailable';
+        }
       }
       if (task.target_id && task.cwd === realpathSync(ctx.cwd) && await this.target(ctx) !== task.target_id) {
         task.phase = 'stale'; task.accepted = false;
@@ -199,12 +205,25 @@ export class Workflow {
     if (['collect', 'stop', 'resume'].includes(p.op) && !job) throw new Error('Unknown run_id');
     if (p.op === 'collect') return this.collect(task, job, ctx);
     if (p.op === 'stop') {
-      await rpc(this.host.events, 'stop', { agentId: job.agent_id });
-      job.status = 'stopped'; job.collected = false; this.save(ctx); return job;
+      try {
+        if (isCli(job)) await this.claude.stop(job, task.cwd);
+        else await rpc(this.host.events, 'stop', { agentId: job.agent_id });
+        job.status = 'stopped'; job.collected = false; job.valid = false; return job;
+      } finally { this.save(ctx); }
     }
     if (p.op === 'resume') return this.resume(task, job, p, ctx, signal);
     if (p.op === 'accept') {
-      if (task.jobs.some(j => !j.collected || ACTIVE.has(this.manager()?.getRecord(j.agent_id)?.status ?? j.status))) throw new Error('Collect every managed result before acceptance.');
+      // Re-observe external writers: a missing native manager is not freeze evidence.
+      const cliOwners = new Map(Object.values(this.tasks).filter(t => t.cwd === task.cwd).flatMap(t => t.jobs.filter(isCli)).map(j => [j.agent_id || j.run_id,j]));
+      for (const writer of cliOwners.values()) {
+        await this.claude.observe(writer, task.cwd);
+        if (!writer.cli.frozen || (writer.cli.unexpected_copy && !writer.cli.copy_frozen)) throw new Error('Freeze exact Claude writer before acceptance.');
+        if (writer.valid) {
+          if (writer.result_hash !== hash(await readFile(writer.artifact, 'utf8'))) throw new Error('Saved implementation report bytes changed.');
+          await this.claude.audit(writer);
+        }
+      }
+      if (this.activeJobs(task.cwd).length || task.jobs.some(j => !j.collected || (!isCli(j) && ACTIVE.has(this.manager()?.getRecord(j.agent_id)?.status ?? j.status)))) throw new Error('Collect every managed result before acceptance.');
       const latestWorkers = new Map(task.jobs.filter(j => isWriter(j.role)).map(j => [j.agent_id, j]));
       if ([...latestWorkers.values()].some(j => !j.valid)) throw new Error('Implementation owner has unresolved failed or incomplete work.');
       const matches = JSON.parse(await this.bridge(['matches-review', '--repo', ctx.cwd], ctx));
@@ -235,12 +254,20 @@ export class Workflow {
     if (role === 'designer' && (!task.design_authorization || p.design_scope !== task.design_authorization.scope)) throw new Error('Designer requires recorded explicit design authorization and matching design_scope.');
     const model = role === 'designer' ? designModel(ctx.modelRegistry, p.model) : exactModel(ctx.modelRegistry, p.model, policy);
     if (!p.thinking) throw new Error('Specify thinking explicitly.');
-    const levels = this.host.supportedThinking(model);
+    const levels = role === 'designer' ? CLI_EFFORTS : this.host.supportedThinking(model);
     if (!levels.includes(p.thinking)) throw new Error(`Unsupported thinking ${p.thinking}; available: ${levels.join(', ')}. No clamping allowed.`);
     await this.roleCheck(role, ctx);
-    const ping = await rpc(this.host.events, 'ping', {});
-    if (ping?.version !== 2) throw new Error('Unsupported Tintinweb RPC version');
+    if (role !== 'designer') {
+      const ping = await rpc(this.host.events, 'ping', {});
+      if (ping?.version !== 2) throw new Error('Unsupported Tintinweb RPC version');
+    }
     const currentTarget = await this.target(ctx);
+    // External writer state must be current even without a native manager.
+    const cliOwners = new Map(Object.values(this.tasks).filter(t => t.cwd === task.cwd).flatMap(t => t.jobs.filter(isCli)).map(j => [j.agent_id || j.run_id,j]));
+    for (const writer of cliOwners.values()) {
+      try { await this.claude.observe(writer,task.cwd); }
+      catch (error) { writer.cli.frozen = false; writer.valid = false; writer.error = String(error); this.save(ctx); }
+    }
     const running = this.activeJobs(task.cwd);
     if (!isWriter(role) && running.length) throw new Error('Freeze writers and collect outstanding work before review/adjudication.');
     if (!isWriter(role) && task.jobs.some(j => !j.collected)) throw new Error('Collect existing runs first.');
@@ -261,7 +288,9 @@ export class Workflow {
       task.target_id = null; task.accepted = false;
     } else task.target_id = currentTarget;
     const run_id = randomUUID();
-    const job = { run_id, role, agent_id: null, status: 'queued', collected: false, valid: false, owned_paths: owned, requested: {model:p.model, effort:p.thinking}, review_run: review?.run_id ?? null, target_id: task.target_id };
+    if (role === 'designer') { validatePaths(owned); validateChecks(p.checks ?? []); }
+    const job = { run_id, role, transport:role === 'designer' ? CLAUDE_TRANSPORT : 'pi-native', agent_id: null, status: 'queued', collected: false, valid: false, owned_paths: owned, requested: {model:p.model, effort:p.thinking}, review_run: review?.run_id ?? null, target_id: task.target_id };
+    if (role === 'designer') job.cli = {frozen:false, evidence:[]};
     task.jobs.push(job); task.accepted = false; task.phase = isWriter(role) ? 'implementation' : role === 'reviewer' ? 'review' : 'adjudication'; this.save(ctx);
     const designText = task.design_authorization ? await readFile(join(this.root, 'references/claude-design.md'), 'utf8') : '';
     const policyText = await readFile(join(this.root, 'skills', `pi-astraeus-${isWriter(role) ? 'orchestrate' : role === 'reviewer' ? 'review' : 'adjudicate'}`, 'SKILL.md'), 'utf8');
@@ -276,12 +305,91 @@ export class Workflow {
       review ? `Original review bytes:\n${await readFile(review.artifact, 'utf8')}\nreview_sha256: ${review.result_hash}` : '',
     ].filter(Boolean).join('\n\n');
     try {
+      if (role === 'designer') {
+        await this.prepareCli(task, job, ctx, p.checks ?? []);
+        this.save(ctx); // Persist binding before launch; failures must never invite a blind retry.
+        await this.claude.start(job, task.cwd, await this.cliPrompt(task, job, prompt), job.cli.checks);
+        this.save(ctx); return job;
+      }
       const response = await rpc(this.host.events, 'spawn', { type: `astraeus-${role}`, prompt, options: { model, thinkingLevel:p.thinking, inheritContext:false, isBackground:true, cwd:ctx.cwd, onSpawned: id => { job.agent_id = id; this.save(ctx); } } });
       job.agent_id = response.id; job.status = this.manager()?.getRecord(response.id)?.status ?? 'running'; this.save(ctx);
       return job;
-    } catch (error) { job.status = this.manager()?.getRecord(job.agent_id)?.status ?? (job.agent_id ? 'unavailable' : 'error'); job.error = String(error); this.save(ctx); throw error; }
+    } catch (error) { job.status = isCli(job) ? 'unavailable' : this.manager()?.getRecord(job.agent_id)?.status ?? (job.agent_id ? 'unavailable' : 'error'); job.error = String(error); this.save(ctx); throw error; }
+  }
+  async prepareCli(task, job, ctx, checks, prior) {
+    for (const owned of job.owned_paths) {
+      let path = resolve(task.cwd,owned);
+      while (!existsSync(path)) { const parent = dirname(path); if (parent === path) throw new Error('Cannot resolve owned path'); path = parent; }
+      const canonical = await realpath(path);
+      if (canonical !== task.cwd && !canonical.startsWith(task.cwd + '/')) throw new Error(`Designer ownership escapes cwd through symlink: ${owned}`);
+    }
+    const directory = join(await this.artifacts(task, ctx), job.run_id);
+    if (directory === task.cwd || directory.startsWith(task.cwd + '/')) throw new Error('Claude control artifacts must be outside the managed cwd.');
+    await mkdir(directory, {recursive:true, mode:0o700});
+    const baseline = await snapshot(task.cwd);
+    // Existing dirty user files are never handed to an external writer. No reset/stash.
+    for (const path of Object.keys(baseline.files)) {
+      if (!job.owned_paths.some(o => o === '.' || path === o || path.startsWith(o + '/'))) continue;
+      if ((await lstat(join(task.cwd,path))).isSymbolicLink()) {
+        const canonical = await realpath(join(task.cwd,path));
+        if (canonical !== task.cwd && !canonical.startsWith(task.cwd + '/')) throw new Error(`Designer owned symlink escapes cwd: ${path}`);
+      }
+    }
+    const dirty = prior ? prior.user_dirty : baseline.dirty;
+    if (!prior && dirty.some(path => job.owned_paths.some(o => o === '.' || path === o || path.startsWith(o + '/')))) throw new Error('Designer ownership overlaps existing user changes; narrow ownership or resolve manually without reset/stash.');
+    const report_directory = prior ? prior.report_directory : join(directory,'pending');
+    await mkdir(report_directory,{recursive:true, mode:0o700});
+    job.cli = {directory, report_directory, pending:join(report_directory,`${job.run_id}.json`), checks, baseline, dispatch_target:await this.target(ctx), user_dirty:dirty, evidence:prior ? [...prior.evidence] : [], frozen:false,
+      ...(prior ? {short_id:prior.short_id, session_id:prior.session_id, observed:prior.observed} : {})};
+    const bytes = JSON.stringify({task_id:task.task_id, run_id:job.run_id, owned_paths:job.owned_paths, checks, baseline, dispatch_target:job.cli.dispatch_target},null,2);
+    const path = join(directory,'request.json');
+    await writeFile(path, bytes, {mode:0o600, flag:'wx'});
+    job.cli.evidence.push({kind:'request', path, sha256:hash(bytes).slice(7)});
+  }
+  async cliPrompt(task, job, prompt) {
+    const schema = await readFile(join(this.root,'schemas/implementation.json'),'utf8');
+    const role = await readFile(join(this.root,'agents/astraeus-designer.md'),'utf8');
+    return `${prompt}\n\nDesigner role contract (native frontmatter is not CLI isolation):\n${role}\n\nInstalled Claude Code background task, exact requested model claude-opus-5-5. Do not launch nested agents, create worktrees, commit/stage/reset/stash, push, publish, or edit outside literal ownership. Preserve existing user changes. Permissions are not an OS sandbox. Run required checks exactly: ${JSON.stringify(job.cli.checks)}. Report failed/denied checks truthfully. Missing checks means checks: [].\nWrite one JSON implementation result only to ${job.cli.pending}; do not edit control metadata or publish a final result. task_id=${JSON.stringify(task.task_id)}, run_id=${JSON.stringify(job.run_id)}, target_id=${JSON.stringify(job.cli.dispatch_target)}. changed_files must match the actual delta from this run's baseline, not preexisting changes. Complete requires completed authorized work, all required checks passed, remaining: []. Schema:\n${schema}`;
+  }
+  async collectCli(task, job, ctx) {
+    job.valid = false;
+    try {
+      const observed = await this.claude.observe(job, task.cwd);
+      if (!job.cli.frozen) {
+        if (!(['done','stopped'].includes(observed.state) || (observed.state === 'blocked' && observed.status === 'idle'))) {
+          if (observed.state === 'working' && ['running','busy','working'].includes(observed.status)) return {...job, note:'Claude still working; unknown lifecycle is not completion.'};
+          throw new Error('Claude lifecycle not collectable; explicitly stop exact writer or obtain evidence.');
+        }
+        await this.claude.stop(job, task.cwd);
+      }
+      if (job.cli.unexpected_copy && !job.cli.copy_frozen) throw new Error('Unexpected copy remains unfrozen.');
+      job.collected = true;
+      const before = await snapshot(task.cwd), paths = delta(job.cli.baseline, before, job.owned_paths);
+      const candidate = job.artifact || job.cli.pending;
+      if ((await lstat(candidate)).isSymbolicLink()) throw new Error('Symlinked implementation report.');
+      const bytes = await readFile(candidate,'utf8');
+      // Validate captured bytes, not a mutable child path reopened by Python.
+      const validation = join(job.cli.directory,`validation-${randomUUID()}.json`);
+      await writeFile(validation,bytes,{mode:0o600, flag:'wx'});
+      job.result = JSON.parse(await this.bridge(['validate-result',validation,'--kind','implementation','--task-id',task.task_id,'--target-id',job.cli.dispatch_target],ctx)).result;
+      const result = job.result;
+      if (result.run_id !== job.run_id || result.status !== 'complete' || result.remaining.length) throw new Error('Implementation report has wrong run binding, incomplete work or remaining issues.');
+      const checks = new Map(result.checks.map(c => [c.command,c]));
+      if (checks.size !== result.checks.length || result.checks.some(c => c.outcome !== 'passed') || job.cli.checks.some(c => !checks.has(c))) throw new Error('Required checks missing, failed or not run.');
+      if (JSON.stringify([...result.changed_files].sort()) !== JSON.stringify(paths)) throw new Error('Implementation changed_files differs from actual owned baseline delta.');
+      await this.claude.observe(job,task.cwd);
+      if (!job.cli.frozen || JSON.stringify(await snapshot(task.cwd)) !== JSON.stringify(before)) throw new Error('Claude writer/source changed during collection.');
+      if (!job.artifact) {
+        const final = join(job.cli.directory,'result.json');
+        await publish(job.cli.pending,final,bytes); job.artifact = final;
+      } else if (job.result_hash !== hash(bytes)) throw new Error('Published implementation result changed.');
+      job.result_hash = hash(bytes); job.summary = result.summary; job.valid = true;
+      task.phase = 'verification'; task.target_id = null; delete job.error;
+    } catch (error) { job.collected = true; job.error = String(error); task.phase = 'needs-evidence'; }
+    this.save(ctx); return job;
   }
   async collect(task, job, ctx) {
+    if (isCli(job)) return this.collectCli(task,job,ctx);
     const record = this.manager()?.getRecord(job.agent_id);
     if (!record) {
       if (job.collected) return job;
@@ -319,12 +427,27 @@ export class Workflow {
     if (!isWriter(job.role)) throw new Error('Reviews and adjudications always use fresh sessions.');
     if (!job.collected || !p.prompt?.trim()) throw new Error('Collect the previous run and provide a bounded follow-up prompt.');
     if (this.activeJobs(task.cwd).length) throw new Error('Collect/stop active work before resuming the implementation owner.');
+    const latestOwner = [...task.jobs].reverse().find(j => j.agent_id === job.agent_id && isWriter(j.role));
+    if (latestOwner !== job) throw new Error('Resume only the latest run of the original implementation owner.');
     const latestReview = [...task.jobs].reverse().find(j => j.role === 'reviewer');
     if (latestReview?.valid && latestReview.result?.verdict === 'changes_required') {
       const decision = [...task.jobs].reverse().find(j => j.role === 'adjudicator' && j.review_run === latestReview.run_id && j.valid);
       if (!decision || decision.result?.verdict !== 'changes_required') throw new Error('Only adopted fixes from a complete adjudication may return to the implementer.');
       if (await this.target(ctx) !== task.target_id) throw new Error('Target changed since adjudication; obtain fresh review before adopted fixes.');
       await this.validate(decision, task, ctx);
+    }
+    if (isCli(job)) {
+      await this.claude.observe(job,task.cwd);
+      if (!job.cli.frozen) throw new Error('Collect/freeze the original Claude writer before resume.');
+      const follow = {...job, run_id:randomUUID(), collected:false, valid:false, result:undefined, artifact:undefined, result_hash:undefined, status:'queued', error:undefined};
+      task.jobs.push(follow); task.accepted = false; task.target_id = null; task.phase = 'implementation';
+      try {
+        // Follow-up may edit the previous owner's delta, but not preexisting user files.
+        await this.prepareCli(task,follow,ctx,job.cli.checks,job.cli);
+        this.save(ctx);
+        await this.claude.resume(follow,task.cwd,await this.cliPrompt(task,follow,`Continue only original authorized design scope ${task.design_authorization.scope}; preserve Opus design decisions unless explicit user/functional constraints require changes.\n${p.prompt}`));
+        this.save(ctx); return follow;
+      } catch (error) { follow.status = 'unavailable'; follow.error = String(error); follow.collected = true; this.save(ctx); throw error; }
     }
     const record = this.manager()?.getRecord(job.agent_id);
     if (!record?.session) throw new Error('Original live child session unavailable. Use Tintinweb @handle session recovery; no replacement owner was launched.');

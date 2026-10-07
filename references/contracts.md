@@ -4,6 +4,12 @@ Contracts describe results, never the agent's private reasoning or search sequen
 Read only the relevant schema under `../schemas/`. Review and adjudication require JSON; exploration,
 research, and implementation may use concise prose when parsing offers little value.
 Empty lists are valid where there is nothing to report. Do not manufacture findings.
+The Claude Code designer transport requires implementation JSON, including `run_id`
+equal to this run and `target_id` equal to its dispatch baseline. It writes only the
+run-specific pending path; root stops the exact CLI writer, checks required commands,
+complete status/no remaining work and actual changed_files, then publishes the original
+validated bytes. Absent requested checks means `checks: []`, never fabricated checks.
+This is post-validation, not generation-time schema enforcement or final acceptance.
 
 Common fields: `schema_version: 1`, `kind`, `task_id`, `target_id`, `status`
 (`complete|blocked|failed`), and a short `summary`.

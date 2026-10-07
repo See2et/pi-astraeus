@@ -22,7 +22,7 @@ test('Pi 1.0.4 loads both factories and runs real fresh/reused children with onl
   let requests=0;
   const target=execFileSync(process.env.PI_ASTRAEUS_PYTHON || 'python3',[resolve('scripts/astraeus.py'),'target','--repo',cwd],{encoding:'utf8'}).trim();
   const fake=pi=> {
-    for (const [provider, id] of [['local-test','stub'], ['anthropic','claude-opus-5-5']]) pi.registerProvider(provider,{
+    for (const [provider, id] of [['local-test','stub']]) pi.registerProvider(provider,{
     api:'local-test-api',apiKey:'local-fixture-only',baseUrl:'http://invalid.local',
     models:[{id,name:'Local stub',reasoning:false,input:['text'],cost:{input:0,output:0,cacheRead:0,cacheWrite:0},contextWindow:32000,maxTokens:4000}],
     streamSimple:(model,context)=>{
@@ -79,17 +79,7 @@ test('Pi 1.0.4 loads both factories and runs real fresh/reused children with onl
     const followResult=await invoke({op:'collect',task_id:'native-worker',run_id:follow.run_id});
     assert.equal(followResult.valid,true,followResult.error);
     assert.equal(requests,3);
-    await invoke({op:'start',task_id:'native-designer',requirements:'Exercise Pi-native designer',acceptance:'Same Anthropic session resumes',design_request:'Use Claude for this design',design_scope:'design-direction'});
-    const designer=await invoke({op:'delegate',task_id:'native-designer',role:'designer',model:'anthropic/claude-opus-5-5',thinking:'off',design_scope:'design-direction',prompt:'Return deterministic design fixture'});
-    const designOwner=globalThis[Symbol.for('pi-subagents:manager')].getRecord(designer.agent_id);
-    await designOwner.promise;
-    assert.equal(designOwner.session.model.provider,'anthropic');
-    assert.equal(designOwner.session.model.id,'claude-opus-5-5');
-    assert.equal((await invoke({op:'collect',task_id:'native-designer',run_id:designer.run_id})).valid,true);
-    const designFollow=await invoke({op:'resume',task_id:'native-designer',run_id:designer.run_id,prompt:'Preserve design and return bounded follow-up'});
-    assert.equal(designFollow.agent_id,designer.agent_id);
-    await designOwner.promise;
-    assert.equal((await invoke({op:'collect',task_id:'native-designer',run_id:designFollow.run_id})).valid,true);
-    assert.equal(requests,5);
+    // Native Anthropic designer regression retired: background CLI tests own this route.
+    assert.equal(requests,3);
   } finally { await session.extensionRunner.emit({type:'session_shutdown'}); session.dispose(); }
 });

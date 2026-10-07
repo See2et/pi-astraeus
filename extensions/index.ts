@@ -17,6 +17,7 @@ const parameters = Type.Object({
   model: Type.Optional(Type.String({description:'Exact authorized provider/model ID; no fuzzy matching or fallback'})),
   thinking: Type.Optional(Type.Union(['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'].map(x => Type.Literal(x)))),
   prompt: Type.Optional(Type.String()), owned_paths: Type.Optional(Type.Array(Type.String())),
+  checks: Type.Optional(Type.Array(Type.String({description:'Designer-only exact simple verification commands; absent means []'}))),
   run_id: Type.Optional(Type.String()),
 });
 export default function (pi: ExtensionAPI) {
@@ -29,7 +30,7 @@ export default function (pi: ExtensionAPI) {
   const internalResume = new Map<string, string>();
   pi.registerTool({
     name:'astraeus_workflow', label:'Astraeus workflow', exposure:'model-only',
-    description:`Manage evidence-bound Astraeus work. Trivial work stays solo. For consequential work, start with requirements/acceptance/constraints, delegate only useful bounded work with exact model+thinking, collect results, use fresh reviewer then fresh adjudicator only after complete changes_required, resume the original implementation owner for adopted fixes, and accept after evidence and current-target checks. For explicit Claude design only, record original design_request and design_scope at start/authorize_design, then use designer with matching scope and exact anthropic/claude-opus-5-5. These are caller attestations, not authenticated user consent. Status does not infer success. Role policies: ${join(ROOT, 'skills')}.`,
+    description:`Manage evidence-bound Astraeus work. Trivial work stays solo. For consequential work, start with requirements/acceptance/constraints, delegate only useful bounded work with exact model+thinking, collect results, use fresh reviewer then fresh adjudicator only after complete changes_required, resume the original implementation owner for adopted fixes, and accept after evidence and current-target checks. For explicit Claude design only, record original design_request and design_scope at start/authorize_design, then use designer with matching scope and exact anthropic/claude-opus-5-5 (logical pin), installed Claude Code --bg with supported CLI effort and optional checks. GPT routes stay native; no CLI/API fallback. Designer collect stops the exact bound writer and validates a run-specific structured report and owned baseline delta. These are caller attestations, not authenticated user consent. Status does not infer success. Role policies: ${join(ROOT, 'skills')}.`,
     parameters,
     async execute(toolCallId, params, signal, _onUpdate, ctx) {
       if (params.op === 'resume' && params.run_id && params.task_id) {
@@ -61,7 +62,7 @@ export default function (pi: ExtensionAPI) {
     const state = await workflow.execute({op:'status'}, ctx);
     return { message: {
       customType:'pi-astraeus:guidance', display:false,
-      content:`Apply ${join(ROOT, 'skills/pi-astraeus-orchestrate/SKILL.md')} to authorized project work. Simple tasks stay solo. Root owns scope and final acceptance. Use astraeus_workflow for managed consequential work, including when root implements directly (delegate is optional). Preserve project/user constraints and native Pi authentication. Never claim strict sandbox assurance. Current workflow state: ${JSON.stringify(state)}. Read-only role instructions are not OS isolation.`,
+      content:`Apply ${join(ROOT, 'skills/pi-astraeus-orchestrate/SKILL.md')} to authorized project work. Simple tasks stay solo. Root owns scope and final acceptance. Use astraeus_workflow for managed consequential work, including when root implements directly (delegate is optional). Preserve project/user constraints and native Pi authentication for GPT. Explicit designer uses only installed Claude Code --bg, never as GPT fallback. Never claim strict sandbox assurance. Current workflow state: ${JSON.stringify(state)}. Read-only role instructions are not OS isolation.`,
     }};
   });
   pi.on('tool_call', (event, ctx) => {

@@ -13,6 +13,11 @@
       "minLength": 1,
       "pattern": "\\S"
     },
+    "run_id": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "\\S"
+    },
     "target_id": {
       "type": "string",
       "minLength": 1,

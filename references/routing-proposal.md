@@ -74,7 +74,8 @@ per-token dominance is not a measured quality/latency dominance.
 - Demanding judgment: GPT-6 Astra high for unresolved conflicting evidence, important
   security/concurrency/architecture questions, and visual acceptance of rendered work.
   Choose it upfront when requirements warrant it, not a mandatory cheap-first ladder.
-- Explicitly requested Claude design: Pi-native exact Anthropic Opus 5.5+; Claude owns
+- Explicitly requested Claude design: installed Claude Code `--bg`, exact logical
+  `anthropic/claude-opus-5-5` / CLI `claude-opus-5-5`; Claude owns
   design direction and directly related UI work. GPT retains independent review,
   adjudication and final acceptance. User choices and actual functional constraints
   outrank every model's taste. No design request means no automatic Anthropic dispatch.
