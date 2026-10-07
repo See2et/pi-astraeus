@@ -16,8 +16,9 @@ or catalog availability are not required. `thinking` is the requested CLI effort
 be explicitly supported by local help (low/medium/high/xhigh/max as available), never
 clamped from an unsupported Pi level. Presence/help checks establish capabilities, not
 account access, model identity or successful inference. Observed model/effort remain
-unknown unless public CLI evidence actually supplies them. No login/config changes,
+unknown unless public CLI evidence actually supplies them. No login/auth changes,
 installation, billing inspection, API/print fallback or permission bypass is performed.
+The only authorized config update is the GPT-owned workspace trust preflight below.
 General implementation, review, adjudication and acceptance stay on native GPT;
 allowlisting Anthropic never permits general worker/reviewer/adjudicator dispatch.
 
@@ -46,8 +47,8 @@ This is not an OS sandbox. CLI permission settings supplement prompt/scheduling 
 and deny nested agents/publication; they cannot guarantee no writes outside the cwd.
 Checks must be simple exact trusted verification commands, supplied in optional
 `checks`; omitted means `[]`. Include generated outputs in ownership. Denied/failed
-checks remain failures, never justification to relax permissions. Existing trusted
-workspace and authenticated CLI are prerequisites, not permissions this package grants.
+checks remain failures, never justification to relax permissions. Existing authenticated
+CLI access remains a prerequisite; workspace trust is separate from tool permissions.
 The bundled designer definition is checked against installed role definitions and its
 contract is supplied in the handoff; native Pi tools/frontmatter are not CLI isolation.
 
@@ -100,11 +101,55 @@ the identical full UUID/cwd. An unexpected emitted copy is verified and stopped 
 with evidence retained; it never replaces the owner binding. A failed/unknown copy stop
 keeps freezing unresolved. Inspect changes/evidence before recovery, never retry blindly.
 
-If stderr reports workspace trust or authentication failure, disclose it and ask the user
-to resolve it interactively for that exact cwd. Never approve trust, alter auth, read
-private sessions or switch inference modes on their behalf. A failed managed launch
-remains an unresolved implementation attempt; this package does not automatically spawn
-a replacement owner or infer success from an empty listing.
+## Workspace trust preflight
+
+Immediately before each initial `--bg` launch and after the exact owner stop before
+resume, GPT runs a bounded preflight. For a cwd and actual Git root both strictly under
+canonical `homedir()/ghq`, it registers only
+`projects[canonicalGitRoot].hasTrustDialogAccepted = true` in writable `~/.claude.json`.
+Nested repositories use their own actual root; symlink/sibling escapes, an external Git
+parent, and ghq/home/filesystem parent trust are never registered. No unrelated clones
+are enumerated. Git environment overrides cannot manufacture the discovered root.
+Outside the boundary, launch retains existing manual workspace-trust behavior.
+
+This is a narrow user-authorized runtime exception to the no-global-config-write rule,
+not permission bypass, authentication management, or a new execution mode. Other
+project fields, tool permissions, auth/session values, even unrelated JSON number tokens
+and formatting are preserved by a minimal textual change, never reset/stringified.
+Existing true is a no-write operation and does not inspect or stop unrelated sessions.
+Malformed JSON, duplicate decoded keys and invalid object/trust shapes are refused,
+without parser snippets or config values in errors/evidence. Only the current process's
+owner-only regular readable/writable file is eligible: symlinks (including Nix-managed
+links), hardlink aliases, public/read-only files and unsafe directories are refused.
+An absent config is exclusively created with mode 0600. `CLAUDE_CONFIG_DIR` is rejected
+for eligible repositories: its override mapping has not been established from installed
+CLI/public documentation, so the default file must not be guessed.
+
+When a mutation is needed, a cooperative exclusive lock, public `agents --json --all`
+listing and native Linux/Darwin `ps` observations require no observed active or unknown
+Claude sessions/processes. Missing capabilities, incomplete process output/visibility
+and lock contention block mutation; never kill unrelated processes or remove another
+writer's lock. Linux additionally checks `/proc` mount visibility with `findmnt`;
+Darwin uses native macOS `ps` without `findmnt` or `/proc`. Unsupported platforms require
+manual trust for an update. Darwin process observation is mock-tested, not runtime-verified.
+Already trusted repositories still need only the regular CLI lifecycle checks.
+CLI observation can itself write config, so changed pre/post-observation snapshots block
+the update rather than merging stale bytes. A second process census and immediate
+metadata/content re-read before atomic publication catch observed noncooperating writes.
+Temporary files are 0600 and cleanup removes only owned artifacts. Trust config bytes
+are never copied to Git, Store, reports or lifecycle receipts.
+
+This is not strict cross-process exclusion: Claude does not participate in this package's
+cooperative lock. A new writer or noncooperating update can race the final comparison
+and rename; the process census is limited to visible processes. No OS sandbox, race-free
+CAS, crash-proof cleanup or durable directory fsync guarantee is claimed. A stale lock
+blocks future updates until the user confirms the writer is gone and removes it manually.
+
+If preflight or stderr reports a remaining workspace trust/authentication failure,
+disclose it and ask the user to resolve it interactively for that exact cwd. Never alter
+auth, read private sessions or switch inference modes. A failed managed launch remains
+unresolved; this package does not automatically spawn a replacement owner or infer
+success from an empty listing.
 
 ## Structured result and acceptance
 

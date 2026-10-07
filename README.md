@@ -36,7 +36,9 @@ copy the four bundled definitions into `$PI_CODING_AGENT_DIR/agents` (default
 Use `PI_ASTRAEUS_PYTHON` only to select a preinstalled Python interpreter.
 Do not overwrite existing customized definitions without inspecting them.
 
-No authentication files or Pi settings are managed by this package. Close existing
+No authentication values or Pi settings are managed by this package. A narrowly
+authorized GPT-owned preflight updates only Claude's canonical `~/ghq` Git-root
+workspace trust flag, preserving every unrelated config/auth/session value. Close existing
 Pi processes before updating packages, apply the host's normal manual rollout gates,
 and start a fresh Pi process. NixOS `test`/`switch` and Darwin activation remain user-only.
 
@@ -114,7 +116,12 @@ linked worktree or OS sandbox is claimed. Collection stops the exact observed wr
 validates its run-bound report/checks and actual baseline delta, and rejects changes
 outside literal ownership. Existing dirty user files cannot be owned on initial dispatch;
 narrow ownership or resolve that conflict manually, never reset/stash user changes.
-See [Claude design delegation](references/claude-design.md) for lifecycle and recovery.
+Before start/resume, GPT registers only the actual canonical Git root under canonical
+`~/ghq` in writable `~/.claude.json`; existing true is a no-write/no-session-inspection
+operation. Outside that boundary workspace trust remains manual. Unsafe config,
+unknown/active sessions or observed concurrent writes block a needed update and launch.
+`CLAUDE_CONFIG_DIR` overrides fail closed because their config mapping is not established.
+See [Claude design delegation](references/claude-design.md) for lifecycle, trust and recovery.
 
 ## Policy and evidence
 

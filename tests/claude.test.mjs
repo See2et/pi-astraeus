@@ -7,20 +7,22 @@ import {execFileSync} from 'node:child_process';
 import {parseFrontmatter} from '@earendil-works/pi-coding-agent';
 import {Workflow, ROOT} from '../extensions/core.mjs';
 import {ClaudeBackground, launchId} from '../extensions/claude.mjs';
+import {ClaudeTrustPreflight} from '../extensions/claude-trust.mjs';
 
 const ID = '12345678-1111-2222-3333-444444444444', COPY = 'abcdef12-1111-2222-3333-444444444444';
 const auth = {design_request:'Use Claude to design and implement this UI', design_scope:'design-direction-and-ui-implementation'};
 const help = '--bg --resume --model --safe-mode --settings --setting-sources --permission-mode --allowedTools --disallowedTools --tools --add-dir --strict-mcp-config --mcp-config\n--effort <value> low medium high xhigh max';
 async function fixture(t) {
   const base = await mkdtemp(join(tmpdir(),'astraeus-cli-')); t.after(()=>rm(base,{recursive:true,force:true}));
-  const cwd = join(base,'repo'), agentDir = join(base,'agent');
-  await mkdir(cwd); await mkdir(agentDir); await cp(join(ROOT,'agents'),join(agentDir,'agents'),{recursive:true});
+  const home = join(base,'home'), cwd = join(home,'ghq','repo'), agentDir = join(base,'agent'), config = join(home,'.claude.json');
+  await mkdir(cwd,{recursive:true}); await mkdir(agentDir); await cp(join(ROOT,'agents'),join(agentDir,'agents'),{recursive:true});
   execFileSync('git',['init','-q'],{cwd});
   await writeFile(join(cwd,'ui.txt'),'initial'); await writeFile(join(cwd,'user.txt'),'user initial'); await writeFile(join(cwd,'.gitignore'),'build/\n');
   execFileSync('git',['add','.'],{cwd}); execFileSync('git',['-c','user.name=Test','-c','user.email=test@example.invalid','commit','-qm','fixture'],{cwd});
   await writeFile(join(cwd,'user.txt'),'existing user changes');
-  const entries = [], calls = [], state = {records:[],launchOutput:null,failLaunch:false,failStop:false,copy:false};
-  const cli = new ClaudeBackground({invoke:async (command,args,dir)=>{
+  const entries = [], calls = [], state = {records:[],launchOutput:null,failLaunch:false,failStop:false,copy:false,afterStop:null,manual:false};
+  const trust = new ClaudeTrustPreflight({home,env:process.env.CLAUDE_CONFIG_DIR === undefined ? process.env : {...process.env,CLAUDE_CONFIG_DIR:undefined},processes:async()=>{}});
+  const cli = new ClaudeBackground({trust,invoke:async (command,args,dir)=>{
     assert.equal(command,'claude'); assert.equal(dir,cwd); calls.push([...args]);
     const ok = stdout=>({returncode:0,stdout,stderr:''});
     if (args[0] === '--help') return ok(help);
@@ -31,9 +33,11 @@ async function fixture(t) {
       if (state.failStop) return {returncode:1,stdout:'',stderr:'fixture stop denied'};
       const record = state.records.find(r=>r.id === args[1]);
       assert.ok(record); record.state = 'done'; delete record.status; delete record.pid;
+      if (state.afterStop) await state.afterStop();
       return ok(`stopped ${args[1]}\n`);
     }
     assert.equal(args[0],'--bg');
+    if (!state.manual) assert.equal(JSON.parse(await readFile(config,'utf8')).projects[cwd].hasTrustDialogAccepted,true,'GPT preflight must publish exact trust before every mock background launch');
     if (state.failLaunch) return {returncode:1,stdout:'',stderr:'Workspace not trusted'};
     const resume = args[1] === '--resume';
     if (resume) {
@@ -60,7 +64,7 @@ async function fixture(t) {
     await writeFile(job.cli.pending,JSON.stringify(data));
   };
   const idle = ()=>{ const record=state.records.find(r=>r.sessionId===ID); record.state='done'; record.status='idle'; }; // PID is deliberately still live.
-  return {cwd,agentDir,workflow,ctx,act,delegate,report,idle,state,calls,host,cli};
+  return {cwd,home,config,trust,agentDir,workflow,ctx,act,delegate,report,idle,state,calls,host,cli};
 }
 
 test('documented unique launch short ID only; unknown/ambiguous output fails closed',()=>{
@@ -97,6 +101,40 @@ test('public CLI lifecycle binds observed UUID, preserves user baseline, freezes
   await writeFile(join(f.cwd,'ui.txt'),'fixed'); await f.report(follow);
   const fixed=await restored.execute({op:'collect',task_id:'design',run_id:follow.run_id},f.ctx); assert.equal(fixed.valid,true,fixed.error);
   await assert.rejects(restored.execute({op:'resume',task_id:'design',run_id:job.run_id,prompt:'Stale run'},f.ctx),/latest run/);
+});
+test('outside canonical ghq retains manual-trust launch and never reads/modifies config',async t=>{
+  const f=await fixture(t); f.trust.home=f.agentDir; f.state.manual=true;
+  const bytes='not-json:FAKE'; await writeFile(f.config,bytes,{mode:0o600});
+  const job=await f.delegate(); assert.equal(job.cli.session_id,ID); assert.equal(await readFile(f.config,'utf8'),bytes);
+  assert.equal(f.calls.filter(a=>a[0]==='--bg').length,1);
+});
+test('start preflight blocks active/unknown sessions without config overwrite, launch or unrelated stop',async t=>{
+  const f=await fixture(t); const bytes='{"authFixture":"FAKE"}'; await writeFile(f.config,bytes,{mode:0o600});
+  f.state.records=[{id:'abcdef12',sessionId:COPY,cwd:f.cwd,state:'working',status:'running',pid:321}];
+  await assert.rejects(f.delegate(),/active or unknown/);
+  assert.equal(await readFile(f.config,'utf8'),bytes);
+  assert.equal(f.calls.filter(a=>a[0]==='--bg'||a[0]==='stop'&&a[1]!=='--help').length,0);
+});
+test('resume takes fresh trust snapshot after stop saves config, preserving saved flags and UUID',async t=>{
+  const f=await fixture(t),job=await f.delegate(); await f.report(job,{changed_files:[]}); f.idle();
+  assert.equal((await f.act({op:'collect',run_id:job.run_id})).valid,true);
+  f.state.afterStop=async()=>writeFile(f.config,JSON.stringify({authFixture:{fresh:'FAKE'},projects:{[f.cwd]:{hasTrustDialogAccepted:false,allowedTools:['Read']}}}),{mode:0o600});
+  const follow=await f.act({op:'resume',run_id:job.run_id,prompt:'Bounded fix'});
+  assert.equal(follow.cli.session_id,ID);
+  assert.deepEqual(JSON.parse(await readFile(f.config,'utf8')),{authFixture:{fresh:'FAKE'},projects:{[f.cwd]:{hasTrustDialogAccepted:true,allowedTools:['Read']}}});
+  const launch=f.calls.findIndex(a=>a[0]==='--bg');
+  assert.ok(f.calls.slice(0,launch).some(a=>a[0]==='agents'&&a[1]==='--json'));
+  const resumeArgs=f.calls.filter(a=>a[0]==='--bg').at(-1);
+  assert.equal(resumeArgs.length,5); assert.deepEqual(resumeArgs.slice(0,4),['--bg','--resume',ID,'--']);
+});
+test('resume preflight failure leaves exact owner stopped and never launches or changes unsafe config',async t=>{
+  const f=await fixture(t),job=await f.delegate(); await f.report(job,{changed_files:[]}); f.idle();
+  assert.equal((await f.act({op:'collect',run_id:job.run_id})).valid,true);
+  const bytes='{"authFixture":"FAKE",'; f.state.afterStop=async()=>writeFile(f.config,bytes);
+  const count=f.calls.filter(a=>a[0]==='--bg').length;
+  await assert.rejects(f.act({op:'resume',run_id:job.run_id,prompt:'Bounded fix'}),/invalid JSON/);
+  assert.equal(f.calls.filter(a=>a[0]==='--bg').length,count); assert.equal(await readFile(f.config,'utf8'),bytes);
+  assert.equal(f.state.records.find(r=>r.sessionId===ID).state,'done');
 });
 test('launch failure retains stdout stderr exit and never blindly retries or falls back',async t=>{
   const f=await fixture(t); f.state.failLaunch=true;

@@ -3,6 +3,7 @@ import { spawn } from 'node:child_process';
 import { randomUUID, createHash } from 'node:crypto';
 import { readFile, writeFile, lstat, readlink, realpath, link, unlink } from 'node:fs/promises';
 import { join, resolve, relative, isAbsolute } from 'node:path';
+import { ClaudeTrustPreflight } from './claude-trust.mjs';
 
 export const CLAUDE_TRANSPORT = 'claude-code-bg-v1';
 export const CLI_EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'];
@@ -25,7 +26,8 @@ export function capture(command, args, cwd) {
   });
 }
 export class ClaudeBackground {
-  constructor({command = 'claude', invoke = capture} = {}) { this.command = command; this.invoke = invoke; }
+  constructor({command = 'claude', invoke = capture, trust = new ClaudeTrustPreflight()} = {}) { this.command = command; this.invoke = invoke; this.trust = trust; }
+  async preflight(cwd) { return this.trust.run(cwd, () => this.records(cwd)); }
   async call(args, cwd) { return this.invoke(this.command, args, cwd); }
   async checked(args, cwd) {
     const result = await this.call(args, cwd);
@@ -109,6 +111,7 @@ export class ClaudeBackground {
     // No broad Edit/Write allow on the control directory: only this pending report.
     const settings = {permissions:{defaultMode:'dontAsk', allow:allows, deny:denies}};
     const args = ['--bg','--safe-mode','--model','claude-opus-5-5','--effort',job.requested.effort,'--permission-mode','dontAsk','--setting-sources','','--settings',JSON.stringify(settings),'--tools','Read,Edit,Write,Glob,Grep,Bash','--allowedTools',...allows,'--disallowedTools',...denies,'--add-dir',job.cli.directory,'--strict-mcp-config','--mcp-config','{"mcpServers":{}}','--',prompt];
+    await this.preflight(cwd);
     const result = await this.evidence(job, 'launch', args, cwd);
     if (result.returncode !== 0) throw new Error('Claude background launch failed; inspect retained stdout/stderr/exit, no blind retry.');
     const short = launchId(result.stdout);
@@ -119,6 +122,7 @@ export class ClaudeBackground {
   async resume(job, cwd, prompt) {
     // Live idle/done sessions also copy on --resume in 2.1.288: stop first.
     await this.stop(job, cwd);
+    await this.preflight(cwd);
     const result = await this.evidence(job, 'resume', ['--bg','--resume',job.cli.session_id,'--',prompt], cwd);
     job.cli.frozen = false;
     if (result.returncode !== 0) throw new Error('Claude resume failed; retained evidence, no retry.');

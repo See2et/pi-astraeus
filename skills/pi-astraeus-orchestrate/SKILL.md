@@ -63,7 +63,10 @@ before dispatch: record the original quote and scope once, use exact
 owner in the same task. General implementation, review, adjudication and acceptance
 stay on native GPT. This exception uses installed Claude Code `--bg`, CLI model
 `claude-opus-5-5` and validated CLI effort, not Pi Anthropic credentials/catalog.
-No auth changes, permission bypass or API/print fallback. Collect freezes the exact
+No auth changes, permission bypass or API/print fallback. GPT's narrowly authorized
+runtime preflight sets only canonical `~/ghq` Git-root workspace trust before start/resume,
+preserving all other config/auth/session values; outside that boundary trust stays manual.
+Collect freezes the exact
 observed UUID and validates a run-specific report, required checks and owned baseline
 delta. Resume the stopped original owner without configuration overrides; reject copies.
 

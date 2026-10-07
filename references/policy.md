@@ -15,6 +15,11 @@ Allowed model IDs are restrictions, not proof of availability.
 semantics (`*` can cross `/`); these add review requirements, never remove risk-based ones.
 Load the Pi skills and extension through the authorized Pi package configuration.
 Do not edit global configuration or install anything during ordinary project work.
+The narrowly user-authorized runtime exception is the GPT-owned preflight setting
+only `projects[canonicalGitRoot].hasTrustDialogAccepted` before Claude designer
+start/resume for actual repositories under canonical `~/ghq`. Preserve unrelated
+config/auth/session values; this does not authorize auth or tool-permission changes.
+See [the trust boundary](claude-design.md#workspace-trust-preflight).
 
 Only a complete `changes_required` review triggers one separate fresh adjudicator
 before fixes or acceptance of the rejected target. A complete `pass` goes directly to
