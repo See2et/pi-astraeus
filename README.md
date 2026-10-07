@@ -123,6 +123,22 @@ unknown/active sessions or observed concurrent writes block a needed update and 
 `CLAUDE_CONFIG_DIR` overrides fail closed because their config mapping is not established.
 See [Claude design delegation](references/claude-design.md) for lifecycle, trust and recovery.
 
+Session-scoped monitoring observes only each Claude owner's latest uncollected run.
+Transitions send bounded `followUp` messages with `triggerTurn: true`, including when
+root is idle. `work-ended` means public done/idle evidence, ready to attempt collect,
+not implementation success. `blocked`, external `stopped`, and `unknown` require
+attention and never imply success. Repeated observations do not wake root again;
+a resumed run has a new notification identity. Observation remains separate from
+`cli.frozen` (explicit exact stop acknowledgment) and `valid` (strict report checks).
+Monitoring never stops, collects, or accepts work automatically.
+
+One owner is polled per tick, without overlapping workflow operations; failed
+observations back off from 3 seconds to at most 30 seconds. Public CLI queries have
+a 5-second timeout and 256-KiB combined output limit. Cancellation kills only the
+query child, never the background owner. Tree navigation, session replacement,
+reload and shutdown dispose monitoring; retired observations cannot mutate or
+notify the replacement session. Unhandled restored transitions remain noticeable.
+
 ## Policy and evidence
 
 Only the current Git root's `astraeus.toml` is read. Keys preserve Astraeus's format:

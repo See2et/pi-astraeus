@@ -19,14 +19,14 @@ const result = {
   checked_scope:strings, evidence:strings, suggestions:strings,
 };
 const cli = {
-  frozen:scalar, copy_frozen:scalar, short_id:scalar, session_id:scalar,
+  frozen:scalar, copy_frozen:scalar, short_id:scalar, session_id:scalar, notified_status:scalar,
   directory:scalar, pending:scalar, report_directory:scalar, dispatch_target:scalar,
   observed, unexpected_copy:observed, evidence:[evidence], checks:strings,
 };
 const job = {
-  run_id:scalar, agent_id:scalar, role:scalar, transport:scalar, status:scalar, valid:scalar, collected:scalar,
+  task_id:scalar, run_id:scalar, agent_id:scalar, role:scalar, transport:scalar, status:scalar, valid:scalar, collected:scalar,
   target_id:scalar, review_run:scalar, artifact:scalar, result_hash:scalar, receipt_path:scalar, receipt_hash:scalar,
-  requested:settings, error:scalar, note:scalar, cli, result, summary:scalar, owned_paths:strings,
+  requested:settings, diagnostic:scalar, error:scalar, note:scalar, cli, result, summary:scalar, owned_paths:strings,
 };
 const task = {
   task_id:scalar, cwd:scalar, phase:scalar, accepted:scalar, consequential:scalar, target_id:scalar, accepted_target:scalar,

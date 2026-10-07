@@ -24,6 +24,8 @@ const parameters = Type.Object({
 export default function (pi: ExtensionAPI) {
   const workflow = new Workflow({
     events:pi.events, appendEntry:(type:string, data:unknown) => pi.appendEntry(type, data),
+    notify:(notice:unknown) => pi.sendMessage({customType:'pi-astraeus:claude-lifecycle', display:true,
+      content:JSON.stringify(modelView(notice)), details:modelView(notice)}, {deliverAs:'followUp', triggerTurn:true}),
     agentDir:getAgentDir, parseFrontmatter,
     supportedThinking:getSupportedThinkingLevels,
     manager:() => (globalThis as any)[Symbol.for('pi-subagents:manager')],
@@ -35,6 +37,7 @@ export default function (pi: ExtensionAPI) {
     description:`Manage evidence-bound Astraeus work. Trivial work stays solo. For consequential work, start with requirements/acceptance/constraints, delegate only useful bounded work with exact model+thinking, collect results, use fresh reviewer then fresh adjudicator only after complete changes_required, resume the original implementation owner for adopted fixes, and accept after evidence and current-target checks. For explicit Claude design only, record original design_request and design_scope at start/authorize_design, then use designer with matching scope and exact anthropic/claude-opus-5-5 (logical pin), installed Claude Code --bg with supported CLI effort and optional checks. GPT routes stay native; no CLI/API fallback. Designer collect stops the exact bound writer and validates a run-specific structured report and owned baseline delta. These are caller attestations, not authenticated user consent. Status does not infer success. Role policies: ${join(ROOT, 'skills')}.`,
     parameters,
     async execute(toolCallId, params, signal, _onUpdate, ctx) {
+      workflow.ensureMonitoring(ctx);
       if (params.op === 'resume' && params.run_id && params.task_id) {
         const task = (workflow.tasks as any)[params.task_id] as any;
         const job = task?.jobs.find((j:any) => j.run_id === params.run_id);
@@ -51,6 +54,7 @@ export default function (pi: ExtensionAPI) {
   pi.registerCommand('astraeus', {
     description:'Astraeus status and capability diagnostics (no inference)',
     async handler(args, ctx) {
+      workflow.ensureMonitoring(ctx);
       try {
         const policy = await workflow.policy(ctx);
         const tasks = await workflow.execute({op:'status', task_id:args.trim() || undefined}, ctx);
@@ -62,7 +66,9 @@ export default function (pi: ExtensionAPI) {
   });
   pi.on('session_start', (_event, ctx) => workflow.restore(ctx));
   pi.on('session_tree', (_event, ctx) => workflow.restore(ctx));
+  pi.on('session_shutdown', () => workflow.dispose());
   pi.on('before_agent_start', async (_event, ctx) => {
+    workflow.ensureMonitoring(ctx);
     const state = await workflow.execute({op:'status'}, ctx);
     return { message: {
       customType:'pi-astraeus:guidance', display:false,
@@ -78,6 +84,7 @@ export default function (pi: ExtensionAPI) {
     event.preparation.turnPrefixMessages = sanitizeContext(event.preparation.turnPrefixMessages, current);
   });
   pi.on('session_before_tree', event => {
+    workflow.dispose();
     // Pi 1.0.4 retains this request-local array for generateBranchSummary;
     // replace its elements with sanitized copies, never persisted entry objects.
     const entries = event.preparation.entriesToSummarize;

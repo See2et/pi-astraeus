@@ -15,23 +15,53 @@ export function launchId(stdout) {
   if (ids.length !== 1) throw new Error('Unknown or ambiguous Claude background launch output; retain evidence, do not relaunch.');
   return ids[0];
 }
-export function capture(command, args, cwd) {
+// Public lifecycle evidence is not a freeze acknowledgment or a valid report.
+export function observedStatus(record) {
+  const {state, status} = record ?? {};
+  if (state === 'stopped' && [null, undefined, 'idle'].includes(status)) return 'stopped';
+  if (state === 'blocked' && [null, undefined, 'idle', 'blocked', 'waiting', 'input-wait'].includes(status)) return 'blocked';
+  if (['done', 'idle'].includes(state) && [null, undefined, 'idle'].includes(status)) return 'work-ended';
+  if (state === 'working' && ['running', 'busy', 'working'].includes(status)) return 'running';
+  return 'unknown';
+}
+export function capture(command, args, cwd, {signal, timeout, maxBytes = Infinity} = {}) {
   return new Promise(resolveResult => {
     const child = spawn(command, args, {cwd, stdio:['ignore','pipe','pipe']});
-    let stdout = '', stderr = '', settled = false;
-    child.stdout.on('data', c => stdout += c); child.stderr.on('data', c => stderr += c);
-    const finish = result => { if (!settled) { settled = true; resolveResult({...result, stdout, stderr}); } };
-    child.on('error', error => { stderr += String(error); finish({returncode:null}); });
+    let stdout = '', stderr = '', settled = false, size = 0;
+    let timer;
+    const finish = result => {
+      if (settled) return;
+      settled = true; clearTimeout(timer); signal?.removeEventListener('abort', abort);
+      resolveResult({...result, stdout, stderr});
+    };
+    // Kill only this CLI query child, never the bound background owner/PID.
+    const cancel = reason => { child.kill('SIGKILL'); finish({returncode:null, diagnostic:reason}); };
+    const abort = () => cancel('Claude CLI observation cancelled');
+    const chunk = (key, bytes) => {
+      if (settled) return;
+      const remaining = Math.max(0, maxBytes - size); size += bytes.length;
+      const text = bytes.subarray(0, remaining).toString();
+      if (key === 'stdout') stdout += text; else stderr += text;
+      if (size > maxBytes) cancel('Claude CLI output limit exceeded');
+    };
+    child.stdout.on('data', c => chunk('stdout', c)); child.stderr.on('data', c => chunk('stderr', c));
+    child.on('error', error => { if (!settled) stderr += String(error).slice(0, 1024); finish({returncode:null}); });
     child.on('close', (returncode, signal) => finish({returncode, signal}));
+    if (timeout !== undefined) timer = setTimeout(() => cancel('Claude CLI observation timed out'), timeout);
+    signal?.addEventListener('abort', abort, {once:true});
+    if (signal?.aborted) abort();
   });
 }
 export class ClaudeBackground {
-  constructor({command = 'claude', invoke = capture, trust = new ClaudeTrustPreflight()} = {}) { this.command = command; this.invoke = invoke; this.trust = trust; }
+  constructor({command = 'claude', invoke = capture, trust = new ClaudeTrustPreflight(), observationTimeout = 5000, observationMaxBytes = 256 * 1024} = {}) {
+    this.command = command; this.invoke = invoke; this.trust = trust;
+    this.observationTimeout = observationTimeout; this.observationMaxBytes = observationMaxBytes;
+  }
   async preflight(cwd) { return this.trust.run(cwd, () => this.records(cwd)); }
   async call(args, cwd) { return this.invoke(this.command, args, cwd); }
-  async checked(args, cwd) {
-    const result = await this.call(args, cwd);
-    if (result.returncode !== 0) throw new Error(`Claude CLI ${args.slice(0,2).join(' ')} failed: ${result.stderr}`);
+  async checked(args, cwd, options) {
+    const result = await this.query(args, cwd, options?.signal);
+    if (result.returncode !== 0) throw new Error(`Claude CLI ${args.slice(0,2).join(' ')} failed: ${result.diagnostic || result.stderr}`);
     return result.stdout;
   }
   async capabilities(cwd, effort) {
@@ -44,13 +74,32 @@ export class ClaudeBackground {
     const agents = await this.checked(['agents','--help'], cwd);
     if (!agents.includes('--json') || !agents.includes('--all') || !(await this.checked(['stop','--help'], cwd)).includes('stop <id>')) throw new Error('Installed Claude CLI lacks exact lifecycle capabilities.');
   }
-  async records(cwd) {
-    const records = JSON.parse(await this.checked(['agents','--json','--all'], cwd));
+  async query(args, cwd, signal) {
+    // Also bound injected transports that ignore cancellation. Late replies cannot
+    // escape this promise or mutate a job; observe's caller stages its own copy.
+    const controller = new AbortController();
+    let timer, off;
+    try {
+      return await new Promise((resolveResult, reject) => {
+        const fail = reason => { reject(new Error(reason)); controller.abort(); };
+        off = () => fail('Claude observation cancelled');
+        timer = setTimeout(() => fail('Claude observation timed out'), this.observationTimeout);
+        signal?.addEventListener('abort', off, {once:true});
+        if (signal?.aborted) { off(); return; }
+        Promise.resolve().then(() => this.invoke(this.command, args, cwd, {signal:controller.signal, timeout:this.observationTimeout, maxBytes:this.observationMaxBytes})).then(result => {
+          if (Buffer.byteLength(result.stdout || '') + Buffer.byteLength(result.stderr || '') > this.observationMaxBytes) fail('Claude observation output limit exceeded');
+          else resolveResult(result);
+        }, reject);
+      });
+    } finally { clearTimeout(timer); signal?.removeEventListener('abort', off); }
+  }
+  async records(cwd, signal) {
+    const records = JSON.parse(await this.checked(['agents','--json','--all'], cwd, {signal}));
     if (!Array.isArray(records)) throw new Error('Unknown Claude agents JSON format.');
     return records;
   }
-  async match(short, cwd, full) {
-    const found = (await this.records(cwd)).filter(r => r && r.id === short);
+  async match(short, cwd, full, signal) {
+    const found = (await this.records(cwd, signal)).filter(r => r && r.id === short);
     if (found.length !== 1) throw new Error('Bound Claude session missing or ambiguous; unknown is not done.');
     const record = found[0], id = record.sessionId ?? record.session_id;
     if (!uuid(id) || !id.startsWith(short + '-') || (full && full !== id) || typeof record.cwd !== 'string' || await realpath(record.cwd) !== await realpath(cwd)) throw new Error('Claude full UUID/cwd binding mismatch.');
@@ -69,13 +118,13 @@ export class ClaudeBackground {
       if ((await lstat(item.path)).isSymbolicLink() || digest(await readFile(item.path)) !== item.sha256) throw new Error('Claude lifecycle evidence changed.');
     }
   }
-  async observe(job, cwd) {
+  async observe(job, cwd, signal) {
     await this.audit(job);
     if (!job.cli.session_id || !job.cli.short_id) throw new Error('Claude launch has no observed UUID binding; inspect retained launch evidence.');
-    const observed = await this.match(job.cli.short_id, cwd, job.cli.session_id);
+    const observed = await this.match(job.cli.short_id, cwd, job.cli.session_id, signal);
     job.cli.observed = observed;
     if (job.cli.unexpected_copy) {
-      const copy = await this.match(job.cli.unexpected_copy.id,cwd,job.cli.unexpected_copy.session_id);
+      const copy = await this.match(job.cli.unexpected_copy.id,cwd,job.cli.unexpected_copy.session_id, signal);
       job.cli.copy_frozen = job.cli.copy_frozen && ['done','stopped'].includes(copy.state) && copy.pid === null && [null,'idle'].includes(copy.status);
       if (!job.cli.copy_frozen) throw new Error('Unexpected Claude copy is not affirmatively frozen.');
     }
@@ -92,7 +141,7 @@ export class ClaudeBackground {
     if (result.returncode !== 0 || result.stdout.trim() !== `stopped ${observed.id}`) throw new Error('Exact Claude stop not acknowledged; retained stop evidence.');
     const stopped = await this.match(observed.id, cwd, observed.session_id);
     if (!['done','stopped'].includes(stopped.state) || stopped.pid !== null || ![null,'idle'].includes(stopped.status)) throw new Error('Claude stop acknowledged but lifecycle is not frozen.');
-    job.cli.frozen = true; job.cli.observed = stopped; job.status = 'stopped';
+    job.cli.frozen = true; job.cli.observed = stopped; job.status = observedStatus(stopped);
     return stopped;
   }
   async start(job, cwd, prompt, checks) {
@@ -117,7 +166,7 @@ export class ClaudeBackground {
     const short = launchId(result.stdout);
     job.cli.short_id = short;
     const observed = await this.match(short, cwd);
-    job.cli.session_id = observed.session_id; job.cli.observed = observed; job.agent_id = `claude:${observed.session_id}`; job.status = 'running';
+    job.cli.session_id = observed.session_id; job.cli.observed = observed; job.agent_id = `claude:${observed.session_id}`; job.status = observedStatus(observed);
   }
   async resume(job, cwd, prompt) {
     // Live idle/done sessions also copy on --resume in 2.1.288: stop first.
@@ -138,7 +187,7 @@ export class ClaudeBackground {
       job.cli.copy_frozen = ['done','stopped'].includes(frozen.state) && frozen.pid === null && [null,'idle'].includes(frozen.status);
       throw new Error('Claude resume copied the owner; exact unexpected copy stopped, inspect changes before recovery.');
     }
-    job.cli.observed = resumed; job.status = 'running';
+    job.cli.observed = resumed; job.status = observedStatus(resumed);
   }
 }
 

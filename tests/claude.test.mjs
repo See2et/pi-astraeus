@@ -49,7 +49,7 @@ async function fixture(t) {
       assert.ok(!args.some(a=>a.includes('dangerously-skip-permissions')));
     }
     const id = resume && state.copy ? COPY : ID;
-    const record = {id:id.slice(0,8),sessionId:id,cwd,state:'working',status:'running',pid:123};
+    const record = {id:id.slice(0,8),sessionId:id,cwd,state:'working',status:'running',pid:123,...state.initialLifecycle};
     state.records = state.records.filter(r=>r.id !== record.id); state.records.push(record);
     return ok(state.launchOutput ?? `backgrounded · ${record.id} · Claude\n`);
   }});
@@ -83,7 +83,7 @@ test('public CLI lifecycle binds observed UUID, preserves user baseline, freezes
   assert.equal(await readFile(join(f.cwd,'user.txt'),'utf8'),'existing user changes');
   const restored=new Workflow(f.host,{claude:f.cli}); restored.restore(f.ctx);
   assert.equal(restored.tasks.design.jobs[0].transport,'claude-code-bg-v1');
-  assert.equal((await restored.execute({op:'status',task_id:'design'},f.ctx))[0].jobs[0].status,'stopped');
+  assert.equal((await restored.execute({op:'status',task_id:'design'},f.ctx))[0].jobs[0].status,'work-ended');
   const follow=await restored.execute({op:'resume',task_id:'design',run_id:job.run_id,prompt:'Fix bounded UI overflow'},f.ctx);
   assert.equal(follow.agent_id,job.agent_id); assert.notEqual(follow.cli.pending,job.cli.pending);
   assert.equal(follow.cli.report_directory,job.cli.report_directory);
@@ -101,6 +101,25 @@ test('public CLI lifecycle binds observed UUID, preserves user baseline, freezes
   await writeFile(join(f.cwd,'ui.txt'),'fixed'); await f.report(follow);
   const fixed=await restored.execute({op:'collect',task_id:'design',run_id:follow.run_id},f.ctx); assert.equal(fixed.valid,true,fixed.error);
   await assert.rejects(restored.execute({op:'resume',task_id:'design',run_id:job.run_id,prompt:'Stale run'},f.ctx),/latest run/);
+});
+test('initial terminal launch and real same-owner resume notify separately without auto-freezing or collection',async t=>{
+  for (const state of ['done','blocked','stopped','mystery']) {
+    const f=await fixture(t), notices=[];
+    f.host.notify=n=>notices.push(n); f.workflow.startMonitoring(f.ctx); t.after(()=>f.workflow.dispose());
+    f.state.initialLifecycle={state,status:'idle'};
+    const job=await f.delegate();
+    assert.equal(notices.length,1); assert.equal(notices[0].status,state==='done'?'work-ended':state==='mystery'?'unknown':state);
+    assert.equal(job.cli.frozen,false); assert.equal(job.valid,false); assert.equal(job.collected,false);
+    assert.equal(f.calls.filter(a=>a[0]==='stop'&&a[1]!=='--help').length,0);
+    if(state!=='done') continue;
+    await f.report(job,{changed_files:[]}); await f.act({op:'collect',run_id:job.run_id});
+    f.state.initialLifecycle={state:'working',status:'running'};
+    const follow=await f.act({op:'resume',run_id:job.run_id,prompt:'Bounded fixture follow-up'});
+    assert.equal(follow.agent_id,job.agent_id); f.idle();
+    await f.act({op:'status'}); await f.act({op:'status'});
+    assert.equal(notices.length,2); assert.equal(notices[1].run_id,follow.run_id); assert.equal(notices[1].status,'work-ended');
+    assert.equal(job.cli.frozen,true); assert.equal(job.valid,true,'old frozen run must not poison latest resumed writer');
+  }
 });
 test('outside canonical ghq retains manual-trust launch and never reads/modifies config',async t=>{
   const f=await fixture(t); f.trust.home=f.agentDir; f.state.manual=true;
@@ -151,7 +170,7 @@ test('unknown/missing/changed-cwd session cannot collect, accept, or be declared
   f.state.records[0].cwd=f.agentDir;
   assert.match((await f.act({op:'collect',run_id:job.run_id})).error,/binding mismatch/);
   f.state.records=[];
-  const status=await f.act({op:'status'}); assert.equal(status[0].jobs[0].status,'unavailable');
+  const status=await f.act({op:'status'}); assert.equal(status[0].jobs[0].status,'unknown');
   await assert.rejects(f.act({op:'accept'}),/missing/);
   assert.equal(f.workflow.activeJobs(f.cwd).length,1);
 });

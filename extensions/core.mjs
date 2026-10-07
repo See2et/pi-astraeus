@@ -5,7 +5,7 @@ import { dirname, join, resolve, posix } from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
-import { ClaudeBackground, CLAUDE_TRANSPORT, CLI_EFFORTS, validatePaths, validateChecks, snapshot, delta, publish } from './claude.mjs';
+import { ClaudeBackground, observedStatus, CLAUDE_TRANSPORT, CLI_EFFORTS, validatePaths, validateChecks, snapshot, delta, publish } from './claude.mjs';
 export const isCli = job => job.transport === CLAUDE_TRANSPORT;
 export const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 export const ENTRY = 'pi-astraeus:state-v1';
@@ -78,8 +78,101 @@ export function run(command, args, cwd, signal) {
   });
 }
 export class Workflow {
-  constructor(host, { root = ROOT, python = process.env.PI_ASTRAEUS_PYTHON || 'python3', claude = new ClaudeBackground() } = {}) {
+  constructor(host, { root = ROOT, python = process.env.PI_ASTRAEUS_PYTHON || 'python3', claude = new ClaudeBackground(), pollInterval = 3000, maxBackoff = 30000 } = {}) {
     this.host = host; this.root = root; this.python = python; this.claude = claude; this.tasks = {}; this.queue = Promise.resolve();
+    this.pollInterval = pollInterval; this.maxBackoff = maxBackoff; this.session = null;
+  }
+  dispose() {
+    const session = this.session;
+    if (!session) return;
+    this.session = null; clearTimeout(session.timer); session.controller.abort();
+  }
+  current(session) {
+    if (session !== this.session || session?.controller.signal.aborted) return false;
+    // Pi context accessors throw when their owning runtime/session is retired.
+    try { return session.ctx.sessionManager.getSessionId() === session.id; } catch { return false; }
+  }
+  ensureMonitoring(ctx) {
+    if (!this.session || !this.current(this.session)) this.startMonitoring(ctx);
+  }
+  startMonitoring(ctx) {
+    this.dispose();
+    const session = {ctx, id:ctx.sessionManager.getSessionId(), controller:new AbortController(), timer:null, cursor:0, failures:0};
+    this.session = session; this.schedule(session, 0);
+  }
+  latestCli(tasks = Object.values(this.tasks)) {
+    return [...new Map(tasks.flatMap(task => task.jobs.filter(isCli).map(job => [job.agent_id || job.run_id, {task, job}]))).values()];
+  }
+  lifecycleSignature(job) {
+    return JSON.stringify({status:job.status, valid:job.valid, error:job.error, frozen:job.cli.frozen,
+      copy_frozen:job.cli.copy_frozen, observed:job.cli.observed, notified_status:job.cli.notified_status});
+  }
+  schedule(session, delay = this.pollInterval) {
+    if (!this.current(session) || !this.host.notify) return;
+    clearTimeout(session.timer);
+    session.timer = setTimeout(() => {
+      if (!this.current(session)) return;
+      const next = this.queue.then(async () => {
+        if (!this.current(session)) return;
+        const owners = this.latestCli().filter(({job}) => !job.collected);
+        if (!owners.length) return;
+        const {task, job} = owners[session.cursor++ % owners.length];
+        // One owner per tick bounds occupation of the operation queue.
+        const before = this.lifecycleSignature(job);
+        const ok = await this.refreshCli(task, job, session.ctx, session);
+        if (!this.current(session)) return;
+        session.failures = ok ? 0 : Math.min(session.failures + 1, 5);
+        // Stable polls must not append full baselines to the session every tick.
+        if (before !== this.lifecycleSignature(job)) this.save(session.ctx);
+      });
+      this.queue = next.catch(() => {});
+      next.catch(() => {}).finally(() => this.schedule(session, Math.min(this.maxBackoff, this.pollInterval * 2 ** session.failures)));
+    }, delay);
+    session.timer.unref?.();
+  }
+  notice(task, job, ctx, session) {
+    if (!session || !this.current(session) || !this.host.notify || job.cli.notified_status === job.status) return;
+    // Running clears the transition baseline but does not wake an idle parent.
+    if (['work-ended', 'blocked', 'stopped', 'unknown'].includes(job.status)) {
+      const meaning = job.status === 'work-ended' ? 'Observed work ended; ready to attempt collect, NOT implementation success.' : 'Needs attention; NOT successful completion.';
+      this.host.notify({task_id:task.task_id, run_id:job.run_id, status:job.status,
+        diagnostic:meaning, error:job.error?.slice(0, 1024)}, ctx);
+    }
+    job.cli.notified_status = job.status; return true;
+  }
+  assertOperationActive() {
+    if (this.operationSession && !this.current(this.operationSession)) throw new Error('Operation belongs to retired session.');
+  }
+  async cliOperation(method, job, ...args) {
+    const session = this.operationSession;
+    this.assertOperationActive();
+    const staged = structuredClone(job);
+    let result, error;
+    try { result = await this.claude[method](staged, ...args, ...(method === 'observe' ? [session?.controller.signal] : [])); }
+    catch (caught) { error = caught; }
+    this.assertOperationActive();
+    Object.assign(job, staged);
+    if (method === 'observe') {
+      job.status = error ? 'unknown' : observedStatus(job.cli.observed);
+      if (error) { job.cli.frozen = false; job.valid = false; job.error = String(error).slice(0, 1024); }
+    }
+    if (error) throw error;
+    return result;
+  }
+  async refreshCli(task, job, ctx, session = this.session) {
+    const staged = structuredClone(job);
+    let error;
+    try { await this.claude.observe(staged, task.cwd, session?.controller.signal); }
+    catch (caught) { error = caught; }
+    // Never mutate a retired job reference, including from an ignored abort.
+    if (session && !this.current(session)) return false;
+    job.cli = staged.cli;
+    if (error) {
+      job.status = 'unknown'; job.cli.frozen = false; job.valid = false; job.error = String(error).slice(0, 1024);
+    } else {
+      job.status = observedStatus(job.cli.observed); delete job.error;
+    }
+    this.notice(task, job, ctx, session); return !error;
   }
   bridge(args, ctx) { return run(this.python, [join(this.root, 'scripts/astraeus.py'), ...args], ctx.cwd); }
   async policy(ctx) { return JSON.parse(await this.bridge(['policy', '--repo', ctx.cwd], ctx)); }
@@ -88,6 +181,7 @@ export class Workflow {
   }
   manager() { return this.host.manager(); }
   restore(ctx) {
+    this.dispose();
     this.tasks = {};
     for (const entry of ctx.sessionManager.getBranch()) {
       if (entry.type === 'custom' && entry.customType === ENTRY && entry.data?.version === 1) this.tasks = structuredClone(entry.data.tasks);
@@ -96,8 +190,10 @@ export class Workflow {
       for (const job of task.jobs) if (!isCli(job) && ACTIVE.has(job.status) && !this.manager()?.getRecord(job.agent_id)) job.status = 'unavailable';
     }
     this.show(ctx);
+    if (this.host.notify) this.startMonitoring(ctx);
   }
   save(ctx) {
+    this.assertOperationActive();
     this.host.appendEntry(ENTRY, { version: 1, tasks: structuredClone(this.tasks) }); this.show(ctx);
   }
   show(ctx) {
@@ -116,25 +212,41 @@ export class Workflow {
     });
   }
   async status(ctx, id) {
+    const session = this.session;
     const tasks = id ? [this.task(id, ctx)] : Object.values(this.tasks);
+    for (const {task, job} of this.latestCli(tasks)) {
+      await this.refreshCli(task, job, ctx, session);
+      if (session && !this.current(session)) throw new Error('Session retired during observation.');
+    }
     for (const task of tasks) {
-      for (const job of task.jobs) {
-        if (isCli(job)) {
-          try { await this.claude.observe(job, task.cwd); job.status = job.cli.frozen ? 'stopped' : 'running'; delete job.error; }
-          catch (error) { job.status = 'unavailable'; job.cli.frozen = false; job.valid = false; job.error = String(error); }
-        } else {
-          const record = this.manager()?.getRecord(job.agent_id);
-          if (ACTIVE.has(job.status)) job.status = record?.status ?? 'unavailable';
-        }
+      for (const job of task.jobs.filter(j => !isCli(j))) {
+        const record = this.manager()?.getRecord(job.agent_id);
+        if (ACTIVE.has(job.status)) job.status = record?.status ?? 'unavailable';
       }
-      if (task.target_id && task.cwd === realpathSync(ctx.cwd) && await this.target(ctx) !== task.target_id) {
-        task.phase = 'stale'; task.accepted = false;
+      if (task.target_id && task.cwd === realpathSync(ctx.cwd)) {
+        const target = await this.target(ctx);
+        if (session && !this.current(session)) throw new Error('Session retired during status.');
+        if (target !== task.target_id) { task.phase = 'stale'; task.accepted = false; }
       }
     }
     this.save(ctx); return structuredClone(tasks);
   }
   execute(params, ctx, signal) {
-    const next = this.queue.then(() => this.action(params, ctx, signal));
+    const session = this.session;
+    const next = this.queue.then(async () => {
+      if (session && !this.current(session)) throw new Error('Queued operation belongs to retired session.');
+      this.operationSession = session;
+      try { return await this.action(params, ctx, signal); }
+      finally {
+        try {
+          if (session && this.current(session)) {
+            let changed = false;
+            for (const {task, job} of this.latestCli()) changed = this.notice(task, job, ctx, session) || changed;
+            if (changed) this.save(ctx);
+          }
+        } finally { this.operationSession = null; }
+      }
+    });
     this.queue = next.catch(() => {}); return next;
   }
   async artifacts(task, ctx) {
@@ -206,9 +318,9 @@ export class Workflow {
     if (p.op === 'collect') return this.collect(task, job, ctx);
     if (p.op === 'stop') {
       try {
-        if (isCli(job)) await this.claude.stop(job, task.cwd);
+        if (isCli(job)) await this.cliOperation('stop', job, task.cwd);
         else await rpc(this.host.events, 'stop', { agentId: job.agent_id });
-        job.status = 'stopped'; job.collected = false; job.valid = false; return job;
+        job.status = isCli(job) ? observedStatus(job.cli.observed) : 'stopped'; job.collected = false; job.valid = false; return job;
       } finally { this.save(ctx); }
     }
     if (p.op === 'resume') return this.resume(task, job, p, ctx, signal);
@@ -216,7 +328,7 @@ export class Workflow {
       // Re-observe external writers: a missing native manager is not freeze evidence.
       const cliOwners = new Map(Object.values(this.tasks).filter(t => t.cwd === task.cwd).flatMap(t => t.jobs.filter(isCli)).map(j => [j.agent_id || j.run_id,j]));
       for (const writer of cliOwners.values()) {
-        await this.claude.observe(writer, task.cwd);
+        await this.cliOperation('observe', writer, task.cwd);
         if (!writer.cli.frozen || (writer.cli.unexpected_copy && !writer.cli.copy_frozen)) throw new Error('Freeze exact Claude writer before acceptance.');
         if (writer.valid) {
           if (writer.result_hash !== hash(await readFile(writer.artifact, 'utf8'))) throw new Error('Saved implementation report bytes changed.');
@@ -265,8 +377,8 @@ export class Workflow {
     // External writer state must be current even without a native manager.
     const cliOwners = new Map(Object.values(this.tasks).filter(t => t.cwd === task.cwd).flatMap(t => t.jobs.filter(isCli)).map(j => [j.agent_id || j.run_id,j]));
     for (const writer of cliOwners.values()) {
-      try { await this.claude.observe(writer,task.cwd); }
-      catch (error) { writer.cli.frozen = false; writer.valid = false; writer.error = String(error); this.save(ctx); }
+      try { await this.cliOperation('observe', writer,task.cwd); }
+      catch (error) { this.assertOperationActive(); writer.cli.frozen = false; writer.valid = false; writer.error = String(error); this.save(ctx); }
     }
     const running = this.activeJobs(task.cwd);
     if (!isWriter(role) && running.length) throw new Error('Freeze writers and collect outstanding work before review/adjudication.');
@@ -308,13 +420,13 @@ export class Workflow {
       if (role === 'designer') {
         await this.prepareCli(task, job, ctx, p.checks ?? []);
         this.save(ctx); // Persist binding before launch; failures must never invite a blind retry.
-        await this.claude.start(job, task.cwd, await this.cliPrompt(task, job, prompt), job.cli.checks);
+        await this.cliOperation('start', job, task.cwd, await this.cliPrompt(task, job, prompt), job.cli.checks);
         this.save(ctx); return job;
       }
       const response = await rpc(this.host.events, 'spawn', { type: `astraeus-${role}`, prompt, options: { description:`${task.task_id}: ${role}`, model, thinkingLevel:p.thinking, inheritContext:false, isBackground:true, cwd:ctx.cwd, onSpawned: id => { job.agent_id = id; this.save(ctx); } } });
       job.agent_id = response.id; job.status = this.manager()?.getRecord(response.id)?.status ?? 'running'; this.save(ctx);
       return job;
-    } catch (error) { job.status = isCli(job) ? 'unavailable' : this.manager()?.getRecord(job.agent_id)?.status ?? (job.agent_id ? 'unavailable' : 'error'); job.error = String(error); this.save(ctx); throw error; }
+    } catch (error) { this.assertOperationActive(); job.status = isCli(job) ? 'unknown' : this.manager()?.getRecord(job.agent_id)?.status ?? (job.agent_id ? 'unavailable' : 'error'); job.error = String(error); this.save(ctx); throw error; }
   }
   async prepareCli(task, job, ctx, checks, prior) {
     for (const owned of job.owned_paths) {
@@ -354,13 +466,13 @@ export class Workflow {
   async collectCli(task, job, ctx) {
     job.valid = false;
     try {
-      const observed = await this.claude.observe(job, task.cwd);
+      const observed = await this.cliOperation('observe', job, task.cwd);
       if (!job.cli.frozen) {
         if (!(['done','stopped'].includes(observed.state) || (observed.state === 'blocked' && observed.status === 'idle'))) {
           if (observed.state === 'working' && ['running','busy','working'].includes(observed.status)) return {...job, note:'Claude still working; unknown lifecycle is not completion.'};
           throw new Error('Claude lifecycle not collectable; explicitly stop exact writer or obtain evidence.');
         }
-        await this.claude.stop(job, task.cwd);
+        await this.cliOperation('stop', job, task.cwd);
       }
       if (job.cli.unexpected_copy && !job.cli.copy_frozen) throw new Error('Unexpected copy remains unfrozen.');
       job.collected = true;
@@ -377,7 +489,7 @@ export class Workflow {
       const checks = new Map(result.checks.map(c => [c.command,c]));
       if (checks.size !== result.checks.length || result.checks.some(c => c.outcome !== 'passed') || job.cli.checks.some(c => !checks.has(c))) throw new Error('Required checks missing, failed or not run.');
       if (JSON.stringify([...result.changed_files].sort()) !== JSON.stringify(paths)) throw new Error('Implementation changed_files differs from actual owned baseline delta.');
-      await this.claude.observe(job,task.cwd);
+      await this.cliOperation('observe', job,task.cwd);
       if (!job.cli.frozen || JSON.stringify(await snapshot(task.cwd)) !== JSON.stringify(before)) throw new Error('Claude writer/source changed during collection.');
       if (!job.artifact) {
         const final = join(job.cli.directory,'result.json');
@@ -385,7 +497,7 @@ export class Workflow {
       } else if (job.result_hash !== hash(bytes)) throw new Error('Published implementation result changed.');
       job.result_hash = hash(bytes); job.summary = result.summary; job.valid = true;
       task.phase = 'verification'; task.target_id = null; delete job.error;
-    } catch (error) { job.collected = true; job.error = String(error); task.phase = 'needs-evidence'; }
+    } catch (error) { this.assertOperationActive(); job.collected = true; job.error = String(error); task.phase = 'needs-evidence'; }
     this.save(ctx); return job;
   }
   async collect(task, job, ctx) {
@@ -437,7 +549,7 @@ export class Workflow {
       await this.validate(decision, task, ctx);
     }
     if (isCli(job)) {
-      await this.claude.observe(job,task.cwd);
+      await this.cliOperation('observe', job,task.cwd);
       if (!job.cli.frozen) throw new Error('Collect/freeze the original Claude writer before resume.');
       const follow = {...job, run_id:randomUUID(), collected:false, valid:false, result:undefined, artifact:undefined, result_hash:undefined, status:'queued', error:undefined};
       task.jobs.push(follow); task.accepted = false; task.target_id = null; task.phase = 'implementation';
@@ -445,9 +557,9 @@ export class Workflow {
         // Follow-up may edit the previous owner's delta, but not preexisting user files.
         await this.prepareCli(task,follow,ctx,job.cli.checks,job.cli);
         this.save(ctx);
-        await this.claude.resume(follow,task.cwd,await this.cliPrompt(task,follow,`Continue only original authorized design scope ${task.design_authorization.scope}; preserve Opus design decisions unless explicit user/functional constraints require changes.\n${p.prompt}`));
+        await this.cliOperation('resume', follow,task.cwd,await this.cliPrompt(task,follow,`Continue only original authorized design scope ${task.design_authorization.scope}; preserve Opus design decisions unless explicit user/functional constraints require changes.\n${p.prompt}`));
         this.save(ctx); return follow;
-      } catch (error) { follow.status = 'unavailable'; follow.error = String(error); follow.collected = true; this.save(ctx); throw error; }
+      } catch (error) { this.assertOperationActive(); follow.status = 'unknown'; follow.error = String(error); follow.collected = true; this.save(ctx); throw error; }
     }
     const record = this.manager()?.getRecord(job.agent_id);
     if (!record?.session) throw new Error('Original live child session unavailable. Use Tintinweb @handle session recovery; no replacement owner was launched.');
