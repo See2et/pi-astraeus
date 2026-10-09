@@ -190,11 +190,11 @@ export class Workflow {
     }
     const staged = structuredClone(job);
     let result, error;
-    try { result = await this.claude[method](staged, ...args, ...(method === 'observe' ? [session?.controller.signal] : [])); }
+    try { result = await this.claude[method](staged, ...args, session?.controller.signal); }
     catch (caught) { error = caught; }
     this.assertOperationActive();
     Object.assign(job, staged);
-    if (method === 'observe') {
+    if (method === 'observe' || ['CLAUDE_OBSERVATION_UNCERTAIN','CLAUDE_BINDING_REFUSED'].includes(error?.code)) {
       job.status = error ? 'unknown' : observedStatus(job.cli.observed);
       if (error) { job.cli.observation_failure ??= String(error).slice(0, 1024); job.cli.frozen = false; job.valid = false; job.error = String(error).slice(0, 1024); }
     }
@@ -541,7 +541,7 @@ export class Workflow {
   async cliPrompt(task, job, prompt) {
     const schema = await readFile(join(this.root,'schemas/implementation.json'),'utf8');
     const role = await readFile(join(this.root,'agents/astraeus-designer.md'),'utf8');
-    return `${prompt}\n\nDesigner role contract (native frontmatter is not CLI isolation):\n${role}\n\nInstalled Claude Code background task, exact requested model claude-opus-5-5. Do not launch nested agents, create worktrees, commit/stage/reset/stash, push, publish, or edit workflow control metadata. Stay within the assigned paths and explicitly authorized design scope; owned_paths is advisory assignment, not a permission sandbox. Preserve existing user changes. Permissions are not an OS sandbox. Run required checks exactly: ${JSON.stringify(job.cli.checks)}. Report failed/denied checks truthfully. Missing checks means checks: [].\nWrite one JSON implementation result only to ${job.cli.pending}; do not edit control metadata or publish a final result. task_id=${JSON.stringify(task.task_id)}, run_id=${JSON.stringify(job.run_id)}, target_id=${JSON.stringify(job.cli.dispatch_target)}. changed_files reports your actual edits for this run, not preexisting or other writers' changes; shared-cwd baseline deltas are not exact attribution. Complete requires completed authorized work, all required checks passed, remaining: []. Schema:\n${schema}`;
+    return `${prompt}\n\nDesigner role contract, including unattended noninteractive behavior, applies to this initial or follow-up run (native frontmatter is not CLI isolation):\n${role}\n\nInstalled Claude Code background task, exact requested model claude-opus-5-5. Do not launch nested agents, create worktrees, commit/stage/reset/stash, push, publish, or edit workflow control metadata. Stay within the assigned paths and explicitly authorized design scope; owned_paths is advisory assignment, not a permission sandbox. Preserve existing user changes. Permissions are not an OS sandbox. Run required checks exactly: ${JSON.stringify(job.cli.checks)}. Report failed/denied checks truthfully. Missing checks means checks: [].\nWrite one JSON implementation result only to ${job.cli.pending}; do not edit control metadata or publish a final result. task_id=${JSON.stringify(task.task_id)}, run_id=${JSON.stringify(job.run_id)}, target_id=${JSON.stringify(job.cli.dispatch_target)}. changed_files reports your actual edits for this run, not preexisting or other writers' changes; shared-cwd baseline deltas are not exact attribution. Complete requires completed authorized work, all required checks passed, remaining: []. Schema:\n${schema}`;
   }
   async readCliReport(task, job, ctx) {
     const candidate = job.artifact || job.cli.pending;
@@ -602,7 +602,7 @@ export class Workflow {
       job.valid = true;
       task.phase = 'verification'; task.target_id = null; delete job.error;
     } catch (error) {
-      this.assertOperationActive(); job.collected = true; job.error = String(error); task.phase = 'needs-evidence';
+      this.assertOperationActive(); job.collected = job.cli.frozen === true; job.error = String(error); task.phase = 'needs-evidence';
     }
     this.save(ctx); return job;
   }
@@ -736,7 +736,7 @@ export class Workflow {
         this.save(ctx);
         await this.cliOperation('resume', follow,task.cwd,await this.cliPrompt(task,follow,`Continue only original authorized design scope ${task.design_authorization.scope}; preserve Opus design decisions unless explicit user/functional constraints require changes.\n${p.prompt}`));
         this.save(ctx); return follow;
-      } catch (error) { this.assertOperationActive(); follow.status = 'unknown'; follow.error = String(error); follow.collected = true; this.settlePreparationFailure(follow); this.save(ctx); throw error; }
+      } catch (error) { this.assertOperationActive(); follow.status = 'unknown'; follow.error = String(error); follow.collected = follow.cli.frozen === true; this.settlePreparationFailure(follow); this.save(ctx); throw error; }
     }
     const record = this.manager()?.getRecord(job.agent_id);
     if (!record?.session) throw new Error('Original live child session unavailable. Use Tintinweb @handle session recovery; no replacement owner was launched.');

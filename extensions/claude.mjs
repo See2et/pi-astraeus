@@ -4,6 +4,10 @@ import { randomUUID, createHash } from 'node:crypto';
 import { readFile, writeFile, lstat, readlink, realpath, link, unlink } from 'node:fs/promises';
 import { join, resolve, relative, isAbsolute } from 'node:path';
 import { ClaudeTrustPreflight } from './claude-trust.mjs';
+import { setTimeout as delay } from 'node:timers/promises';
+
+const affirmativelyFrozen = record => ['done','stopped'].includes(record.state) && record.pid === null && [null,'idle'].includes(record.status);
+const incompleteObservation = new Set(['missing-record','missing-uuid','invalid-uuid','missing-cwd','invalid-cwd','cwd-unresolvable','expected-cwd-unresolvable','unknown-response','query-unavailable','query-timeout','query-output-limit']);
 
 export const CLAUDE_TRANSPORT = 'claude-code-bg-v1';
 export const CLI_EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'];
@@ -53,15 +57,21 @@ export function capture(command, args, cwd, {signal, timeout, maxBytes = Infinit
   });
 }
 export class ClaudeBackground {
-  constructor({command = 'claude', invoke = capture, trust = new ClaudeTrustPreflight(), observationTimeout = 5000, observationMaxBytes = 256 * 1024} = {}) {
+  constructor({command = 'claude', invoke = capture, trust = new ClaudeTrustPreflight(), observationTimeout = 5000, observationMaxBytes = 256 * 1024,
+    readinessTimeout = 5000, readinessAttempts = 10, readinessInterval = 100} = {}) {
     this.command = command; this.invoke = invoke; this.trust = trust;
     this.observationTimeout = observationTimeout; this.observationMaxBytes = observationMaxBytes;
+    if (!Number.isFinite(readinessTimeout) || readinessTimeout <= 0 || !Number.isInteger(readinessAttempts) || readinessAttempts < 1 || readinessAttempts > 100 || !Number.isFinite(readinessInterval) || readinessInterval < 0) throw new Error('Invalid bounded Claude readiness budget.');
+    this.readinessTimeout = readinessTimeout; this.readinessAttempts = readinessAttempts; this.readinessInterval = readinessInterval;
   }
   async preflight(cwd) { return this.trust.run(cwd, () => this.records(cwd)); }
   async call(args, cwd) { return this.invoke(this.command, args, cwd); }
   async checked(args, cwd, options) {
     const result = await this.query(args, cwd, options?.signal);
-    if (result.returncode !== 0) throw new Error(`Claude CLI ${args.slice(0,2).join(' ')} failed: ${result.diagnostic || result.stderr}`);
+    if (result.returncode !== 0) {
+      const diagnostic = /timed out/.test(result.diagnostic || '') ? 'timed out' : /output limit/.test(result.diagnostic || '') ? 'output limit exceeded' : 'failed';
+      throw new Error(`Claude CLI ${args.slice(0,2).join(' ')} observation ${diagnostic}; no success inferred.`);
+    }
     return result.stdout;
   }
   async capabilities(cwd, effort) {
@@ -108,13 +118,18 @@ export class ClaudeBackground {
     // persists it across restore, without retaining unrelated public records or paths.
     const evidence = {short_id:/^[a-f0-9]{8}$/.test(short) ? short : null, expected_uuid:uuid(full) ? full : null};
     const refuse = reason => {
-      const error = new Error(`Claude full UUID/cwd binding mismatch: ${reason}; unknown is not done. ${JSON.stringify(evidence)}`);
-      error.code = 'CLAUDE_BINDING_REFUSED'; error.reason = reason; error.evidence = {...evidence};
+      const error = new Error(`Claude ${incompleteObservation.has(reason) ? 'observation uncertain' : 'full UUID/cwd binding mismatch'}: ${reason}${reason === 'query-timeout' ? ' (observation timed out)' : ''}; unknown is not done. ${JSON.stringify(evidence)}`);
+      error.code = incompleteObservation.has(reason) ? 'CLAUDE_OBSERVATION_UNCERTAIN' : 'CLAUDE_BINDING_REFUSED';
+      error.reason = reason; error.evidence = {...evidence};
       throw error;
     };
     let records;
     try { records = await this.records(cwd, signal); }
-    catch (error) { if (error.code === 'CLAUDE_AGENTS_FORMAT') refuse('unknown-response'); throw error; }
+    catch (error) {
+      if (signal?.aborted) throw new Error('Claude observation cancelled');
+      refuse(error.code === 'CLAUDE_AGENTS_FORMAT' ? 'unknown-response' :
+        /timed out/.test(error.message) ? 'query-timeout' : /output limit/.test(error.message) ? 'query-output-limit' : 'query-unavailable');
+    }
     const found = records.filter(r => r && r.id === short);
     evidence.match_count = found.length;
     if (!found.length) refuse('missing-record');
@@ -139,6 +154,42 @@ export class ClaudeBackground {
     if (observedCwd !== expectedCwd) refuse('canonical-cwd-mismatch');
     return {id:short, session_id:id, cwd:expectedCwd, state:record.state ?? null, status:record.status ?? null, pid:record.pid ?? null};
   }
+  async ready(short, cwd, full, signal, frozen = false) {
+    // Retry only public observations after one acknowledged mutation. The total
+    // deadline also cancels a query/wait; conflicting identity fails immediately.
+    const controller = new AbortController();
+    const abort = () => controller.abort();
+    const timer = setTimeout(abort, this.readinessTimeout);
+    signal?.addEventListener('abort', abort, {once:true});
+    if (signal?.aborted) abort();
+    let last;
+    try {
+      for (let attempt = 0; attempt < this.readinessAttempts; attempt++) {
+        if (controller.signal.aborted) break;
+        try {
+          const record = await this.match(short, cwd, full, controller.signal);
+          if (controller.signal.aborted) break;
+          if (!frozen || affirmativelyFrozen(record)) return record;
+          last = new Error('Claude stop acknowledged but lifecycle is not frozen.');
+          last.code = 'CLAUDE_OBSERVATION_UNCERTAIN'; last.reason = 'lifecycle-not-frozen';
+        } catch (error) {
+          if (error.code !== 'CLAUDE_OBSERVATION_UNCERTAIN') {
+            if (error.code !== 'CLAUDE_BINDING_REFUSED' && controller.signal.aborted) break;
+            throw error;
+          }
+          last = error;
+        }
+        if (attempt + 1 < this.readinessAttempts) {
+          try { await delay(this.readinessInterval, undefined, {signal:controller.signal}); }
+          catch { break; }
+        }
+      }
+      const error = new Error(signal?.aborted ? 'Claude readiness observation cancelled.' :
+        `Claude readiness observation exhausted; unknown is not done or frozen. ${last?.message || 'Observation deadline elapsed.'}`);
+      error.code = 'CLAUDE_OBSERVATION_UNCERTAIN'; error.reason = last?.reason ?? 'readiness-deadline';
+      error.evidence = last?.evidence; throw error;
+    } finally { clearTimeout(timer); signal?.removeEventListener('abort', abort); }
+  }
   async evidence(job, kind, args, cwd) {
     const result = await this.call(args, cwd);
     const path = join(job.cli.directory, `${kind}-${randomUUID()}.json`);
@@ -160,26 +211,26 @@ export class ClaudeBackground {
     if (job.cli.unexpected_copy) {
       if (!uuid(job.cli.unexpected_copy.session_id)) throw new Error('Unexpected Claude copy binding is unverified; retained emitted ID cannot authorize cleanup or success.');
       const copy = await this.match(job.cli.unexpected_copy.id,cwd,job.cli.unexpected_copy.session_id, signal);
-      job.cli.copy_frozen = job.cli.copy_frozen && ['done','stopped'].includes(copy.state) && copy.pid === null && [null,'idle'].includes(copy.status);
+      job.cli.copy_frozen = job.cli.copy_frozen && affirmativelyFrozen(copy);
       if (!job.cli.copy_frozen) throw new Error('Unexpected Claude copy is not affirmatively frozen.');
     }
-    if (job.cli.frozen && !(['done','stopped'].includes(observed.state) && observed.pid === null && (observed.status === null || observed.status === 'idle'))) {
+    if (job.cli.frozen && !affirmativelyFrozen(observed)) {
       job.cli.frozen = false;
       throw new Error('Previously stopped Claude writer is no longer affirmatively frozen.');
     }
     return observed;
   }
-  async stop(job, cwd) {
-    const observed = await this.observe(job, cwd);
-    const result = await this.evidence(job, 'stop', ['stop', observed.id], cwd);
+  async stop(job, cwd, signal) {
+    const observed = await this.observe(job, cwd, signal);
+    signal?.throwIfAborted();
     job.cli.frozen = false;
+    const result = await this.evidence(job, 'stop', ['stop', observed.id], cwd);
     if (result.returncode !== 0 || result.stdout.trim() !== `stopped ${observed.id}`) throw new Error('Exact Claude stop not acknowledged; retained stop evidence.');
-    const stopped = await this.match(observed.id, cwd, observed.session_id);
-    if (!['done','stopped'].includes(stopped.state) || stopped.pid !== null || ![null,'idle'].includes(stopped.status)) throw new Error('Claude stop acknowledged but lifecycle is not frozen.');
+    const stopped = await this.ready(observed.id, cwd, observed.session_id, signal, true);
     job.cli.frozen = true; job.cli.observed = stopped; job.status = observedStatus(stopped);
     return stopped;
   }
-  async start(job, cwd, prompt, checks) {
+  async start(job, cwd, prompt, checks, signal) {
     await this.capabilities(cwd, job.requested.effort);
     if (/[*?\[\]()\r\n]/.test(cwd + job.cli.directory + job.cli.report_directory)) throw new Error('Claude cwd/control paths contain permission-rule metacharacters.');
     const allows = ['Read','Glob','Grep'];
@@ -195,19 +246,23 @@ export class ClaudeBackground {
     const settings = {permissions:{defaultMode:'dontAsk', allow:allows, deny:denies}, worktree:{bgIsolation:'none'}};
     const args = ['--bg','--safe-mode','--model','claude-opus-5-5','--effort',job.requested.effort,'--permission-mode','dontAsk','--setting-sources','','--settings',JSON.stringify(settings),'--tools','Read,Edit,Write,Glob,Grep,Bash','--allowedTools',...allows,'--disallowedTools',...denies,'--add-dir',job.cli.directory,'--strict-mcp-config','--mcp-config','{"mcpServers":{}}','--',prompt];
     await this.preflight(cwd);
+    signal?.throwIfAborted();
     const result = await this.evidence(job, 'launch', args, cwd);
     if (result.returncode !== 0) throw new Error('Claude background launch failed; inspect retained stdout/stderr/exit, no blind retry.');
     const short = launchId(result.stdout);
     job.cli.short_id = short;
-    const observed = await this.match(short, cwd);
+    const observed = await this.ready(short, cwd, undefined, signal);
     job.cli.session_id = observed.session_id; job.cli.observed = observed; job.agent_id = `claude:${observed.session_id}`; job.status = observedStatus(observed);
   }
-  async resume(job, cwd, prompt) {
+  async resume(job, cwd, prompt, signal) {
     // Live idle/done sessions also copy on --resume in 2.1.288: stop first.
-    await this.stop(job, cwd);
+    await this.stop(job, cwd, signal);
     await this.preflight(cwd);
-    const result = await this.evidence(job, 'resume', ['--bg','--resume',job.cli.session_id,'--',prompt], cwd);
+    signal?.throwIfAborted();
+    // A dispatched run is no longer safely frozen even if receipt publication
+    // fails after invocation. Do not let the caller settle/stop monitoring it.
     job.cli.frozen = false;
+    const result = await this.evidence(job, 'resume', ['--bg','--resume',job.cli.session_id,'--',prompt], cwd);
     if (result.returncode !== 0) throw new Error('Claude resume failed; retained evidence, no retry.');
     const short = launchId(result.stdout);
     if (short !== job.cli.short_id) {
@@ -218,15 +273,16 @@ export class ClaudeBackground {
     }
     // Same-short replies must prove the saved full UUID at the binding boundary.
     // A different emitted short ID is inspected only for exact copy cleanup below.
-    const resumed = await this.match(short,cwd,short === job.cli.short_id ? job.cli.session_id : undefined);
+    const resumed = await this.ready(short,cwd,short === job.cli.short_id ? job.cli.session_id : undefined, signal);
     if (short !== job.cli.short_id || resumed.session_id !== job.cli.session_id) {
       // Only stop the exact emitted copy after verifying UUID/cwd; never rebind owner.
       const copy = resumed;
       job.cli.unexpected_copy = copy;
+      signal?.throwIfAborted();
       const stopped = await this.evidence(job, 'stop-unexpected-copy', ['stop',copy.id], cwd);
       if (stopped.returncode !== 0 || stopped.stdout.trim() !== `stopped ${copy.id}`) throw new Error('Unexpected Claude copy could not be stopped; retained evidence.');
-      const frozen = await this.match(copy.id, cwd, copy.session_id);
-      job.cli.copy_frozen = ['done','stopped'].includes(frozen.state) && frozen.pid === null && [null,'idle'].includes(frozen.status);
+      const frozen = await this.ready(copy.id, cwd, copy.session_id, signal, true);
+      job.cli.copy_frozen = affirmativelyFrozen(frozen);
       throw new Error('Claude resume copied the owner; exact unexpected copy stopped, inspect changes before recovery.');
     }
     job.cli.observed = resumed; job.status = observedStatus(resumed);

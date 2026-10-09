@@ -134,14 +134,25 @@ Before start/resume, GPT registers only the actual canonical Git root under cano
 operation. Outside that boundary workspace trust remains manual. Unsafe config,
 unknown/active sessions or observed concurrent writes block a needed update and launch.
 `CLAUDE_CONFIG_DIR` overrides fail closed because their config mapping is not established.
-Binding errors retain specific refusal reasons and minimal UUID/canonical-cwd fingerprint
-evidence, not whole public records. Conflicting UUID aliases, missing/ambiguous identities
-and cwd mismatches fail closed; no automatic readiness retry or owner replacement occurs.
+Binding errors retain specific reasons and minimal UUID/canonical-cwd fingerprint
+evidence, not whole public records. After launch/resume/acknowledged stop, public readiness
+is observed for at most 10 queries within 5 seconds (100-ms waits), never by repeating
+the mutating command. Missing/incomplete records and unavailable observations remain
+uncertain on exhaustion. Ambiguous identities, conflicting UUID aliases and actual
+full-UUID/canonical-cwd conflicts fail immediately. Neither uncertainty nor conflict
+permits success, freeze, replacement or migration.
 A later exact match is current evidence, not reconstruction of an unsaved error-time record.
 Safe resume requires the exact original owner, latest collected/frozen run, immutable
 evidence integrity, bounded scope and required adopted fixes. Failed original runs can
 resume for correction without a successful prior report; incomplete/failed work is not
 automatically accepted. Old saved permissions/guards may remain blocked.
+Every initial and follow-up CLI handoff supplies the canonical unattended designer
+contract: no user questions, AskUserQuestion, plan approval, interactive commands or
+waiting for chat. Minor ambiguity uses safe in-scope assumptions reported in the summary;
+missing authority/input ends with a run-specific blocked report and concrete issues/options
+for root, preserving completed work. Prompt guidance is not guaranteed enforcement.
+Existing sessions retain saved settings; these handoff/runtime changes require normal
+package update and Pi reload, not private-session edits or activation.
 See [Claude design delegation](references/claude-design.md) for lifecycle, trust and recovery.
 
 Session-scoped monitoring observes only each Claude owner's latest uncollected run.
@@ -150,19 +161,30 @@ messages, and idle roots wake automatically. During user-prompt preparation, not
 are appended without starting a competing turn and enter the upcoming user context.
 Pi 1.0.4 reports idle during awaited prompt preparation and has no preparation-exit
 extension event. The extension therefore observes the exported `AgentSession.prompt`
-method with per-session reservations and `finally` cleanup, including handled inputs
-and errors; it does not edit upstream Pi or retry rejected user prompts. If preparation
-exits without a run, a hidden wake message processes the already-appended notice once.
+and `sendCustomMessage` methods with per-session reservations and `finally` cleanup,
+including handled inputs and errors; it does not edit upstream Pi or retry rejected
+user prompts. Delivery stays pending until an actual `agent_start`, not merely dispatch.
+If user- or notification-owned preparation exits without a run, autonomous idle retry
+uses a hidden wake for the already-appended notice, backing off from 100 ms to 5 seconds.
+Manual compaction/non-streaming busy work delays wakes without waiting for new user input.
+Notices are appended once; stable public observations do not create duplicate notices.
 A user arriving during a notification-owned wake waits before submission; registered
 commands still execute immediately and explicit streaming delivery choices are unchanged.
-The observer is shared across reloads; retired extension owners cannot deliver later wakes. This runtime adaptation is tested
+The observer retains unconsumed delivery across complete extension reload on the same
+session branch, anchored by public membership of any unconsumed appended notice (later
+notices or workflow saves do not overwrite earlier anchors). Replacement owners restore
+retry/backoff; retired-owner timers are cancelled. A branch retaining none of those notices
+or a different session cannot inherit the wake.
+This runtime adaptation is tested
 against the pinned Pi version and needs compatibility checks on Pi upgrades.
 `work-ended` means public done/idle evidence, ready to attempt collect,
 not implementation success. `blocked`, external `stopped`, and `unknown` require
 attention and never imply success. Repeated observations do not wake root again;
 a resumed run has a new notification identity. Observation remains separate from
 `cli.frozen` (explicit exact stop acknowledgment) and `valid` (strict report checks).
-Monitoring never stops, collects, or accepts work automatically.
+Monitoring never stops, collects, or accepts work automatically. A dispatched resume with
+exhausted readiness remains uncollected/unfrozen so later monitor observations can recover
+attention autonomously; they do not collect work or establish success.
 
 One owner is polled per tick, without overlapping workflow operations; failed
 observations back off from 3 seconds to at most 30 seconds. Public CLI queries have

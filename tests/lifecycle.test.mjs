@@ -1,6 +1,7 @@
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
 import {mkdtemp, mkdir, rm, writeFile} from 'node:fs/promises';
+import {existsSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {setTimeout as delay} from 'node:timers/promises';
@@ -106,7 +107,7 @@ test('fake observation child timeout/output/cancellation are bounded without sto
   controller.abort(); assert.match((await pending).diagnostic,/cancelled/);
 });
 
-async function notificationFixture(t, initialState = 'done') {
+async function notificationFixture(t, initialState = 'done', holdStartup = false) {
   const base=await mkdtemp(join(tmpdir(),'astraeus-notices-')); t.after(() => rm(base,{recursive:true,force:true}));
   const cwd=join(base,'repo'), agentDir=join(base,'agent'), bin=join(base,'bin'), recordPath=join(base,'records.json'), startedPath=join(base,'query-started');
   await Promise.all([mkdir(cwd),mkdir(agentDir),mkdir(bin)]);
@@ -122,12 +123,19 @@ async function notificationFixture(t, initialState = 'done') {
   let parentRequests=0;
   const prompts={hold:false, finishes:[], contexts:[], input:null, commands:0, attempts:0};
   const navigation={cancel:false, treeEvents:0, summaryMode:null, summaryRequests:0, finish:null};
+  const compaction={gate:null, started:false};
   const fake=pi => {
     pi.registerCommand('fixture-immediate',{description:'Deterministic command',handler:async () => {prompts.commands++;}});
     pi.on('input', async () => {
       if (!prompts.input) return;
       const input=prompts.input; prompts.input=null; input.started=true;
       await input.promise; return input.result;
+    });
+    pi.on('session_before_compact', async () => {
+      if (!compaction.gate) return;
+      compaction.started=true;
+      await compaction.gate;
+      return {cancel:true};
     });
     pi.on('session_before_tree', () => navigation.cancel ? {cancel:true} : undefined);
     pi.on('session_tree', () => {navigation.treeEvents++;});
@@ -158,9 +166,24 @@ async function notificationFixture(t, initialState = 'done') {
     }});
   };
   const runtime=await ModelRuntime.create({authPath:join(agentDir,'auth.json'),modelsPath:join(agentDir,'models.json')});
-  const settings=SettingsManager.inMemory({compaction:{enabled:false},retry:{enabled:false}});
-  const loader=new DefaultResourceLoader({cwd,agentDir,eventBus:createEventBus(),settingsManager:settings,noExtensions:true,noContextFiles:true,extensionFactories:[fake],additionalExtensionPaths:[ROOT],disabledBuiltinExtensions:['mcp']});
+  const settings=SettingsManager.inMemory({compaction:{enabled:false,keepRecentTokens:16},retry:{enabled:false}});
+  const startup={extension:join(base,'startup.ts'),started:join(base,'startup-started'),release:join(base,'startup-release')};
+  if (holdStartup) await writeFile(startup.extension, `
+    import {existsSync, writeFileSync} from 'node:fs';
+    import {setTimeout as delay} from 'node:timers/promises';
+    export default function(pi) {
+      let held=false;
+      pi.on('agent_start', async (_event, ctx) => {
+        if (held) return; held=true;
+        writeFileSync(${JSON.stringify(startup.started)}, 'started');
+        const end=Date.now()+10000;
+        while (!existsSync(${JSON.stringify(startup.release)}) && !ctx.signal?.aborted && Date.now()<end) await delay(10);
+      });
+    }
+  `);
+  const loader=new DefaultResourceLoader({cwd,agentDir,eventBus:createEventBus(),settingsManager:settings,noExtensions:true,noContextFiles:true,extensionFactories:[fake],additionalExtensionPaths:holdStartup?[startup.extension,ROOT]:[ROOT],disabledBuiltinExtensions:['mcp']});
   await loader.reload(); assert.deepEqual(loader.getExtensions().errors,[]);
+  if (holdStartup) assert.equal(loader.getExtensions().extensions[0].path,startup.extension,'gate extension must run before Astraeus, not an appended inline factory');
   const manager=SessionManager.inMemory(cwd); manager.appendCustomEntry(ENTRY,{version:1,tasks:{fixture:task(cwd)}});
   const {session}=await createAgentSession({cwd,agentDir,modelRuntime:runtime,model:runtime.getModel('openai','gpt-6.1-sol'),settingsManager:settings,sessionManager:manager,resourceLoader:loader});
   const notices=[], errors=[];
@@ -171,7 +194,7 @@ async function notificationFixture(t, initialState = 'done') {
   t.after(async () => {await session.extensionRunner.emit({type:'session_shutdown',reason:'quit'}); session.dispose();});
   await session.bindExtensions({onError:error => errors.push(error)}); await session.setModel(runtime.getModel('local-notice','stub'));
   const status=() => session.agent.state.tools.find(t => t.name==='astraeus_workflow').execute('fixture-status',{op:'status'},new AbortController().signal);
-  return {session, manager, notices, errors, navigation, prompts, runtime, record, recordPath, startedPath, status, parentRequests:() => parentRequests,
+  return {session, manager, notices, errors, navigation, compaction, startup, prompts, runtime, record, recordPath, startedPath, status, parentRequests:() => parentRequests,
     publish:() => writeFile(recordPath,JSON.stringify([record]))};
 }
 
@@ -260,6 +283,191 @@ for (const exit of ['handled','auth-error']) test(`actual ${exit} preflight rele
   await f.status(); assert.equal(f.parentRequests(),2);
 });
 
+for (const exit of ['handled','auth-error']) test(`notification-owned ${exit} preparation retries autonomously until an actual parent run`, async t => {
+  const f=await notificationFixture(t,'working');
+  await until(() => f.manager.getBranch().filter(e => e.type==='custom'&&e.customType===ENTRY).at(-1).data.tasks.fixture.jobs[0].cli.notified_status==='running');
+  const send=f.session.sendCustomMessage.bind(f.session);
+  const configured=f.runtime.hasConfiguredAuth, check=f.runtime.checkAuth;
+  let attempts=0, release;
+  const started=[];
+  // Pi 1.0.4's default custom-message dispatch bypasses input/auth preflight.
+  // Model a host that does prepare notification turns through public prompt(),
+  // exercising real handled/auth-failure completion with the pinned SDK. The
+  // notice is appended once before preparation, never resubmitted as user work.
+  f.session.sendCustomMessage=async (message,options) => {
+    if (!options?.triggerTurn || attempts>=2) return send(message,options);
+    started.push(Date.now()); attempts++;
+    if (message.customType==='pi-astraeus:claude-lifecycle') await send(message,{...options,triggerTurn:false});
+    if(exit==='handled') {
+      const gate={promise:attempts===1 ? new Promise(resolve => {release=resolve;}) : Promise.resolve(),started:false,result:{action:'handled'}};
+      f.prompts.input=gate;
+      return f.session.prompt('Fixture notification preflight consumed by host');
+    }
+    f.runtime.hasConfiguredAuth=() => false;
+    f.runtime.checkAuth=async () => undefined;
+    try { return await f.session.prompt('Fixture notification auth preflight'); }
+    finally { f.runtime.hasConfiguredAuth=configured; f.runtime.checkAuth=check; }
+  };
+  f.record.state='done'; f.record.status='idle'; await f.publish(); await f.status();
+  if(exit==='handled') {
+    await until(() => attempts===1); await delay(250);
+    assert.equal(attempts,1,'a held preparation owns the wake; timer cannot compete');
+    release();
+  }
+  // No new user prompt, tool call or record change after the original dispatch.
+  await until(() => f.parentRequests()===1); await f.session.waitForIdle();
+  assert.equal(attempts,2,'both original dispatch and hidden wake can fail/handle before recovery');
+  assert.ok(started[1]-started[0]>=80,'failed/handled wakes back off rather than hot-looping');
+  await delay(350); assert.equal(f.parentRequests(),1,'actual agent_start consumes the pending obligation');
+  assert.equal(f.manager.getBranch().filter(e => e.customType==='pi-astraeus:claude-lifecycle').length,1);
+  assert.equal(f.manager.buildSessionContext().messages.filter(m => m.role==='user').length,0);
+  assert.ok(JSON.stringify(f.prompts.contexts[0]).includes('ready to attempt collect, NOT implementation success.'));
+  if(exit==='handled') assert.deepEqual(f.errors,[]);
+  else {assert.equal(f.errors.length,2); assert.ok(f.errors.every(e=>/No API key found/.test(e.error)));}
+});
+
+async function heldCompaction(f) {
+  // Enough persisted conversation for Pi's actual manual compaction entry point.
+  f.manager.appendMessage({role:'user',content:'Older fixture conversation to compact. '.repeat(10),timestamp:Date.now()});
+  f.manager.appendMessage({role:'user',content:'Recent fixture conversation to keep. '.repeat(10),timestamp:Date.now()});
+  f.session.refreshContext();
+  let release;
+  f.compaction.started=false;
+  f.compaction.gate=new Promise(resolve => {release=resolve;});
+  const outcome=f.session.compact().then(result => ({result}),error => ({error}));
+  await until(() => f.compaction.started);
+  return {release, outcome};
+}
+
+test('pending preflight attention wakes autonomously after compaction, not at the next user message', async t => {
+  const f=await notificationFixture(t,'working');
+  await until(() => f.manager.getBranch().filter(e => e.type==='custom'&&e.customType===ENTRY).at(-1).data.tasks.fixture.jobs[0].cli.notified_status==='running');
+  let release;
+  const gate={promise:new Promise(resolve => {release=resolve;}),started:false,result:{action:'handled'}};
+  f.prompts.input=gate;
+  const input=f.session.prompt('Handled fixture input');
+  await until(() => gate.started);
+  f.record.state='done'; f.record.status='idle'; await f.publish(); await f.status();
+  assert.equal(f.parentRequests(),0);
+  const compacting=await heldCompaction(f);
+  release(); await input;
+  await delay(150);
+  assert.equal(f.parentRequests(),0,'no wake while manual compaction owns the runtime');
+  compacting.release(); assert.match((await compacting.outcome).error.message,/Compaction cancelled/);
+  // No prompt/status call after the idle boundary. Unchanged observations dedup
+  // at Workflow.notice, so they cannot rescue a lost delivery obligation.
+  await until(() => f.parentRequests()===1); await f.session.waitForIdle();
+  await delay(150);
+  assert.equal(f.parentRequests(),1);
+  assert.equal(f.manager.getBranch().filter(e => e.customType==='pi-astraeus:claude-lifecycle').length,1);
+  assert.equal(f.manager.getBranch().filter(e => e.customType==='pi-astraeus:claude-wake').length,1);
+  assert.deepEqual(f.errors,[]);
+});
+
+test('background notices during manual compaction wait for idle and retired deferred wakes are cancelled', async t => {
+  const f=await notificationFixture(t,'working');
+  await until(() => f.manager.getBranch().filter(e => e.type==='custom'&&e.customType===ENTRY).at(-1).data.tasks.fixture.jobs[0].cli.notified_status==='running');
+  const compacting=await heldCompaction(f);
+  f.record.state='blocked'; f.record.status='idle'; await f.publish();
+  await until(() => f.notices.length===1,6500); // The real monitor, no user input/status.
+  await delay(150);
+  assert.equal(f.parentRequests(),0,'compaction is busy but not streaming; triggerTurn would start competing inference');
+  assert.deepEqual(f.notices[0].options,{deliverAs:'followUp',triggerTurn:false});
+  compacting.release(); assert.match((await compacting.outcome).error.message,/Compaction cancelled/);
+  await until(() => f.parentRequests()===1); await f.session.waitForIdle();
+  assert.ok(JSON.stringify(f.prompts.contexts[0]).includes('Needs attention; NOT successful completion.'));
+  const retired=await heldCompaction(f);
+  f.record.state='done'; await f.publish(); await f.status();
+  assert.equal(f.parentRequests(),1);
+  await f.session.extensionRunner.emit({type:'session_shutdown',reason:'reload'});
+  retired.release(); await retired.outcome; await delay(200);
+  assert.equal(f.parentRequests(),1,'retired pending timer cannot wake the old branch/runtime');
+  assert.equal(f.manager.getBranch().filter(e => e.customType==='pi-astraeus:claude-wake').length,1);
+  assert.deepEqual(f.errors,[]);
+});
+
+test('complete reload retains appended pending attention on the same branch until an actual parent run', async t => {
+  const f=await notificationFixture(t,'working');
+  await until(() => f.manager.getBranch().filter(e => e.type==='custom'&&e.customType===ENTRY).at(-1).data.tasks.fixture.jobs[0].cli.notified_status==='running');
+  let release;
+  const gate={promise:new Promise(resolve => {release=resolve;}),started:false,result:{action:'handled'}};
+  f.prompts.input=gate;
+  const input=f.session.prompt('Handled input held across complete reload');
+  await until(() => gate.started);
+  f.record.state='done'; f.record.status='idle'; await f.publish(); await f.status();
+  const notice=f.manager.getBranch().find(e => e.customType==='pi-astraeus:claude-lifecycle');
+  assert.ok(notice);
+  assert.notEqual(f.manager.getLeafId(),notice.id,'workflow save entries follow the appended notice');
+  await f.session.reload();
+  await delay(150); assert.equal(f.parentRequests(),0,'retained preparation still reserves the runtime');
+  release(); await input;
+  // No user prompt, tool/status call, or public lifecycle transition after reload.
+  await until(() => f.parentRequests()===1); await f.session.waitForIdle();
+  assert.ok(JSON.stringify(f.prompts.contexts[0]).includes('ready to attempt collect, NOT implementation success.'));
+  assert.equal(f.manager.getBranch().filter(e => e.customType==='pi-astraeus:claude-lifecycle').length,1);
+  assert.equal(f.manager.getBranch().filter(e => e.customType==='pi-astraeus:claude-wake').length,1);
+  await delay(350); assert.equal(f.parentRequests(),1,'actual agent_start consumes retained attention once');
+  assert.equal(f.prompts.attempts,1); assert.deepEqual(f.errors,[]);
+});
+
+test('navigation retaining an earlier unconsumed notice recovers attention even when a later notice is excluded', async t => {
+  const f=await notificationFixture(t,'working');
+  await until(() => f.manager.getBranch().filter(e => e.type==='custom'&&e.customType===ENTRY).at(-1).data.tasks.fixture.jobs[0].cli.notified_status==='running');
+  let release;
+  const gate={promise:new Promise(resolve => {release=resolve;}),started:false,result:{action:'handled'}};
+  f.prompts.input=gate;
+  const input=f.session.prompt('Handled input holding two lifecycle notices');
+  await until(() => gate.started);
+  f.record.state='done'; f.record.status='idle'; await f.publish(); await f.status();
+  const noticeA=f.manager.getBranch().find(e => e.customType==='pi-astraeus:claude-lifecycle');
+  const saveB=f.manager.getLeafId();
+  assert.notEqual(saveB,noticeA.id);
+  f.record.state='blocked'; await f.publish(); await f.status();
+  const noticeC=f.manager.getBranch().filter(e => e.customType==='pi-astraeus:claude-lifecycle').at(-1);
+  assert.notEqual(noticeA.id,noticeC.id); assert.equal(f.notices.length,2);
+  // Restored saveB already marks done as notified: no fresh transition should
+  // rescue a lost obligation after selecting the branch that retains noticeA.
+  f.record.state='done'; await f.publish();
+  assert.equal((await f.session.navigateTree(saveB,{summarize:false})).cancelled,false);
+  assert.ok(f.manager.getBranch().some(e => e.id===noticeA.id));
+  assert.ok(!f.manager.getBranch().some(e => e.id===noticeC.id));
+  release(); await input;
+  // No further input/status/public transition to recover the retained notice.
+  await until(() => f.parentRequests()===1); await f.session.waitForIdle();
+  const selected=JSON.stringify(f.prompts.contexts[0]);
+  assert.ok(selected.includes(noticeA.details.diagnostic));
+  assert.ok(!selected.includes(noticeC.details.diagnostic),'excluded notice is not sent in the selected context');
+  assert.equal(f.notices.filter(n => n.message.customType==='pi-astraeus:claude-lifecycle').length,2,'navigation does not append duplicate lifecycle notices');
+  assert.equal(f.manager.getBranch().filter(e => e.customType==='pi-astraeus:claude-lifecycle').length,1);
+  assert.equal(f.manager.getBranch().filter(e => e.customType==='pi-astraeus:claude-wake').length,1);
+  await delay(350); assert.equal(f.parentRequests(),1,'actual agent_start consumes the obligation once');
+  assert.equal(f.prompts.attempts,1); assert.deepEqual(f.errors,[]);
+});
+
+test('pending appended notice does not transfer to a navigated branch that excludes it', async t => {
+  const f=await notificationFixture(t,'working');
+  await until(() => f.manager.getBranch().filter(e => e.type==='custom'&&e.customType===ENTRY).at(-1).data.tasks.fixture.jobs[0].cli.notified_status==='running');
+  const target=f.manager.getLeafId();
+  let release;
+  const gate={promise:new Promise(resolve => {release=resolve;}),started:false,result:{action:'handled'}};
+  f.prompts.input=gate;
+  const input=f.session.prompt('Handled input on the abandoned branch');
+  await until(() => gate.started);
+  f.record.state='done'; f.record.status='idle'; await f.publish(); await f.status();
+  const notice=f.manager.getBranch().find(e => e.customType==='pi-astraeus:claude-lifecycle');
+  // The selected branch's restored running baseline must not generate a new
+  // genuine attention transition and obscure an incorrectly transferred wake.
+  f.record.state='working'; f.record.status='running'; await f.publish();
+  const navigation=await f.session.navigateTree(target,{summarize:false});
+  assert.equal(navigation.cancelled,false);
+  assert.ok(!f.manager.getBranch().some(e => e.id===notice.id));
+  release(); await input; await delay(350);
+  assert.equal(f.parentRequests(),0); assert.equal(f.prompts.attempts,0);
+  assert.equal(f.manager.getBranch().filter(e => e.customType==='pi-astraeus:claude-wake').length,0);
+  assert.equal(f.notices.length,1,'the abandoned notice was appended only once');
+  assert.deepEqual(f.errors,[]);
+});
+
 test('actual reload shutdown retires the pending preparation wake without an old-owner run', async t => {
   const f=await notificationFixture(t,'working');
   await until(() => f.manager.getBranch().filter(e => e.type==='custom'&&e.customType===ENTRY).at(-1).data.tasks.fixture.jobs[0].cli.notified_status==='running');
@@ -277,13 +485,39 @@ test('actual reload shutdown retires the pending preparation wake without an old
   assert.deepEqual(f.errors,[]);
 });
 
-test('actual streaming lifecycle notice remains a native followUp, not a competing prompt', async t => {
+test('actual monitor during an earlier awaited agent_start handler retains autonomous lifecycle attention', async t => {
+  const f=await notificationFixture(t,'working',true);
+  await until(() => f.manager.getBranch().filter(e => e.type==='custom'&&e.customType===ENTRY).at(-1).data.tasks.fixture.jobs[0].cli.notified_status==='running');
+  const user='Original input held at agent startup';
+  const outcome=f.session.prompt(user).then(() => ({ok:true}),error => ({error}));
+  await until(() => existsSync(f.startup.started));
+  assert.equal(f.session.isIdle,false); assert.equal(f.session.isStreaming,true);
+  f.record.state='done'; f.record.status='idle'; await f.publish();
+  await until(() => f.notices.length===1,6500); // Actual monitor, not a tool/status refresh.
+  assert.equal(f.parentRequests(),0,'no inference while the earlier startup handler owns the run');
+  await writeFile(f.startup.release,'release'); assert.equal((await outcome).error,undefined); await f.session.waitForIdle();
+  // No further prompt/status calls. Attention must enter a model request, not
+  // merely be appended as context at turn_end after the request snapshot.
+  const diagnostic=f.notices[0].message.details.diagnostic;
+  await until(() => f.prompts.contexts.some(messages => JSON.stringify(messages).includes(diagnostic)));
+  assert.equal(f.parentRequests(),2,'one original request and one autonomous native followUp');
+  assert.equal(f.prompts.attempts,1,'no competing low-level prompt');
+  assert.ok(!JSON.stringify(f.prompts.contexts[0]).includes(diagnostic));
+  assert.equal(f.manager.getBranch().filter(e => e.customType==='pi-astraeus:claude-lifecycle').length,1);
+  assert.equal(f.manager.getBranch().filter(e => e.customType==='pi-astraeus:claude-wake').length,0);
+  assert.equal(f.manager.buildSessionContext().messages.filter(m => m.role==='user'&&m.content.some(c => c.text===user)).length,1);
+  await delay(150); assert.equal(f.parentRequests(),2,'stable polls cannot duplicate attention');
+  assert.deepEqual(f.errors,[]);
+});
+
+test('actual streaming lifecycle notice across reload remains a native followUp, not a competing prompt', async t => {
   const f=await notificationFixture(t,'working');
   f.prompts.hold=true;
   const user='Streaming original input';
   const outcome=f.session.prompt(user).then(() => ({ok:true}),error => ({error}));
   await until(() => f.parentRequests()===1);
   await assert.rejects(f.session.prompt('Ordinary concurrent input'),/Specify streamingBehavior/,'ordinary prompt errors are not masked');
+  await f.session.reload(); // A new delivery owner must retain the active run, not infer streaming from isIdle.
   f.record.state='blocked'; f.record.status='idle'; await f.publish(); await f.status();
   assert.deepEqual(f.notices[0].options,{deliverAs:'followUp',triggerTurn:true});
   assert.equal(f.parentRequests(),1,'followUp waits for the streaming turn');

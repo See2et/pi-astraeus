@@ -4,6 +4,7 @@ import {mkdtemp, mkdir, cp, writeFile, readFile, rm, symlink} from 'node:fs/prom
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {execFileSync} from 'node:child_process';
+import {setTimeout as delay} from 'node:timers/promises';
 import {parseFrontmatter} from '@earendil-works/pi-coding-agent';
 import {Workflow, ROOT} from '../extensions/core.mjs';
 import {ClaudeBackground, launchId, snapshot} from '../extensions/claude.mjs';
@@ -284,19 +285,162 @@ test('binding requires one exact UUID and canonical cwd, with minimal refusal ev
     f.state.records=records;
     const count=f.calls.length;
     await assert.rejects(f.cli.match(record.id,f.cwd,ID),error=>{
-      assert.equal(error.code,'CLAUDE_BINDING_REFUSED'); assert.equal(error.reason,reason);
+      const uncertainty = ['missing-record','missing-uuid','invalid-uuid','missing-cwd','invalid-cwd','cwd-unresolvable','unknown-response'].includes(reason);
+      assert.equal(error.code,uncertainty ? 'CLAUDE_OBSERVATION_UNCERTAIN' : 'CLAUDE_BINDING_REFUSED'); assert.equal(error.reason,reason);
       assert.equal(error.evidence.short_id,record.id); assert.equal(error.evidence.expected_uuid,ID);
       assert.ok(error.message.includes(reason)); assert.ok(error.message.length<1024);
       assert.ok(!error.message.includes('PRIVATE')); assert.ok(!error.message.includes('nonexistent'));
       return true;
     });
-    assert.equal(f.calls.length-count,1,'one public read, never readiness retry or mutation');
+    assert.equal(f.calls.length-count,1,'ordinary match is one public read, never a mutation');
+    if (['ambiguous-record','uuid-prefix-mismatch','expected-uuid-mismatch','conflicting-uuid-aliases','canonical-cwd-mismatch'].includes(reason)) {
+      const before=f.calls.length;
+      await assert.rejects(f.cli.ready(record.id,f.cwd,ID),error => error.code==='CLAUDE_BINDING_REFUSED' && error.reason===reason);
+      assert.equal(f.calls.length-before,1,'genuine conflict fails immediately even in readiness observation');
+    }
   }
   f.cli.invoke=async()=>({returncode:0,stdout:'{"private":"PRIVATE-MALFORMED',stderr:''});
   await assert.rejects(f.cli.match(record.id,f.cwd,ID),error=>{
     assert.equal(error.reason,'unknown-response'); assert.ok(!error.message.includes('PRIVATE')); return true;
   });
 });
+// Post-mutation readiness may lag the acknowledged command. These fixtures
+// change only public observations; never repeat a mutating invocation to recover.
+function delayedPublicRecords(f, observations) {
+  const invoke=f.cli.invoke;
+  let pending=[];
+  f.cli.readinessAttempts=3; f.cli.readinessInterval=1; f.cli.readinessTimeout=1000;
+  f.cli.invoke=async(command,args,cwd,...rest)=>{
+    if(args[0]==='agents'&&args[1]==='--json'&&pending.length) {
+      f.calls.push([...args]);
+      return {returncode:0,stdout:JSON.stringify(pending.shift()),stderr:''};
+    }
+    const result=await invoke(command,args,cwd,...rest);
+    if(args[0]==='--bg'||args[0]==='stop'&&args[1]!=='--help') pending=observations(args,structuredClone(f.state.records));
+    return result;
+  };
+}
+
+test('launch, stop, resume and exact copy cleanup tolerate bounded incomplete public readiness without repeated mutations',async t=>{
+  const f=await fixture(t);
+  delayedPublicRecords(f,(args,records)=> args[0]==='stop' ? [[],records.map(r=>({...r,pid:123,state:'working',status:'running'}))] :
+    [[],records.map(r=>({...r,sessionId:undefined,cwd:undefined}))]);
+  const job=await f.delegate(); assert.equal(job.cli.session_id,ID);
+  await f.report(job,{changed_files:[]}); f.idle();
+  assert.equal((await f.act({op:'collect',run_id:job.run_id})).valid,true);
+  const follow=await f.act({op:'resume',run_id:job.run_id,prompt:'Bounded unattended fix'});
+  assert.equal(follow.agent_id,job.agent_id); assert.equal(follow.collected,false);
+  await f.report(follow,{changed_files:[]}); f.idle();
+  assert.equal((await f.act({op:'collect',run_id:follow.run_id})).valid,true);
+  assert.equal(f.calls.filter(a=>a[0]==='--bg').length,2);
+  assert.equal(f.calls.filter(a=>a[0]==='stop'&&a[1]!=='--help').length,3,'one stop per collect and the required pre-resume stop');
+  f.state.copy=true;
+  await assert.rejects(f.act({op:'resume',run_id:follow.run_id,prompt:'Exact copy remains forbidden'}),/copied the owner/);
+  const refused=f.workflow.tasks.design.jobs.at(-1);
+  assert.equal(refused.cli.copy_frozen,true); assert.equal(refused.cli.session_id,ID); assert.equal(refused.valid,false);
+  assert.equal(f.calls.filter(a=>a[0]==='stop'&&a[1]===COPY.slice(0,8)).length,1);
+  assert.equal(f.calls.filter(a=>a[0]==='--bg'&&a[1]==='--resume').length,2);
+});
+
+for(const boundary of ['launch','stop','resume']) test(`${boundary} readiness exhaustion stays uncertain and unfrozen without repeated mutations`,async t=>{
+  const f=await fixture(t);
+  const invoke=f.cli.invoke; let failing=false, reads=0;
+  f.cli.readinessAttempts=3; f.cli.readinessInterval=1; f.cli.readinessTimeout=1000;
+  f.cli.invoke=async(command,args,cwd,...rest)=>{
+    if(failing&&args[0]==='agents'&&args[1]==='--json') {reads++; f.calls.push([...args]); return {returncode:0,stdout:'[]',stderr:''};}
+    const result=await invoke(command,args,cwd,...rest);
+    if(boundary==='launch'&&args[0]==='--bg'||boundary==='stop'&&args[0]==='stop'&&args[1]!=='--help'||boundary==='resume'&&args[0]==='--bg'&&args[1]==='--resume') failing=true;
+    return result;
+  };
+  let job;
+  if(boundary==='launch') await assert.rejects(f.delegate(),/readiness observation exhausted/);
+  else {
+    job=await f.delegate(); await f.report(job,{changed_files:[]}); f.idle();
+    if(boundary==='stop') {
+      const failed=await f.act({op:'collect',run_id:job.run_id});
+      assert.equal(failed.collected,false); assert.match(failed.error,/readiness observation exhausted/);
+    } else {
+      assert.equal((await f.act({op:'collect',run_id:job.run_id})).valid,true);
+      await assert.rejects(f.act({op:'resume',run_id:job.run_id,prompt:'Same original owner only'}),/readiness observation exhausted/);
+    }
+  }
+  const failed=f.workflow.tasks.design.jobs.at(-1);
+  assert.equal(failed.cli.frozen,false); assert.equal(failed.valid,false); assert.equal(failed.collected,false);
+  assert.equal(reads,3,'readiness query count is bounded');
+  assert.equal(f.calls.filter(a=>a[0]==='--bg').length,boundary==='resume'?2:1);
+  assert.equal(f.calls.filter(a=>a[0]==='stop'&&a[1]!=='--help').length,boundary==='launch'?0:boundary==='stop'?1:2);
+  if(boundary==='resume') {
+    const notices=[]; f.host.notify=n=>notices.push(n);
+    f.workflow.pollInterval=10; f.workflow.maxBackoff=100;
+    f.workflow.startMonitoring(f.ctx); t.after(()=>f.workflow.dispose());
+    // Recover solely from monitor ticks after a dispatched resume's exhausted
+    // readiness window. No parent tool/user input rescues the obligation.
+    failing=false; f.idle();
+    const deadline=Date.now()+2000;
+    while(!notices.length&&Date.now()<deadline) await delay(10);
+    assert.equal(notices.length,1); assert.equal(notices[0].run_id,failed.run_id); assert.equal(notices[0].status,'work-ended');
+    assert.equal(failed.collected,false); assert.equal(failed.cli.frozen,false);
+    await delay(40); assert.equal(notices.length,1);
+    assert.equal(f.calls.filter(a=>a[0]==='--bg'&&a[1]==='--resume').length,1);
+    await f.report(failed,{changed_files:[]});
+    assert.equal((await f.act({op:'collect',run_id:failed.run_id})).valid,true);
+  }
+});
+
+test('resume invocation followed by receipt failure remains uncollected and monitored, not inherited freeze',async t=>{
+  const f=await fixture(t), job=await f.delegate(); await f.report(job,{changed_files:[]}); f.idle();
+  await f.act({op:'collect',run_id:job.run_id});
+  const evidence=f.cli.evidence.bind(f.cli);
+  f.cli.evidence=async(...args)=>{
+    const result=await evidence(...args);
+    if(args[1]==='resume') throw new Error('Fixture post-invocation receipt failure');
+    return result;
+  };
+  await assert.rejects(f.act({op:'resume',run_id:job.run_id,prompt:'Original owner fix'}),/receipt failure/);
+  const follow=f.workflow.tasks.design.jobs.at(-1);
+  assert.equal(follow.cli.frozen,false); assert.equal(follow.collected,false); assert.equal(follow.valid,false);
+  assert.equal(f.state.records[0].state,'working');
+  assert.equal(f.calls.filter(a=>a[0]==='--bg'&&a[1]==='--resume').length,1);
+});
+
+test('readiness deadline and cancellation bound observation-only queries',async t=>{
+  const cwd=await mkdtemp(join(tmpdir(),'astraeus-readiness-')); t.after(()=>rm(cwd,{recursive:true,force:true}));
+  const calls=[], cli=new ClaudeBackground({readinessAttempts:100,readinessTimeout:40,readinessInterval:100,
+    invoke:async(_command,args)=>{calls.push(args); return {returncode:0,stdout:'[]',stderr:''};}});
+  await assert.rejects(cli.ready('12345678',cwd,ID),/exhausted/);
+  assert.equal(calls.length,1);
+  cli.readinessTimeout=1000;
+  const controller=new AbortController(), pending=cli.ready('12345678',cwd,ID,controller.signal);
+  setTimeout(()=>controller.abort(),20);
+  await assert.rejects(pending,/cancelled/); assert.equal(calls.length,2);
+  cli.readinessTimeout=30;
+  cli.invoke=async(_command,args)=>{calls.push(args); return new Promise(()=>{});};
+  const started=Date.now();
+  await assert.rejects(cli.ready('12345678',cwd,ID),/exhausted/);
+  assert.ok(Date.now()-started<300,'total readiness deadline also bounds a transport ignoring cancellation');
+  assert.equal(calls.length,3);
+  assert.ok(calls.every(a=>JSON.stringify(a)==='["agents","--json","--all"]'));
+});
+
+test('noninteractive designer contract accompanies both initial and original-owner follow-up handoffs',async t=>{
+  const f=await fixture(t),job=await f.delegate(); await f.report(job,{changed_files:[]}); f.idle();
+  await f.act({op:'collect',run_id:job.run_id});
+  const follow=await f.act({op:'resume',run_id:job.run_id,prompt:'Bounded original scope fix'});
+  const contract=await readFile(join(ROOT,'agents/astraeus-designer.md'),'utf8');
+  for(const args of f.calls.filter(a=>a[0]==='--bg')) {
+    const prompt=args.at(-1);
+    assert.ok(prompt.includes(contract),'canonical role is included, not just repository AGENTS guidance');
+    assert.match(prompt,/Never ask the user questions, request interactive input\/approval, or wait for chat/);
+    assert.match(prompt,/AskUserQuestion, plan approval, or interactive commands/);
+    assert.match(prompt,/safe assumptions within the original authorized scope/);
+    assert.match(prompt,/status: blocked/); assert.match(prompt,/options for root/);
+    assert.match(prompt,/not guaranteed runtime enforcement/);
+  }
+  const resume=f.calls.find(a=>a[0]==='--bg'&&a[1]==='--resume');
+  assert.deepEqual(resume,['--bg','--resume',ID,'--',resume.at(-1)],'no saved-setting or permission overrides');
+  assert.ok(resume.at(-1).includes(follow.cli.pending)); assert.ok(resume.at(-1).includes(follow.run_id));
+});
+
 test('same-short resume mismatch remains bound to original UUID and retains diagnostic across restore',async t=>{
   const f=await fixture(t),job=await f.delegate(); await f.report(job,{changed_files:[]}); f.idle();
   assert.equal((await f.act({op:'collect',run_id:job.run_id})).valid,true);

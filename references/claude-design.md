@@ -60,7 +60,15 @@ reconciliation approval. Denied/failed checks remain unsuccessful outcomes, neve
 justification to relax permissions. Existing authenticated
 CLI access remains a prerequisite; workspace trust is separate from tool permissions.
 The bundled designer definition is checked against installed role definitions and its
-contract is supplied in the handoff; native Pi tools/frontmatter are not CLI isolation.
+contract is supplied in both initial and follow-up CLI handoffs; native Pi tools/frontmatter
+are not CLI isolation. Background designers run unattended: never ask user questions,
+request interactive input/approval, use AskUserQuestion/plan approval/interactive commands,
+or wait for chat. For minor ambiguity, assume safely within the original authorized scope
+and report assumptions in the summary. Genuinely missing authority/input ends in the assigned
+run-specific JSON report with `status: "blocked"`, truthful checks, concrete blocker/options
+for root in `remaining`, and completed work preserved. Root handles user decisions. These
+prompt instructions are not guaranteed runtime enforcement and do not authorize permission
+changes, broader scope or automatic acceptance.
 
 Example delegate after authorized `start`:
 
@@ -93,9 +101,17 @@ SHA-256 fingerprints of canonical cwd paths when resolved. Malformed identity va
 raw paths, parser snippets and whole public records are not included. Fingerprints compare
 canonical paths, not directory contents. Same-short resume inspection supplies the original
 full UUID to this matcher; it cannot turn a conflicting identity into copy cleanup or a
-new owner. Inspection uses one bounded public query, with no readiness retry, inferred
-success from cwd/time, or automatic relaunch/resume. Without an error-time public record,
-a later matching record cannot reconstruct the earlier refusal or prove a transient race.
+new owner. Ordinary identity inspection uses one bounded public query. Only post-launch,
+post-resume and acknowledged post-stop readiness (including exact unexpected-copy cleanup)
+uses a bounded observation-only window: at most 10 queries within 5 seconds, with 100-ms
+cancellable waits and the existing per-query timeout/output bound. Missing/temporarily
+incomplete UUID/cwd fields, an unresolvable observed cwd, malformed/unavailable observations,
+and a not-yet-affirmative post-stop lifecycle are `CLAUDE_OBSERVATION_UNCERTAIN` on exhaustion,
+not identity-conflict evidence. Ambiguous records, conflicting UUID aliases, prefix/expected
+full-UUID mismatch and a different resolved canonical cwd remain `CLAUDE_BINDING_REFUSED`
+and fail immediately. The window never repeats launch/resume/stop, infers identity by
+cwd/time, freezes on unknown, adopts copies or fabricates evidence. A later matching record
+establishes current identity only; it cannot reconstruct an earlier unsaved conflict.
 Status/restore/active-job/review/accept gates track the CLI writer even without a native
 manager. Existing native designer jobs keep their recorded native behavior or require
 explicit recovery; they are never silently migrated to CLI.
@@ -104,7 +120,9 @@ Successful collection explicitly runs `claude stop <bound-short-id>` and retains
 exit-zero `stopped <bound-short-id>` acknowledgment before validating source/report.
 The public post-stop record must affirm `done`/`stopped`, no live pid, and idle or omitted
 status. Idle/done alone can still have a live process; it is not a writer freeze.
-Unknown or missing lifecycle does not become successful completion. Stop preserves files
+Unknown or missing lifecycle does not become successful completion. Readiness exhaustion
+leaves the writer unfrozen/uncollected and eligible for monitoring; acknowledgment alone is
+not affirmative freeze. Stop preserves files
 and conversation, but does not upgrade a blocked/failed report.
 
 Resume requires the latest collected/frozen run of the original owner and the existing
@@ -122,7 +140,10 @@ claude --bg --resume OBSERVED_FULL_UUID -- "Run-specific bounded follow-up"
 No configuration overrides (model, effort, settings, permission flags) are repeated:
 2.1.288 retains saved options, and overrides or a live idle session can cause a copy.
 The resume receipt must emit the original short ID and public inspection must confirm
-the identical full UUID/cwd. An unexpected emitted copy is verified and stopped exactly,
+the identical full UUID/cwd. A dispatched resume whose readiness observations exhaust the
+budget remains uncollected/unfrozen: session monitoring can later recover current lifecycle
+and notify root without another user prompt, never by redispatching resume or automatically
+collecting/accepting it. An unexpected emitted copy is verified and stopped exactly,
 with evidence retained; it never replaces the owner binding. Even a successfully stopped
 copy remains unsuccessful: its report cannot be collected as valid or used to authorize
 resume or acceptance, including when restoring state from an older version. If the
@@ -130,7 +151,10 @@ emitted different ID fails binding inspection, its short ID is retained as unver
 no blind stop, automatic rebinding from a later listing, or successful report collection
 is permitted. A failed/unknown copy stop keeps freezing unresolved. Inspect changes/evidence before recovery, never retry blindly.
 
-Deploying a new Pi package changes only new initial launches. Existing sessions retain
+Deploying new launch permission/worktree settings changes only new initial launches.
+Updated unattended handoff guidance is supplied on managed start/resume after normal package
+update and Pi reload, but is prompt guidance rather than guaranteed enforcement.
+Existing sessions retain
 their saved settings on resume; old launch receipts without `worktree.bgIsolation` do not
 acquire `none` retroactively. Old ownership-scoped permissions and the background
 worktree guard may therefore persist; repo-scoped permissions apply only to new initial
@@ -150,6 +174,25 @@ blocked, leave it unresolved and ask the user for an explicit recovery/migration
 rather than editing private sessions/config, overriding saved options or launching a
 replacement automatically. Historical offending records not retained cannot be recovered
 from a later status listing. No real affected-session resume is required for deployment QA.
+
+## Autonomous parent attention
+
+Session monitoring polls only each owner's latest uncollected run, independently of user
+input. Lifecycle transition notices are appended once. Streaming parents receive native
+follow-ups; preparation/manual compaction does not authorize a competing run. Public
+`AgentSession.prompt` and `sendCustomMessage` completion are observed under the pinned SDK,
+without editing upstream. Delivery remains pending until actual `agent_start`; handled or
+failed user/notification preparation retains that obligation. A session-owned idle timer
+retries with hidden attention wakes, backing off from 100 ms to 5 seconds, without a new
+prompt, status call or changed public record. It does not resubmit rejected user input.
+A complete extension reload retains the unconsumed obligation in the session-owned observer,
+not in the retired timer. The replacement owner recovers it when any unconsumed appended
+notice still belongs to the same session's public branch. Subsequent notices or workflow
+saves do not overwrite earlier anchors; branches retaining none of those notices and
+different sessions do not inherit its attention.
+Retired runtime owners cannot wake another branch/session. This is runtime adaptation,
+not guaranteed model obedience; SDK upgrades require compatibility verification. Polling
+and attention never automatically stop, collect, accept, replace or migrate designers.
 
 ## Retired generated-output reconciliation
 
