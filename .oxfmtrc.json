@@ -1,0 +1,14 @@
+{
+  "$schema": "./node_modules/oxfmt/configuration_schema.json",
+  "ignorePatterns": [
+    "pnpm-lock.yaml",
+    ".astraeus/",
+    "references/",
+    "schemas/",
+    "skills/",
+    "agents/",
+    "tests/python/",
+    "UPSTREAM.md",
+    "AGENTS.md"
+  ]
+}

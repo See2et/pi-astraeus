@@ -2,3 +2,5 @@ node_modules/
 .astraeus/
 __pycache__/
 *.pyc
+coverage/
+.stryker-tmp/

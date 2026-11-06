@@ -52,18 +52,18 @@ there is no mandatory plan command or fixed research/plan/implementation chain.
 `/astraeus` shows policy, available models and current tasks. `/astraeus TASK` narrows
 status to one task. Root uses the model-only `astraeus_workflow` tool as follows:
 
-| Operation | Required fields / behavior |
-|---|---|
-| `start` | `task_id`, `requirements`, `acceptance`; include constraints/non-goals/preserved contracts in `constraints`. `consequential` defaults true. Git repository root required. |
-| `authorize_design` | `task_id`, original explicit user quote in `design_request`, bounded `design_scope`; record once for an existing task. The same optional fields may be included at `start`. |
-| `delegate` | `task_id`, `role`, exact `model` provider/id, supported `thinking`, bounded `prompt`; worker/designer `owned_paths` are literal relative paths, default `.`. Designer optionally supplies `checks` (absent means `[]`). |
-| `collect` | `task_id`, `run_id`; reports running promptly, validates settled outcomes. No repeated tight polling. |
+| Operation             | Required fields / behavior                                                                                                                                                                                                                                                              |
+| --------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `start`               | `task_id`, `requirements`, `acceptance`; include constraints/non-goals/preserved contracts in `constraints`. `consequential` defaults true. Git repository root required.                                                                                                               |
+| `authorize_design`    | `task_id`, original explicit user quote in `design_request`, bounded `design_scope`; record once for an existing task. The same optional fields may be included at `start`.                                                                                                             |
+| `delegate`            | `task_id`, `role`, exact `model` provider/id, supported `thinking`, bounded `prompt`; worker/designer `owned_paths` are literal relative paths, default `.`. Designer optionally supplies `checks` (absent means `[]`).                                                                 |
+| `collect`             | `task_id`, `run_id`; reports running promptly, validates settled outcomes. No repeated tight polling.                                                                                                                                                                                   |
 | `reconcile_generated` | Deprecated compatibility alias for recollecting the latest original collected/frozen designer; no cache fingerprints/approval needed, `generated_outputs` ignored. Prefer `collect`. See [retired reconciliation](references/claude-design.md#retired-generated-output-reconciliation). |
-| `resume` | `task_id`, original worker/designer `run_id`, follow-up `prompt`; uses native Agent continuation for workers/legacy native designers, or exact stopped Claude UUID for CLI designers; never resumes a reviewer/adjudicator. |
-| `stop` | `task_id`, `run_id`; stops only this managed child, then collect its incomplete outcome. |
-| `status` | Optional `task_id`; checks current target and restores explicit incomplete states. |
-| `invalidate` | `task_id`; marks the reviewed target stale before new work. Does not waive pending children. |
-| `accept` | `task_id`; checks managed results and current review/court verdict. Root still examines scope, evidence and truth. No activation or deployment. |
+| `resume`              | `task_id`, original worker/designer `run_id`, follow-up `prompt`; uses native Agent continuation for workers/legacy native designers, or exact stopped Claude UUID for CLI designers; never resumes a reviewer/adjudicator.                                                             |
+| `stop`                | `task_id`, `run_id`; stops only this managed child, then collect its incomplete outcome.                                                                                                                                                                                                |
+| `status`              | Optional `task_id`; checks current target and restores explicit incomplete states.                                                                                                                                                                                                      |
+| `invalidate`          | `task_id`; marks the reviewed target stale before new work. Does not waive pending children.                                                                                                                                                                                            |
+| `accept`              | `task_id`; checks managed results and current review/court verdict. Root still examines scope, evidence and truth. No activation or deployment.                                                                                                                                         |
 
 Role definitions must match the bundled contracts, including aliases under other
 filenames, so project overrides cannot quietly change tools or pin another model.
@@ -282,11 +282,26 @@ and are not automatically uploaded.
 ## Development and verification
 
 ```
-npm ci --ignore-scripts
-npm run typecheck
-uv run --with 'jsonschema>=4.23,<5' python -m unittest discover -s tests/python -v
-uv run --with 'jsonschema>=4.23,<5' python -c 'import os,subprocess,sys; os.environ["PI_ASTRAEUS_PYTHON"]=sys.executable; sys.exit(subprocess.call(["npm","test"]))'
+pnpm install --frozen-lockfile
+pnpm check
 ```
+
+Use Bun 1.3.13+ and the pinned pnpm version. `check` runs Oxfmt, Oxlint,
+strict production TypeScript checking, dependency-cruiser, Vitest, and the retained
+Python validator tests (Python with jsonschema 4.x must be available). If needed:
+
+```
+uv run --with 'jsonschema>=4.23,<5' python -c 'import os,subprocess,sys; os.environ["PI_ASTRAEUS_PYTHON"]=sys.executable; sys.exit(subprocess.call(["bun","run","check"]))'
+```
+
+Installation prepares the Husky pre-commit hook: lint-staged formats staged code
+with Oxfmt and rejects Oxlint warnings. Vendored policy/schema files are excluded
+from formatting. Domain policies in `src/domain` own routing, review/correction and
+completion rules; `src/application` coordinates them through ports, and
+`src/infrastructure` supplies filesystem, Python and CLI adapters. Dependency-cruiser
+rejects outward domain/application imports and cycles. Pi still loads
+`extensions/index.ts`. Vitest retains JavaScript integration fixtures, including
+intentionally malformed legacy state; all production modules are strict TypeScript.
 
 Registration-level context regressions use 15,173 synthetic baseline files, legacy
 retained tool responses, startup/compaction hooks and many long tasks/jobs/findings.
