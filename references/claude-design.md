@@ -28,7 +28,10 @@ Opus owns discovery, design choices, related UI implementation, ordinary verific
 and adopted fixes. Preserve composition, typography, color, assets and motion decisions
 unless explicit user requirements or concrete functional constraints require change.
 Give outcomes, references and real contracts, not root's preferred visual solution.
-Follow-ups use the original owner, not a replacement GPT implementer. Fresh GPT review
+Follow-ups normally use the original owner, never a replacement GPT implementer.
+Explicit fresh-owner succession is permitted only after verified cessation, preserving
+the designer role, exact model/effort, transport, authorized scope, checks and history;
+record predecessor, reason and requirements/code/check/unresolved-decision handoff. Fresh GPT review
 assesses the user brief, usable behavior/contracts and rendered artifacts without turning
 GPT taste into requirements. Astra remains preferred for visual acceptance; missing
 Astra/render access must be disclosed. A report or source review is not visual acceptance.
@@ -205,7 +208,9 @@ current collection/acceptance gates. No historical observations or success are f
 `reconcile_generated` remains a deprecated compatibility alias for recollection of the
 latest original collected/frozen designer; `generated_outputs` is ignored. Prefer `collect`.
 Exact identity/freeze/evidence/report checks and fresh native review/adjudication gates
-remain. No replacement owner, permission override or saved-session migration is performed.
+remain. Recollection does not replace the owner, override permissions or migrate saved
+sessions. Explicit fresh-owner succession uses the separate verified-cessation handoff
+contract in [policy](policy.md).
 
 Editing this repository does not reload an already running installed Nix package/tool.
 The user must arrange the normal package update and fresh Pi process/reload before the
@@ -290,7 +295,8 @@ current-target review, not attribution against an old run baseline. Failed evide
 available; stopping never repairs an invalid report automatically.
 
 Collection is not final acceptance. Consequential work still needs fresh native GPT
-review, optional separate adjudication only after complete changes_required, root diff
+review, independent adjudication for disputed complete changes_required findings (clear
+bounded requirement-backed fixes may go to owner assessment), root diff
 and evidence examination, and current-source rechecks. The managed review target hashes
 HEAD, tracked staged/unstaged diffs and nonignored untracked files; ignored outputs and
 external services need separate evidence. If relevant source lies outside the managed

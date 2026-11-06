@@ -52,6 +52,7 @@ async function fixture(t) {
       id,
       type: p.type,
       description: p.options.description,
+      prompt: p.prompt,
       isBackground: p.options.isBackground,
       status: "running",
       session: { model: p.options.model, thinkingLevel: p.options.thinkingLevel },
@@ -129,6 +130,513 @@ async function fixture(t) {
   return { cwd, agentDir, workflow, ctx, act, delegate, report, complete, records, host };
 }
 
+test("persistent explicit mapping prevents reworded findings resurrecting; reopening needs new evidence", async (t) => {
+  const f = await fixture(t);
+  const first = await f.delegate("reviewer");
+  const data = f.report(first);
+  data.verdict = "changes_required";
+  data.bugs = [{ location: "source.txt", claim: "Not required", evidence: "Old example" }];
+  f.complete(first, data);
+  await f.act({ op: "collect", run_id: first.run_id });
+  const disposition = await f.act({
+    op: "disposition",
+    run_id: first.run_id,
+    ref: "bugs/0",
+    action: "optional",
+    route: "clear",
+    authority: "Acceptance scope",
+    rationale: "Polish, not required",
+    evidence: "No contract impact",
+  });
+  f.workflow.restore(f.ctx);
+  assert.equal(f.workflow.tasks.task.dispositions[0].id, disposition.id);
+  await writeFile(join(f.cwd, "source.txt"), "unrelated target change\n");
+  const next = await f.delegate("reviewer");
+  assert.match(f.records.get(next.agent_id).prompt, new RegExp(disposition.id));
+  const repeated = f.report(next);
+  repeated.verdict = "changes_required";
+  repeated.violations = [
+    {
+      location: "source.txt",
+      claim: "Different words and ID",
+      evidence: "Old example",
+      prior_decision: disposition.id,
+    },
+  ];
+  f.complete(next, repeated);
+  assert.equal((await f.act({ op: "collect", run_id: next.run_id })).valid, true);
+  assert.equal((await f.act({ op: "accept" })).accepted, true);
+  await assert.rejects(
+    f.act({
+      op: "disposition",
+      run_id: next.run_id,
+      ref: "violations/0",
+      action: "adopt",
+      route: "clear",
+      prior_decision: disposition.id,
+      authority: "Requirement",
+      rationale: "New wording",
+      evidence: "Old example",
+    }),
+    /new evidence|relevant code/,
+  );
+  const reopened = await f.act({
+    op: "disposition",
+    run_id: next.run_id,
+    ref: "violations/0",
+    action: "adopt",
+    route: "clear",
+    prior_decision: disposition.id,
+    authority: "Requirement",
+    rationale: "Concrete regression",
+    evidence: "New failing input",
+    reopening: "Input X now violates requirement Y",
+  });
+  assert.equal(reopened.prior_decision, disposition.id);
+  await assert.rejects(f.act({ op: "accept" }), /blocking|adopted/);
+});
+test("route-only reblocking of nonblocking decisions needs traceable new evidence", async (t) => {
+  const f = await fixture(t),
+    review = await f.delegate("reviewer"),
+    data = f.report(review);
+  data.verdict = "changes_required";
+  data.bugs = [{ location: "source.txt", claim: "Optional idea", evidence: "Example" }];
+  f.complete(review, data);
+  await f.act({ op: "collect", run_id: review.run_id });
+  const decision = await f.act({
+    op: "disposition",
+    run_id: review.run_id,
+    ref: "bugs/0",
+    action: "optional",
+    route: "clear",
+    authority: "Scope",
+    rationale: "Not required",
+    evidence: "Existing example",
+  });
+  for (const action of ["optional", "reject"]) {
+    await assert.rejects(
+      f.act({
+        op: "disposition",
+        run_id: review.run_id,
+        ref: "bugs/0",
+        prior_decision: decision.id,
+        action,
+        route: "disputed",
+        authority: "Scope",
+        rationale: "Same claim disputed",
+        evidence: "Existing example",
+      }),
+      /Reopening requires/,
+    );
+  }
+  assert.equal((await f.act({ op: "accept" })).accepted, true);
+  const reopened = await f.act({
+    op: "disposition",
+    run_id: review.run_id,
+    ref: "bugs/0",
+    prior_decision: decision.id,
+    action: "optional",
+    route: "disputed",
+    authority: "Requirement X",
+    rationale: "Concrete conflict needs adjudication",
+    evidence: "New input X fails contract Y",
+    reopening: "Input X is new evidence of requirement impact",
+  });
+  assert.equal(reopened.prior_decision, decision.id);
+  await assert.rejects(f.act({ op: "accept" }), /disputed/);
+});
+for (const adopted of [false, true]) {
+  test(`historical ${adopted ? "adopted" : "unmapped"} blocker survives later pass without owner resolution`, async (t) => {
+    const f = await fixture(t),
+      review = await f.delegate("reviewer"),
+      data = f.report(review);
+    data.verdict = "changes_required";
+    data.bugs = [{ location: "source.txt", claim: "Contract failure", evidence: "Input X" }];
+    f.complete(review, data);
+    await f.act({ op: "collect", run_id: review.run_id });
+    if (adopted)
+      await f.act({
+        op: "disposition",
+        run_id: review.run_id,
+        ref: "bugs/0",
+        action: "adopt",
+        route: "clear",
+        authority: "Requirement X",
+        rationale: "Bounded fix",
+        evidence: "Input X fails",
+      });
+    const later = await f.delegate("reviewer");
+    f.complete(later, f.report(later));
+    await f.act({ op: "collect", run_id: later.run_id });
+    await assert.rejects(f.act({ op: "accept" }), /historical|outstanding|owner assessment/);
+    await f.act({ op: "stop", run_id: review.run_id });
+    await f.act({ op: "collect", run_id: review.run_id });
+    await assert.rejects(f.act({ op: "accept" }), /historical|outstanding|owner assessment/);
+  });
+}
+test("current-report mapping can resolve an old unmapped blocker after source changed", async (t) => {
+  const f = await fixture(t),
+    review = await f.delegate("reviewer"),
+    data = f.report(review);
+  data.verdict = "changes_required";
+  data.bugs = [{ location: "source.txt", claim: "Unsupported contract", evidence: "Input X" }];
+  f.complete(review, data);
+  await f.act({ op: "collect", run_id: review.run_id });
+  await writeFile(join(f.cwd, "source.txt"), "new current target\n");
+  const current = await f.delegate("reviewer"),
+    pass = f.report(current);
+  pass.suggestions = ["Previous claim is optional: no agreed requirement supports it"];
+  f.complete(current, pass);
+  await f.act({ op: "collect", run_id: current.run_id });
+  const mapped = await f.act({
+    op: "disposition",
+    run_id: current.run_id,
+    ref: "suggestions/0",
+    prior_finding: `${review.run_id}/bugs/0`,
+    action: "reject",
+    route: "clear",
+    authority: "Agreed scope",
+    rationale: "Current review disproves requirement claim",
+    evidence: "Contract has no such obligation; current source inspected",
+  });
+  assert.equal(mapped.prior_finding, `${review.run_id}/bugs/0`);
+  assert.equal((await f.act({ op: "accept" })).accepted, true);
+  assert.equal(f.workflow.tasks.task.dispositions[0].review_hash, current.result_hash);
+  await writeFile(review.artifact, "{}");
+  await assert.rejects(f.act({ op: "accept" }), /bytes changed/);
+});
+for (const changed of [false, true]) {
+  test(`supported owner ${changed ? "correction" : "assessment/refutation"} followed by fresh review discharges adopted blocker`, async (t) => {
+    const f = await fixture(t),
+      owner = await f.delegate("worker");
+    f.complete(owner, "Initial work and checks");
+    await f.act({ op: "collect", run_id: owner.run_id });
+    const review = await f.delegate("reviewer"),
+      data = f.report(review);
+    data.verdict = "changes_required";
+    data.bugs = [
+      { location: "source.txt", claim: "Input X contract failure", evidence: "Input X" },
+    ];
+    f.complete(review, data);
+    await f.act({ op: "collect", run_id: review.run_id });
+    const decision = await f.act({
+      op: "disposition",
+      run_id: review.run_id,
+      ref: "bugs/0",
+      action: "adopt",
+      route: "clear",
+      authority: "Requirement X",
+      rationale: "Bounded owner assessment",
+      evidence: "Input X fails",
+    });
+    const follow = await f.act({
+      op: "resume",
+      run_id: owner.run_id,
+      prompt: "Assess X, correct or refute with evidence and verify",
+    });
+    assert.deepEqual(follow.assessed_decisions, [decision.id]);
+    if (changed) await writeFile(join(f.cwd, "source.txt"), "corrected X\n");
+    f.complete(
+      follow,
+      changed
+        ? "Corrected X; input X verification passed"
+        : "Refuted X using agreed contract; input X verification passed",
+    );
+    await f.act({ op: "collect", run_id: follow.run_id });
+    const fresh = await f.delegate("reviewer");
+    f.complete(fresh, f.report(fresh));
+    await f.act({ op: "collect", run_id: fresh.run_id });
+    assert.equal((await f.act({ op: "accept" })).accepted, true);
+    if (!changed) {
+      const optional = await f.act({
+        op: "disposition",
+        run_id: review.run_id,
+        ref: "bugs/0",
+        action: "optional",
+        route: "clear",
+        authority: "Scope",
+        rationale: "Earlier refutation accepted",
+        evidence: "Agreed contract has no obligation",
+      });
+      await f.act({
+        op: "disposition",
+        run_id: review.run_id,
+        ref: "bugs/0",
+        prior_decision: optional.id,
+        action: "adopt",
+        route: "clear",
+        authority: "New contract evidence",
+        rationale: "New input warrants reassessment",
+        evidence: "New input Z violates agreed requirement",
+        reopening: "Input Z was not included in prior assessment",
+      });
+      await assert.rejects(f.act({ op: "accept" }), /Outstanding historical blocker/);
+    }
+  });
+}
+test("disputed findings cannot use direct routing and unmapped blocking findings still block", async (t) => {
+  const f = await fixture(t),
+    review = await f.delegate("reviewer");
+  const data = f.report(review);
+  data.verdict = "changes_required";
+  data.bugs = [{ location: "source.txt", claim: "Disputed contract", evidence: "Example" }];
+  f.complete(review, data);
+  await f.act({ op: "collect", run_id: review.run_id });
+  await f.act({
+    op: "disposition",
+    run_id: review.run_id,
+    ref: "bugs/0",
+    action: "adopt",
+    route: "disputed",
+    authority: "Uncertain scope",
+    rationale: "Interpretation disputed",
+    evidence: "Example",
+  });
+  await assert.rejects(f.act({ op: "accept" }), /adjudication|disputed/);
+  await assert.rejects(
+    f.act({
+      op: "disposition",
+      run_id: review.run_id,
+      ref: "bugs/0",
+      action: "reject",
+      route: "clear",
+      authority: "Root",
+      rationale: "Shortcut",
+      evidence: "Example",
+    }),
+    /adjudication|disputed/,
+  );
+});
+test("root can map reviewer-missed duplicates, but new unmapped blockers do not silently pass", async (t) => {
+  const f = await fixture(t),
+    first = await f.delegate("reviewer");
+  const data = f.report(first);
+  data.verdict = "changes_required";
+  data.bugs = [{ location: "source.txt", claim: "Optional idea", evidence: "Example" }];
+  f.complete(first, data);
+  await f.act({ op: "collect", run_id: first.run_id });
+  const prior = await f.act({
+    op: "disposition",
+    run_id: first.run_id,
+    ref: "bugs/0",
+    action: "reject",
+    route: "clear",
+    authority: "Agreed scope",
+    rationale: "Not required",
+    evidence: "No affected requirement",
+  });
+  const next = await f.delegate("reviewer"),
+    repeated = f.report(next);
+  repeated.verdict = "changes_required";
+  repeated.bugs = [{ location: "source.txt", claim: "Same idea, no link", evidence: "Example" }];
+  f.complete(next, repeated);
+  await f.act({ op: "collect", run_id: next.run_id });
+  await assert.rejects(f.act({ op: "accept" }), /adjudication/);
+  await f.act({
+    op: "disposition",
+    run_id: next.run_id,
+    ref: "bugs/0",
+    prior_decision: prior.id,
+    action: "reject",
+    route: "clear",
+    authority: "Agreed scope",
+    rationale: "Explicit same finding mapping",
+    evidence: "Same unaffected contract",
+  });
+  assert.equal((await f.act({ op: "accept" })).accepted, true);
+});
+test("dispute survives later pass until fresh independent adjudication of its bound source", async (t) => {
+  const f = await fixture(t),
+    review = await f.delegate("reviewer"),
+    data = f.report(review);
+  data.verdict = "changes_required";
+  data.bugs = [{ location: "source.txt", claim: "Disputed requirement", evidence: "Input" }];
+  f.complete(review, data);
+  await f.act({ op: "collect", run_id: review.run_id });
+  await f.act({
+    op: "disposition",
+    run_id: review.run_id,
+    ref: "bugs/0",
+    action: "adopt",
+    route: "disputed",
+    authority: "Requirement uncertain",
+    rationale: "Needs independent assessment",
+    evidence: "Input",
+  });
+  const later = await f.delegate("reviewer");
+  f.complete(later, f.report(later));
+  await f.act({ op: "collect", run_id: later.run_id });
+  await assert.rejects(f.act({ op: "accept" }), /disputed/);
+  const judge = await f.delegate("adjudicator", { run_id: review.run_id });
+  f.complete(judge, {
+    schema_version: 1,
+    kind: "adjudication",
+    task_id: "task",
+    target_id: judge.target_id,
+    status: "complete",
+    verdict: "accept",
+    summary: "Claim disproven",
+    review_sha256: review.result_hash,
+    decisions: [
+      {
+        ref: "bugs/0",
+        action: "reject",
+        basis: "Agreed scope",
+        rationale: "No obligation",
+        evidence: "Inspected contract",
+      },
+    ],
+    checked_scope: ["source.txt"],
+    evidence: ["Contract"],
+    unresolved: [],
+  });
+  const collected = await f.act({ op: "collect", run_id: judge.run_id });
+  assert.equal(collected.valid, true, collected.error);
+  assert.equal((await f.act({ op: "accept" })).accepted, true);
+});
+test("fresh owner succession needs verified cessation and successor failure cannot hide behind predecessor", async (t) => {
+  const f = await fixture(t),
+    owner = await f.delegate("worker");
+  f.records.delete(owner.agent_id);
+  await f.act({ op: "collect", run_id: owner.run_id });
+  await assert.rejects(
+    f.delegate("worker", {
+      predecessor_run: owner.run_id,
+      handoff: "Current code, checks and unresolved work",
+      reason: "Owner unavailable",
+    }),
+    /cessation|stopped|writes/,
+  );
+  f.records.set(owner.agent_id, {
+    status: "stopped",
+    type: "astraeus-worker",
+    session: { model: MODEL, thinkingLevel: "high" },
+  });
+  const successor = await f.delegate("worker", {
+    predecessor_run: owner.run_id,
+    handoff: "Current code and checks; discharge all predecessor work",
+    reason: "Owner cannot continue",
+  });
+  assert.equal(successor.predecessor_run, owner.run_id);
+  f.records.get(successor.agent_id).status = "failed";
+  await f.act({ op: "collect", run_id: successor.run_id });
+  await assert.rejects(f.act({ op: "accept" }), /owner.*failed|incomplete/);
+  const corrected = await f.act({
+    op: "resume",
+    run_id: successor.run_id,
+    prompt: "Complete inherited work and verify",
+  });
+  f.complete(corrected, "Completed all inherited obligations and verified");
+  await f.act({ op: "collect", run_id: corrected.run_id });
+  const review = await f.delegate("reviewer");
+  f.complete(review, f.report(review));
+  await f.act({ op: "collect", run_id: review.run_id });
+  assert.equal((await f.act({ op: "accept" })).accepted, true);
+});
+test("clear requirement-backed fix routes to owner assessment, preserving source binding", async (t) => {
+  const f = await fixture(t),
+    owner = await f.delegate("worker");
+  f.complete(owner, "Implemented and checked");
+  await f.act({ op: "collect", run_id: owner.run_id });
+  const review = await f.delegate("reviewer"),
+    data = f.report(review);
+  data.verdict = "changes_required";
+  data.bugs = [{ location: "source.txt", claim: "Fails agreed input", evidence: "Input X" }];
+  f.complete(review, data);
+  await f.act({ op: "collect", run_id: review.run_id });
+  await f.act({
+    op: "disposition",
+    run_id: review.run_id,
+    ref: "bugs/0",
+    action: "adopt",
+    route: "clear",
+    authority: "Agreed requirement X",
+    rationale: "Bounded correction",
+    evidence: "Input X expected Y",
+  });
+  const correction = await f.act({
+    op: "resume",
+    run_id: owner.run_id,
+    prompt: "Assess finding; fix or explain smaller repair with evidence",
+  });
+  assert.equal(correction.resume_from, owner.run_id);
+  f.complete(correction, "Corrected and verified");
+  await f.act({ op: "collect", run_id: correction.run_id });
+  await writeFile(review.artifact, "{}");
+  await assert.rejects(f.delegate("reviewer"), /bytes changed/);
+});
+test("uncertain native resume cannot accept a completed predecessor's output as successor success", async (t) => {
+  const f = await fixture(t),
+    owner = await f.delegate("worker");
+  f.complete(owner, "Previous run succeeded");
+  await f.act({ op: "collect", run_id: owner.run_id });
+  f.ctx.executeTool = async () => {
+    throw new Error("resume response lost before launch confirmation");
+  };
+  await assert.rejects(
+    f.act({ op: "resume", run_id: owner.run_id, prompt: "New obligation" }),
+    /response lost/,
+  );
+  const follow = f.workflow.tasks.task.jobs.at(-1);
+  assert.equal(follow.dispatch, "uncertain");
+  const collected = await f.act({ op: "collect", run_id: follow.run_id });
+  assert.equal(collected.valid, false);
+  assert.match(collected.error, /predecessor/);
+  await assert.rejects(f.act({ op: "accept" }), /owner.*failed|incomplete/);
+});
+test("unbound uncertain launch remains blocked after collection; no blind redispatch", async (t) => {
+  const f = await fixture(t);
+  f.host.events.handlers.set(
+    "subagents:rpc:spawn",
+    new Set([
+      (p) => {
+        f.host.events.emit(`subagents:rpc:spawn:reply:${p.requestId}`, {
+          success: false,
+          error: "ambiguous launch without callback",
+        });
+      },
+    ]),
+  );
+  await assert.rejects(f.delegate("worker"), /ambiguous launch/);
+  const job = f.workflow.tasks.task.jobs.at(-1);
+  assert.equal(job.dispatch, "uncertain");
+  await f.act({ op: "collect", run_id: job.run_id });
+  await assert.rejects(
+    f.delegate("worker", {
+      predecessor_run: job.run_id,
+      reason: "Unavailable",
+      handoff: "Code/checks/unresolved obligations",
+    }),
+    /no blind retry/,
+  );
+});
+test("partial dispatch exposes exact run and blocks blind retry; invalid calls preserve state", async (t) => {
+  const f = await fixture(t);
+  f.host.events.handlers.set(
+    "subagents:rpc:spawn",
+    new Set([
+      (p) => {
+        p.options.onSpawned("partial-owner");
+        f.records.set("partial-owner", { status: "running" });
+        f.host.events.emit(`subagents:rpc:spawn:reply:${p.requestId}`, {
+          success: false,
+          error: "post-spawn failure",
+        });
+      },
+    ]),
+  );
+  await assert.rejects(f.delegate("worker"), /post-spawn failure/);
+  const recovery = f.workflow.recovery({ op: "delegate", task_id: "task" }, "post-spawn failure");
+  assert.equal(recovery.run_id, f.workflow.tasks.task.jobs[0].run_id);
+  assert.equal(recovery.recovery[0].dispatch, "confirmed");
+  assert.match(recovery.recovery[0].blocked.join(" "), /blind retry/);
+  await assert.rejects(f.delegate("worker"), /disjoint/);
+  await assert.rejects(f.act({ op: "collect", run_id: "wrong" }), /Unknown run/);
+  assert.equal(
+    f.workflow.recovery({ op: "collect", task_id: "task", run_id: "wrong" }, "invalid").phase,
+    "implementation",
+  );
+});
 test("exact model selection rejects fuzzy names, unavailable routes and prohibited models", () => {
   const registry = { getAvailable: () => [MODEL] };
   const policy = { allowed_models: ["gpt-6.1-sol"] };
@@ -286,7 +794,104 @@ test("changes_required requires fresh adjudication; rejected findings can accept
   assert.equal(result.valid, true, result.error);
   assert.equal((await f.act({ op: "accept" })).accepted, true);
   await assert.rejects(f.delegate("adjudicator"), /already has/);
+  // Restored v1 reports may predate persisted disposition history.
+  delete f.workflow.tasks.task.dispositions;
+  const fresh = await f.delegate("reviewer");
+  f.complete(fresh, f.report(fresh));
+  await f.act({ op: "collect", run_id: fresh.run_id });
+  assert.equal((await f.act({ op: "accept" })).accepted, true);
 });
+for (const gap of ["unresolved", "coverage"]) {
+  test(`inconclusive adjudication ${gap} survives imported rejects, override and later pass until supported recovery`, async (t) => {
+    const f = await fixture(t),
+      owner = await f.delegate("worker");
+    f.complete(owner, "Initial implementation and verification");
+    await f.act({ op: "collect", run_id: owner.run_id });
+    const review = await f.delegate("reviewer"),
+      data = f.report(review);
+    data.verdict = "changes_required";
+    data.bugs = [
+      { location: "source.txt", claim: "Unsupported original claim", evidence: "Original example" },
+    ];
+    f.complete(review, data);
+    await f.act({ op: "collect", run_id: review.run_id });
+    const judge = await f.delegate("adjudicator");
+    f.complete(judge, {
+      schema_version: 1,
+      kind: "adjudication",
+      task_id: "task",
+      target_id: judge.target_id,
+      status: "complete",
+      verdict: "inconclusive",
+      summary: "Original claim rejected but acceptance evidence incomplete",
+      review_sha256: review.result_hash,
+      decisions: [
+        {
+          ref: "bugs/0",
+          action: "reject",
+          basis: "Agreed requirement",
+          rationale: "Original claim disproven",
+          evidence: "Original example is allowed",
+        },
+      ],
+      checked_scope: gap === "coverage" ? [] : ["source.txt"],
+      evidence: gap === "coverage" ? [] : ["Original example inspected"],
+      unresolved:
+        gap === "unresolved"
+          ? ["New input Z may violate the agreed contract; obtain verification evidence"]
+          : [],
+    });
+    const collected = await f.act({ op: "collect", run_id: judge.run_id });
+    assert.equal(collected.valid, true, collected.error);
+    assert.equal(f.workflow.tasks.task.dispositions.at(-1).action, "reject");
+    assert.equal(f.workflow.tasks.task.dispositions.at(-1).adjudication_run, judge.run_id);
+    await assert.rejects(
+      f.act({ op: "accept" }),
+      /adjudication.*(pending|unresolved|coverage)|pending.*adjudication/i,
+    );
+    const omitted = await f.delegate("reviewer");
+    f.complete(omitted, f.report(omitted));
+    await f.act({ op: "collect", run_id: omitted.run_id });
+    await f.act({
+      op: "disposition",
+      run_id: review.run_id,
+      ref: "bugs/0",
+      action: "reject",
+      route: "clear",
+      authority: "Agreed scope",
+      rationale: "Original finding remains rejected",
+      evidence: "Same original requirement",
+    });
+    await assert.rejects(
+      f.act({ op: "accept" }),
+      /adjudication.*(pending|unresolved|coverage)|pending.*adjudication/i,
+    );
+    const follow = await f.act({
+      op: "resume",
+      run_id: owner.run_id,
+      prompt:
+        "Investigate adjudication report-level matters and supply missing verification/coverage evidence without widening scope",
+    });
+    assert.ok(follow.assessed_decisions.includes(`${judge.run_id}/report`));
+    f.complete(
+      follow,
+      "Assessed the bound adjudication report: input Z conforms to agreed contract; source.txt scope and local verification covered with passed results",
+    );
+    await f.act({ op: "collect", run_id: follow.run_id });
+    const fresh = await f.delegate("reviewer"),
+      pass = f.report(fresh);
+    assert.match(f.records.get(fresh.agent_id).prompt, new RegExp(judge.run_id));
+    assert.match(f.records.get(fresh.agent_id).prompt, /Assessed the bound adjudication report/);
+    pass.evidence = [
+      `Checked adjudication ${judge.run_id} report-level matters against owner evidence: input Z conforms; source.txt coverage and verification complete`,
+    ];
+    f.complete(fresh, pass);
+    await f.act({ op: "collect", run_id: fresh.run_id });
+    assert.equal((await f.act({ op: "accept" })).accepted, true);
+    await writeFile(judge.artifact, "{}");
+    await assert.rejects(f.act({ op: "accept" }), /bytes changed/);
+  });
+}
 test("inconclusive review cannot be waived through adjudication", async (t) => {
   const f = await fixture(t);
   const job = await f.delegate("reviewer");
@@ -989,6 +1594,6 @@ test("new task does not inherit design authorization; lost designer still blocks
   await assert.rejects(f.act({ op: "accept", task_id: "authorized" }), /unresolved/);
   await assert.rejects(
     f.act({ op: "resume", task_id: "authorized", run_id: job.run_id, prompt: "Recover" }),
-    /Original live child session unavailable/,
+    /Collect\/stop active work/,
   );
 });

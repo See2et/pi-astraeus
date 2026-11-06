@@ -21,24 +21,34 @@ start/resume for actual repositories under canonical `~/ghq`. Preserve unrelated
 config/auth/session values; this does not authorize auth or tool-permission changes.
 See [the trust boundary](claude-design.md#workspace-trust-preflight).
 
-Only a complete `changes_required` review triggers one separate fresh adjudicator
-before fixes or acceptance of the rejected target. A complete `pass` goes directly to
-root acceptance after review validation and current-target/evidence checks; optional
-suggestions do not trigger adjudication. Incomplete or `inconclusive` reviews need
-evidence or the next review round, not adjudication. Use one adjudicator per complete
-`changes_required` review; do not create reviewer/adjudicator debate loops or recursive
-acceptance agents. Failed, malformed, or interrupted attempts may be retried. Continue
-with corrected artifacts or new evidence as needed, without requesting user continuation
-solely because of an attempt count. Repeat checks only for a concrete issue or evidence
-gap; unresolved work remains incomplete.
-Trivial work that needs no independent review needs no adjudicator.
+A complete `pass` goes directly to root after validation and current-target/evidence
+checks. For complete `changes_required`, root may explicitly route clear, bounded,
+requirement-backed fixes to owner assessment using accountable dispositions. Disputed
+scope, interpretation or evidence requires a fresh independent adjudicator. Incomplete
+or `inconclusive` coverage needs evidence or another review; neither route may waive it.
+Optional or unsubstantiated ideas never add completion conditions. No fixed attempt
+limit or reviewer/adjudicator debate loops; retry only with concrete recovery/evidence,
+never blind-relaunch uncertain dispatch. Unresolved blocking work stays incomplete.
 
-Reviewer findings are proposals, not authorized requirements. Root checks an independent
-adjudicator's dispositions; only adopted fixes return to the original implementation
-owner. The user retains product scope authority. An adjudicator can reject unsupported
-claims, but cannot waive incomplete review coverage or invent approval to retire a
-real contract. See [adjudication](../skills/pi-astraeus-adjudicate/SKILL.md) and
-[requirements and tests](requirements-and-tests.md) for decision criteria.
+Findings are proposals, not requirements. Persist task-scoped `adopt`, `reject` and
+`optional` dispositions with authority, rationale, evidence and exact review/target
+binding. Fresh reviews inherit history and explicitly link repeated or reworded claims;
+root can supply a missing mapping. Rejected/optional findings cannot become blocking
+merely through new IDs, wording, severity or target hashes. Reopening needs a trace to
+the prior decision plus concrete new evidence or relevant code change. Root judges
+semantic identity and evidence; no fuzzy paraphrase detection is claimed. Unmapped
+blocking findings require assessment. Only adopted fixes return to the owner, who may
+refute the claim or propose a smaller remedy with evidence. See [contracts](contracts.md).
+
+Keep implementation and ordinary verification together. If the original owner cannot
+continue, explicit fresh-owner succession must record predecessor, reason and a handoff
+covering requirements, current code/check evidence and unresolved decisions. Verify old
+writes ceased before any new writer: exact CLI freeze/audit or native stopped/completed/
+failed host evidence, retained when observed. A missing native record alone is not proof.
+Never auto-stop writers. Preserve history, authorization, scope, transport and exact pins;
+no designer reuse as a general worker. The successor inherits all predecessor obligations;
+its success can discharge predecessor failure but not unrelated work, and its failure blocks
+acceptance. Otherwise recover the original handle or report a concrete blocked outcome.
 
 Use the extension's `astraeus_workflow` tool for start/status, delegate/collect,
 accept, and invalidate operations. Root remains the routing and acceptance owner.

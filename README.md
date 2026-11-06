@@ -14,8 +14,9 @@ This package does not implement authentication, a model runtime, or an OS sandbo
   and ordinary verification; reviewer/adjudicator have only `read,grep,find,ls`.
 - Upstream Astraeus schemas and Python validator, with provenance in `UPSTREAM.md`.
 
-Simple work stays solo. Important work gets fresh independent review; a complete
-`changes_required` review gets a separate fresh adjudicator. Root decides scope and
+Simple work stays solo. Important work gets fresh independent review; clear bounded
+requirement-backed fixes may go directly to owner assessment, while disputed scope,
+evidence or interpretation requires a separate fresh adjudicator. Root decides scope and
 final acceptance. A validated JSON report does not prove its claims are true.
 
 ## Installation
@@ -52,18 +53,19 @@ there is no mandatory plan command or fixed research/plan/implementation chain.
 `/astraeus` shows policy, available models and current tasks. `/astraeus TASK` narrows
 status to one task. Root uses the model-only `astraeus_workflow` tool as follows:
 
-| Operation             | Required fields / behavior                                                                                                                                                                                                                                                              |
-| --------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `start`               | `task_id`, `requirements`, `acceptance`; include constraints/non-goals/preserved contracts in `constraints`. `consequential` defaults true. Git repository root required.                                                                                                               |
-| `authorize_design`    | `task_id`, original explicit user quote in `design_request`, bounded `design_scope`; record once for an existing task. The same optional fields may be included at `start`.                                                                                                             |
-| `delegate`            | `task_id`, `role`, exact `model` provider/id, supported `thinking`, bounded `prompt`; worker/designer `owned_paths` are literal relative paths, default `.`. Designer optionally supplies `checks` (absent means `[]`).                                                                 |
-| `collect`             | `task_id`, `run_id`; reports running promptly, validates settled outcomes. No repeated tight polling.                                                                                                                                                                                   |
-| `reconcile_generated` | Deprecated compatibility alias for recollecting the latest original collected/frozen designer; no cache fingerprints/approval needed, `generated_outputs` ignored. Prefer `collect`. See [retired reconciliation](references/claude-design.md#retired-generated-output-reconciliation). |
-| `resume`              | `task_id`, original worker/designer `run_id`, follow-up `prompt`; uses native Agent continuation for workers/legacy native designers, or exact stopped Claude UUID for CLI designers; never resumes a reviewer/adjudicator.                                                             |
-| `stop`                | `task_id`, `run_id`; stops only this managed child, then collect its incomplete outcome.                                                                                                                                                                                                |
-| `status`              | Optional `task_id`; checks current target and restores explicit incomplete states.                                                                                                                                                                                                      |
-| `invalidate`          | `task_id`; marks the reviewed target stale before new work. Does not waive pending children.                                                                                                                                                                                            |
-| `accept`              | `task_id`; checks managed results and current review/court verdict. Root still examines scope, evidence and truth. No activation or deployment.                                                                                                                                         |
+| Operation             | Required fields / behavior                                                                                                                                                                                                                                                                                                               |
+| --------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `start`               | `task_id`, `requirements`, `acceptance`; include constraints/non-goals/preserved contracts in `constraints`. `consequential` defaults true. Git repository root required.                                                                                                                                                                |
+| `authorize_design`    | `task_id`, original explicit user quote in `design_request`, bounded `design_scope`; record once for an existing task. The same optional fields may be included at `start`.                                                                                                                                                              |
+| `delegate`            | `task_id`, `role`, exact `model` provider/id, supported `thinking`, bounded `prompt`; worker/designer `owned_paths` are literal relative paths, default `.`. Designer optionally supplies `checks` (absent means `[]`).                                                                                                                  |
+| `disposition`         | `task_id`, review `run_id`, exact `ref` (e.g. `bugs/0`), `action` (`adopt/reject/optional`), `route` (`clear/disputed`), `authority`, `rationale`, `evidence`. Optional `prior_decision` maps repeated findings; `reopening` identifies concrete new evidence/relevant code change. Disputed decisions require independent adjudication. |
+| `collect`             | `task_id`, `run_id`; reports running promptly, validates settled outcomes. No repeated tight polling.                                                                                                                                                                                                                                    |
+| `reconcile_generated` | Deprecated compatibility alias for recollecting the latest original collected/frozen designer; no cache fingerprints/approval needed, `generated_outputs` ignored. Prefer `collect`. See [retired reconciliation](references/claude-design.md#retired-generated-output-reconciliation).                                                  |
+| `resume`              | `task_id`, original worker/designer `run_id`, follow-up `prompt`; uses native Agent continuation for workers/legacy native designers, or exact stopped Claude UUID for CLI designers; never resumes a reviewer/adjudicator.                                                                                                              |
+| `stop`                | `task_id`, `run_id`; stops only this managed child, then collect its incomplete outcome.                                                                                                                                                                                                                                                 |
+| `status`              | Optional `task_id`; optional `run_id` and `ref` narrow jobs/dispositions when bounded views omit history. Checks current target and restores explicit incomplete states.                                                                                                                                                                 |
+| `invalidate`          | `task_id`; marks the reviewed target stale before new work. Does not waive pending children.                                                                                                                                                                                                                                             |
+| `accept`              | `task_id`; checks managed results and current review/dispositions. Root still examines scope, evidence and truth. No activation or deployment.                                                                                                                                                                                           |
 
 Role definitions must match the bundled contracts, including aliases under other
 filenames, so project overrides cannot quietly change tools or pin another model.
@@ -79,9 +81,10 @@ The managed flow is:
 implementation + ordinary verification (same owner)
   -> collect -> stable target -> fresh reviewer -> collect
      pass             -> root evidence/current-target checks -> accept
-     changes_required -> fresh adjudicator -> collect
-                          reject all -> root checks -> accept
-                          adopted fixes -> resume original worker -> fresh review
+     changes_required -> explicit root dispositions
+                          clear bounded fixes -> owner assessment/fix -> fresh review
+                          disputed -> fresh adjudicator -> collect -> disposition
+                          reject/optional all -> root checks -> accept
      inconclusive     -> obtain bounded missing evidence -> fresh review
 ```
 
@@ -91,6 +94,15 @@ adjudicator output is exactly one JSON object (one JSON fence is tolerated), mat
 the supplied schema. Readonly reviewers cannot write report artifacts; root captures
 and validates their returned bytes. Failed, malformed, interrupted or
 stale results stay incomplete. No fixed review-attempt cap is imposed.
+
+Finding dispositions persist across fresh reviews, bound to the original review bytes,
+run/ref and reviewed target. Reviewers use optional finding `prior_decision` links for
+reworded/new-ID duplicates; root can record missed mappings. Reject/optional cannot be
+reopened merely by a new ID, wording, severity or target hash: root must record concrete
+new evidence or relevant code change traced to the prior decision. This is explicit
+identity mapping, not automated semantic detection. Unmapped/adopted/disputed blocking
+findings still block acceptance; optional ideas do not expand completion conditions.
+See [contracts](references/contracts.md) for the v1-compatible result boundary.
 
 ## Explicit Claude design request
 
@@ -270,12 +282,24 @@ not abandoned branches. Pi session identity controls ownership; there is no extr
 session database. If a process restart loses a live Tintinweb child record, it is
 shown as unavailable, never successful. Collecting a lost attempt settles it as
 unsuccessful while preserving history, so a fresh reviewer can supply new evidence
-in the same task. Lost implementation work still blocks acceptance; use Tintinweb's
-saved-session/@handle recovery controls, since managed continuation requires the
-original live record/session. CLI designers restore their recorded transport and observed
+in the same task. Lost implementation work still blocks acceptance. Prefer Tintinweb's
+saved-session/@handle recovery for original-owner continuation. If the owner cannot
+continue, `delegate` may explicitly name `predecessor_run`, `reason` and `handoff`
+(requirements, current code/check evidence, unresolved decisions). A new writer requires
+verified old-write cessation: native stopped/completed/failed host evidence (retained
+when observed), or exact audited CLI freeze. Missing native records alone are not stop
+evidence; unprovable cessation intentionally blocks takeover. Preserve exact pins,
+transport, owned scope, design authorization and required checks. Successor success
+discharges inherited predecessor failures, not unrelated work; successor failure blocks.
+History and evidence remain intact. No automatic stop or blind uncertain-launch retry. CLI designers restore their recorded transport and observed
 UUID from task state, verify it via public `agents --json --all`, and never read private
 transcripts. Missing/unknown lifecycle is not completion and blocks writer freezing.
 Legacy native designer jobs stay native or require explicit recovery, never migrate.
+Errors and status expose bounded post-operation task/run state and allowed/blocked
+recovery steps: never dispatched, possibly launched, known running or collected
+unsuccessful. A partial launch is not a failed-to-launch guarantee; recover its exact
+host identity before any retry. Invalid calls retain task history. Legacy snapshots
+without dispatch/cessation/disposition fields remain conservative, not auto-migrated.
 Missing review evidence is never invented. Artifacts are local
 and are not automatically uploaded.
 

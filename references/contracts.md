@@ -25,7 +25,10 @@ Common fields: `schema_version: 1`, `kind`, `task_id`, `target_id`, `status`
 | review | `verdict`, `violations`, `bugs`, `suggestions`, `checked_scope`, `evidence`, `unresolved` |
 | adjudication | `verdict`, `review_sha256`, `decisions`, `checked_scope`, `evidence`, `unresolved` |
 
-Review findings contain `location`, `claim`, `evidence`. Suggestions are short strings.
+Review findings contain `location`, `claim`, `evidence`, and optionally `prior_decision`
+(the task-scoped saved disposition ID for the same finding, even with new wording/ID).
+Existing v1 reports without links remain valid; unmapped blocking claims remain blocking.
+Suggestions are short strings.
 `verdict` is `pass|changes_required|inconclusive`. Missing evidence/coverage or unresolved
 questions require inconclusive. A valid changes_required/inconclusive reply is useful
 data, not acceptance. The implementer returns what actually ran, including failures.
@@ -67,12 +70,53 @@ Neither path installs a model runtime.
 `--accept` supports review and adjudication. A review must be a complete `pass` with
 scope/evidence and no blocking or unresolved items; optional suggestions are allowed.
 Root may accept that target without adjudication after checking the evidence and current
-target. A complete `changes_required` review needs adjudication; an incomplete or
+target. The standalone validator is stateless: `--accept` on `changes_required` still
+requires an accepting adjudication. The managed workflow also supports explicit
+root dispositions bound to source bytes/run/ref/target, permitting clear bounded fixes
+to owner assessment and reject/optional-only acceptance after root checks. Disputed
+scope/evidence/interpretation requires independent adjudication; incomplete or
 `inconclusive` review needs evidence or the next review round. Strict review acceptance
 requires the reviewer host receipt via `--receipt`. Review v1 files remain valid inputs.
 For other roles omit `--accept`;
 inspect status and evidence before integration. No `--accept` means format/semantic
 validation only (exit 0 does NOT mean acceptance).
+
+Managed `disposition` takes `run_id`, `ref`, `action: adopt|reject|optional`,
+`route: clear|disputed`, `authority`, `rationale`, `evidence`; persisted entries include
+stable identity, source review hash and target. `prior_decision` explicitly maps a
+repeated finding, including a root-supplied mapping missed by the reviewer. For an older
+unmapped blocker, `prior_finding: "<review-run>/bugs/N"` (or `violations/N`) maps a current
+report item to that exact saved source; no old-target restoration or invented prior
+decision is required. Do not combine it with `prior_decision`. Both reports' original
+bytes/receipts remain bound and checked. Reopening reject/optional, whether by adoption
+or disputed routing, requires `reopening` describing concrete new evidence/relevant
+code change and distinct supporting evidence, not a new ID/wording/severity/target hash.
+Root judges substance; the tool checks trace/binding, not arbitrary semantic equivalence.
+Adjudication results are imported transactionally into the same history, preserving their
+source binding. History is inherited by fresh reviews and owner follow-ups; it cannot
+waive coverage or silently accept unmapped/adopted/disputed blockers. An unresolved
+blocker (including unmapped or adopted claims) survives a later pass that omits it.
+Reject/optional dispositions resolve claims explicitly. Otherwise, owner dispatch binds
+`assessed_decisions` to exact adopted decision IDs (or source-run/ref for legacy v1
+adjudication fixes); a collected successful owner report with assessment/check evidence
+and a subsequent fresh complete review are required. Reopening cannot reuse an earlier
+owner run's assessment. Root verifies the report's substance. Legacy state without this
+owner binding stays conservative and can use explicit current-report dispositions.
+
+Individual adjudication dispositions do not waive report-level pending matters. A retained
+complete adjudication with an inconclusive verdict, unresolved matters, or missing
+coverage/evidence remains an acceptance obligation, including legacy v1 results. Its
+`<adjudication-run>/report` token is assigned through the existing owner-assessment
+binding; collect supported assessment/refutation/correction and verification evidence,
+then obtain a fresh complete review of that evidence. Evidence-only recovery need not
+change code. Fresh reviewers receive the bound reports and reported owner evidence.
+A later pass, disposition override or omission alone cannot discharge the report; its
+original bytes/receipt remain checked after resolution. No history or useful individual
+decision is discarded. Root judges whether the supplied evidence actually resolves the
+matter within authorized scope. `delegate` adjudicator may
+select its original review via `run_id` if that reviewed target is still current; if
+source changed, obtain a fresh complete review linking the disputed claim first.
+`status(task_id, run_id, ref)` narrows omitted job/disposition history without changing it.
 
 The host receipt is separate from the child's contract. A child must not invent
 runtime confirmation. Strict adjudication requires `--assurance strict --receipt`

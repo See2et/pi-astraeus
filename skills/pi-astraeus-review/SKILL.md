@@ -5,8 +5,8 @@ description: Conduct an explicitly requested independent review, or the required
 
 # Independent review
 
-Root remains the final acceptance owner; a separate adjudicator decides which findings
-warrant action before fixes or acceptance. Read [policy](../../references/policy.md) and
+Root remains the final acceptance owner; disputed scope/evidence/interpretation needs
+separate adjudication, while clear bounded requirement-backed fixes may go to owner assessment. Read [policy](../../references/policy.md) and
 [contracts](../../references/contracts.md). Start after implementation and ordinary
 verification, against an identified stable target including relevant untracked files.
 
@@ -39,17 +39,22 @@ consumer failures still matter even when the request did not enumerate them.
 
 Return the review JSON contract. Separate requirement violations and concrete bugs
 from optional improvements. Every blocking finding needs a location, concrete claim,
-and evidence/reproduction. Do not turn preferences into bugs. Use `inconclusive` for
+and evidence/reproduction. Inherit persistent dispositions and link repeated/reworded or
+new-ID duplicates with `prior_decision`; root may map missed duplicates. Rejected/optional
+claims stay nonblocking absent concrete new evidence or relevant code change, explicitly
+traced to the prior decision. A target hash, severity or wording change alone is insufficient.
+Do not turn preferences into bugs. Use `inconclusive` for
 missing evidence or incomplete coverage, never a speculative pass.
 
 Root validates the reply and checks evidence against the current target. For a complete
 `pass`, validate with `--kind review --accept` and proceed to root acceptance without
 an adjudicator; optional suggestions do not trigger adjudication or block acceptance.
-Dispatch [adjudication](../pi-astraeus-adjudicate/SKILL.md) only for a complete `changes_required`
-review, before adopting fixes or accepting the rejected target. Do not automatically
-send findings to the implementer. Reviewer `pass` is not final acceptance; root still
+For complete `changes_required`, root records accountable adopt/reject/optional dispositions.
+Clear bounded requirement-backed fixes may go directly to owner assessment; disputed
+scope/evidence/interpretation requires [adjudication](../pi-astraeus-adjudicate/SKILL.md).
+Do not automatically send every finding to the implementer or expand completion criteria. Reviewer `pass` is not final acceptance; root still
 checks scope, evidence, assurance, and target identity. Pass is not required when
-complete findings are rejected on evidence by the adjudicator. Incomplete coverage/evidence cannot be waived. A process exit code or a
+complete findings have accountable reject/optional dispositions (root judges evidence). Incomplete coverage/evidence cannot be waived. A process exit code or a
 well-formed reply alone is not acceptance. Review existing user changes only to the
 extent required to assess the authorized change, and never claim credit for them.
 
@@ -58,7 +63,7 @@ not adjudication.
 
 There is no fixed total dispatch limit. Retry failed, interrupted, or malformed attempts
 as needed; incomplete or inconclusive results need evidence or another review. For adopted fixes, the original
-implementation owner edits and verifies; a fresh reviewer checks the accumulated target with emphasis on
+implementation owner (or explicit verified fresh-owner successor) assesses, edits and verifies; a fresh reviewer checks the accumulated target with emphasis on
 fixed issues and affected behavior. A renewed prompt may include prior findings as
 issues to verify, without asserting their resolution. Do not repeat unrelated checks.
 

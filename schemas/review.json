@@ -42,6 +42,7 @@
       "items": {
         "type": "object",
         "properties": {
+          "prior_decision": { "type": "string", "minLength": 1, "pattern": "\\S" },
           "location": {
             "type": "string",
             "minLength": 1,
@@ -71,6 +72,7 @@
       "items": {
         "type": "object",
         "properties": {
+          "prior_decision": { "type": "string", "minLength": 1, "pattern": "\\S" },
           "location": {
             "type": "string",
             "minLength": 1,

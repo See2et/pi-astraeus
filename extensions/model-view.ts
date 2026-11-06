@@ -17,7 +17,35 @@ const observed = {
   pid: scalar,
   ...settings,
 };
-const finding = { location: scalar, claim: scalar, evidence: scalar };
+const finding = { location: scalar, claim: scalar, evidence: scalar, prior_decision: scalar };
+const disposition = {
+  id: scalar,
+  finding_id: scalar,
+  review_run: scalar,
+  ref: scalar,
+  review_hash: scalar,
+  target_id: scalar,
+  action: scalar,
+  route: scalar,
+  authority: scalar,
+  rationale: scalar,
+  evidence: scalar,
+  prior_decision: scalar,
+  prior_finding: scalar,
+  reopening: scalar,
+  adjudication_run: scalar,
+};
+const recovery = {
+  run_id: scalar,
+  status: scalar,
+  collected: scalar,
+  valid: scalar,
+  dispatch: scalar,
+  lifecycle: scalar,
+  allowed: strings,
+  blocked: strings,
+  guidance: scalar,
+};
 const decision = {
   ref: scalar,
   action: scalar,
@@ -74,6 +102,14 @@ const job = {
   collected: scalar,
   target_id: scalar,
   review_run: scalar,
+  predecessor_run: scalar,
+  handoff: scalar,
+  succession_reason: scalar,
+  cessation: { source: scalar, status: scalar, agent_id: scalar },
+  dispatch: scalar,
+  resume_from: scalar,
+  resume_dispatch_started: scalar,
+  assessed_decisions: strings,
   artifact: scalar,
   result_hash: scalar,
   receipt_path: scalar,
@@ -96,13 +132,23 @@ const task = {
   target_id: scalar,
   accepted_target: scalar,
   note: scalar,
+  recovery: [recovery],
   jobs: [job],
+  dispositions: [disposition],
   requirements: scalar,
   acceptance: scalar,
   constraints: scalar,
   design_authorization: { scope: scalar, source: scalar, request: scalar },
 };
 const diagnostics = {
+  diagnostic: scalar,
+  error: scalar,
+  task_id: scalar,
+  run_id: scalar,
+  phase: scalar,
+  accepted: scalar,
+  recovery: [recovery],
+  allowed: strings,
   tasks: [task],
   policy: {
     schema_version: scalar,
@@ -113,8 +159,6 @@ const diagnostics = {
   available_models: strings,
   tintinweb_available: scalar,
   assurance_limit: scalar,
-  diagnostic: scalar,
-  error: scalar,
 };
 type Schema = "scalar" | Schema[] | { [key: string]: Schema };
 const bytes = (value: unknown) => Buffer.byteLength(JSON.stringify(value), "utf8");
@@ -150,7 +194,8 @@ export function modelView(value: any) {
       // Current runs must remain reachable even after a long workflow history.
       // Findings/evidence retain original order (refs such as bugs/0 stay useful).
       const selected =
-        value?.projection?.version !== 1 && (schema === task.jobs || schema === diagnostics.tasks)
+        value?.projection?.version !== 1 &&
+        (schema === task.jobs || schema === diagnostics.tasks || schema === task.dispositions)
           ? input.slice(-ARRAY_LIMIT).reverse()
           : input.slice(0, ARRAY_LIMIT);
       for (const item of selected) {
@@ -202,7 +247,18 @@ export function modelView(value: any) {
   }
   if (!tasks && Array.isArray(value?.jobs)) countJobs(value.jobs);
   if (!tasks && value?.run_id) countJobs([value]);
-  const schema = tasks ? diagnostics : value?.run_id ? job : value?.task_id ? task : diagnostics;
+  const schema =
+    value?.diagnostic && value?.recovery
+      ? diagnostics
+      : value?.finding_id
+        ? disposition
+        : tasks
+          ? diagnostics
+          : value?.run_id
+            ? job
+            : value?.task_id
+              ? task
+              : diagnostics;
   const output = project(Array.isArray(value) ? { tasks: value } : value, schema) ?? {};
   output.projection = {
     version: 1,
@@ -216,7 +272,7 @@ export function modelView(value: any) {
         }
       : totals,
     recovery:
-      "Bounded orchestration view, not full evidence or acceptance. Tasks/jobs show newest first, at most 12 each. Use status(task_id) to narrow omitted tasks; read referenced result/receipt/lifecycle artifacts in bounded slices. Full baseline remains in non-context custom state and designer request.json. Omissions never imply success.",
+      "Bounded orchestration view, not full evidence or acceptance. Tasks/jobs/dispositions show newest first, at most 12 each. Use status(task_id, run_id, ref) to narrow omitted state; read referenced result/receipt/lifecycle artifacts in bounded slices. Full baseline remains in non-context custom state and designer request.json. Omissions never imply success.",
   };
   // Defense in depth for JSON escaping/multibyte input and future schema additions.
   if (bytes(output) > MODEL_VIEW_MAX_BYTES)

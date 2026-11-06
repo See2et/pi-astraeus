@@ -24,6 +24,7 @@ const ops = [
   "stop",
   "accept",
   "invalidate",
+  "disposition",
 ] as const;
 const parameters = Type.Object({
   op: Type.Union(ops.map((op) => Type.Literal(op))),
@@ -74,7 +75,58 @@ const parameters = Type.Object({
       }),
     ),
   ),
-  run_id: Type.Optional(Type.String()),
+  run_id: Type.Optional(
+    Type.String({
+      description:
+        "Required for collect/stop/resume/disposition; for delegate adjudicator optionally select original review run (default latest). Not agent_id",
+    }),
+  ),
+  ref: Type.Optional(
+    Type.String({ description: "disposition: exact review finding ref, e.g. bugs/0" }),
+  ),
+  action: Type.Optional(Type.Union(["adopt", "reject", "optional"].map((x) => Type.Literal(x)))),
+  route: Type.Optional(Type.Union(["clear", "disputed"].map((x) => Type.Literal(x)))),
+  authority: Type.Optional(
+    Type.String({
+      description:
+        "disposition: requirement/scope authority; clear routing is an accountable root judgment",
+    }),
+  ),
+  rationale: Type.Optional(Type.String()),
+  evidence: Type.Optional(Type.String()),
+  prior_decision: Type.Optional(
+    Type.String({
+      description:
+        "Explicit stable identity mapping to saved disposition ID, including reworded/new-ID duplicates",
+    }),
+  ),
+  prior_finding: Type.Optional(
+    Type.String({
+      description:
+        "disposition only: exact earlier review-run/bugs/N or review-run/violations/N source for an explicit current-report mapping, including previously unmapped blockers; do not combine with prior_decision",
+    }),
+  ),
+  reopening: Type.Optional(
+    Type.String({
+      description:
+        "Concrete new evidence/relevant code change for reopening reject/optional; target hash/wording alone insufficient",
+    }),
+  ),
+  predecessor_run: Type.Optional(
+    Type.String({
+      description:
+        "delegate only: explicit fresh-owner takeover of latest collected same-role owner after verified cessation; preserve exact pins/scope",
+    }),
+  ),
+  handoff: Type.Optional(
+    Type.String({
+      description:
+        "Takeover: requirements, current code/check evidence, unresolved decisions and inherited responsibilities",
+    }),
+  ),
+  reason: Type.Optional(
+    Type.String({ description: "Takeover: why original owner cannot continue" }),
+  ),
   generated_outputs: Type.Optional(
     Type.Array(Type.Unknown(), {
       description:
@@ -109,7 +161,7 @@ export default function (pi: ExtensionAPI) {
     name: "astraeus_workflow",
     label: "Astraeus workflow",
     exposure: "model-only",
-    description: `Manage evidence-bound Astraeus work. Trivial work stays solo. For consequential work, start with requirements/acceptance/constraints, delegate only useful bounded work with exact model+thinking, collect results, use fresh reviewer then fresh adjudicator only after complete changes_required, resume the original implementation owner for adopted fixes, and accept after evidence and current-target checks. For explicit Claude design only, record original design_request and design_scope at start/authorize_design, then use designer with matching scope and exact anthropic/claude-opus-5-5 (logical pin), installed Claude Code --bg with supported CLI effort and optional checks. GPT routes stay native; no CLI/API fallback. Designer owned_paths is advisory assignment/scheduling, with repository-scoped edit permissions and protected Git/workflow artifacts. Preserve user changes and explicit design scope. Collect freezes the exact UUID/cwd and records run-bound outcomes separately from acceptance; outside/ignored/shared-cwd deltas are not collection gates. Failed original collected runs may resume after verified identity/freeze/evidence without a successful prior report. reconcile_generated is a deprecated recollection alias for persisted failures; no cache fingerprints or new approvals. Existing Claude sessions retain saved permissions on resume and are not migrated. These are caller attestations, not authenticated user consent. Status does not infer success. Role policies: ${join(ROOT, "skills")}.`,
+    description: `Manage evidence-bound Astraeus work. Trivial work stays solo. For consequential work, start with requirements/acceptance/constraints, delegate only useful bounded work with exact model+thinking, collect results, use fresh reviewer with persistent finding dispositions, route clear bounded requirement-backed fixes to owner assessment or disputed scope/evidence/interpretation to fresh adjudication, resume original owner (or explicit predecessor_run succession with reason/handoff after verified cessation) for adopted fixes, and accept after evidence and current-target checks. For explicit Claude design only, record original design_request and design_scope at start/authorize_design, then use designer with matching scope and exact anthropic/claude-opus-5-5 (logical pin), installed Claude Code --bg with supported CLI effort and optional checks. GPT routes stay native; no CLI/API fallback. Designer owned_paths is advisory assignment/scheduling, with repository-scoped edit permissions and protected Git/workflow artifacts. Preserve user changes and explicit design scope. Collect freezes the exact UUID/cwd and records run-bound outcomes separately from acceptance; outside/ignored/shared-cwd deltas are not collection gates. Failed original collected runs may resume after verified identity/freeze/evidence without a successful prior report. reconcile_generated is a deprecated recollection alias for persisted failures; no cache fingerprints or new approvals. Existing Claude sessions retain saved permissions on resume and are not migrated. These are caller attestations, not authenticated user consent. Status does not infer success. Role policies: ${join(ROOT, "skills")}.`,
     parameters,
     async execute(toolCallId, params, signal, _onUpdate, ctx) {
       workflow.ensureMonitoring(ctx);
@@ -123,10 +175,7 @@ export default function (pi: ExtensionAPI) {
         return modelToolResult(result);
       } catch (error) {
         return {
-          ...modelToolResult({
-            diagnostic: "Astraeus operation failed; no success inferred.",
-            error: String(error),
-          }),
+          ...modelToolResult(workflow.recovery(params, error)),
           isError: true,
         };
       } finally {

@@ -6,7 +6,9 @@ description: Decide which independent review findings warrant action before fixe
 # Review adjudication
 
 Root dispatches a fresh Pi child agent distinct from the implementer and reviewer after
-a complete independent review returns `changes_required`. A `pass` goes directly to
+a complete independent review returns `changes_required` with disputed scope, evidence
+or interpretation. Clear bounded requirement-backed fixes may instead go directly to
+owner assessment through explicit root dispositions. A `pass` goes directly to
 root acceptance after validation; incomplete or `inconclusive` reviews need evidence
 or the next review round, not adjudication. Read [policy](../../references/policy.md),
 [contracts](../../references/contracts.md), and [requirements and tests](../../references/requirements-and-tests.md).
@@ -15,7 +17,9 @@ Astra. No implementation conversation or proposed adoption verdict is inherited.
 
 Supply the original request, authorized scope/non-goals, preserved contracts and their
 evidence, exact stable target, relevant artifacts, verification results, and the original
-review JSON. Identify changed/deleted tests and their stated rationale when applicable.
+review JSON and persistent dispositions. Honor explicit finding-identity links across
+runs: rejected/optional claims need concrete new evidence or relevant code change to
+reopen, not a new ID, wording, severity or target hash. Identify changed/deleted tests and their stated rationale when applicable.
 The agent may inspect dependencies to test claims, but does not repeat the whole review,
 rerun routine verification, edit through any tool, or spawn agents. Disclose unavailable
 read-only/schema enforcement; use the same assurance rules as review, with a separate
@@ -52,12 +56,13 @@ An incomplete/inconclusive review cannot be waived into acceptance.
 
 Root validates the contract against the original review and current target, then checks
 the evidence and disposition. Only adopted fixes go to the original implementation
-owner for implementation and ordinary verification. Resolve investigations in that same
+owner (or explicit verified successor) for assessment, implementation and ordinary verification.
+The owner may refute unsupported claims or propose a smaller remedy with evidence. Resolve investigations in that same
 ownership; escalate only unauthorized product decisions, grouped for the user. Neither
 adjudicator nor root may silently change the agreed requirements to obtain acceptance.
 
-Use one adjudicator per complete `changes_required` review, without adjudication of
-adjudication. There is no fixed total dispatch limit; failed or malformed attempts may
+Use one independent adjudicator for a disputed complete `changes_required` review,
+without adjudication of adjudication. There is no fixed total dispatch limit; failed or malformed attempts may
 be retried. A corrected target or new evidence needs the next review/adjudication round
 as appropriate. A material new
 defect found during adjudication must be recorded as unresolved (and sent for correction

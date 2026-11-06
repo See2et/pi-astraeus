@@ -1,7 +1,15 @@
 import { isCli, isWriter, overlapping, type Job, type Task } from "./workflow.ts";
+import {
+  blockingRefs,
+  dispositionFor,
+  requireResolvedFindings,
+  requireNoPendingDisputes,
+} from "./findings.ts";
 
-export function requireAdjudicableReview(task: Task, currentTarget: string): Job {
-  const review = [...task.jobs].reverse().find((j) => j.role === "reviewer");
+export function requireAdjudicableReview(task: Task, currentTarget: string, run?: string): Job {
+  const review = [...task.jobs]
+    .reverse()
+    .find((j) => j.role === "reviewer" && (!run || j.run_id === run));
   if (
     !review?.valid ||
     review.result?.status !== "complete" ||
@@ -13,7 +21,7 @@ export function requireAdjudicableReview(task: Task, currentTarget: string): Job
     throw new Error(
       "Only complete changes_required review with complete scope/evidence triggers adjudication.",
     );
-  if (task.target_id !== currentTarget)
+  if (task.target_id !== currentTarget || review.target_id !== currentTarget)
     throw new Error("Review target changed; adjudication cannot repair a stale review.");
   if (task.jobs.some((j) => j.role === "adjudicator" && j.review_run === review.run_id && j.valid))
     throw new Error(
@@ -23,8 +31,16 @@ export function requireAdjudicableReview(task: Task, currentTarget: string): Job
 }
 
 export function requireAdoptedCorrection(task: Task): Job | undefined {
+  requireNoPendingDisputes(task);
   const review = [...task.jobs].reverse().find((j) => j.role === "reviewer");
   if (review?.valid && review.result?.verdict === "changes_required") {
+    if (
+      blockingRefs(review).length &&
+      blockingRefs(review).every((ref) => dispositionFor(task, review, ref))
+    ) {
+      requireResolvedFindings(task, review, true);
+      return review;
+    }
     const decision = [...task.jobs]
       .reverse()
       .find((j) => j.role === "adjudicator" && j.review_run === review.run_id && j.valid);

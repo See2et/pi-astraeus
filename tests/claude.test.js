@@ -103,7 +103,7 @@ async function fixture(t) {
         assert.ok(!args.includes("-p"));
         assert.ok(!args.some((a) => a.includes("dangerously-skip-permissions")));
       }
-      const id = resume && state.copy ? COPY : ID;
+      const id = resume && state.copy ? COPY : resume ? ID : (state.freshId ?? ID);
       const record = {
         id: id.slice(0, 8),
         sessionId: id,
@@ -203,6 +203,46 @@ async function fixture(t) {
   };
 }
 
+test("explicit designer succession freezes old UUID and preserves scope, pins, checks and failed history", async (t) => {
+  const f = await fixture(t),
+    owner = await f.delegate({ checks: ["npm test"] });
+  await f.report(owner, { status: "blocked", remaining: ["Unfinished design"] });
+  f.idle();
+  const failed = await f.act({ op: "collect", run_id: owner.run_id });
+  assert.equal(failed.valid, false);
+  assert.equal(failed.cli.frozen, true);
+  const before = f.calls.filter((args) => args[0] === "--bg").length;
+  const handoff = {
+    predecessor_run: owner.run_id,
+    reason: "Original designer cannot continue",
+    handoff: "Authorized UI scope; current ui.txt; npm test required; unfinished design remains",
+  };
+  await assert.rejects(
+    f.delegate({ ...handoff, checks: [] }),
+    /preserves predecessor required checks/,
+  );
+  assert.equal(f.calls.filter((args) => args[0] === "--bg").length, before);
+  f.state.freshId = COPY;
+  const successor = await f.delegate(handoff);
+  assert.equal(successor.predecessor_run, owner.run_id);
+  assert.notEqual(successor.agent_id, owner.agent_id);
+  assert.deepEqual(successor.requested, owner.requested);
+  assert.deepEqual(successor.owned_paths, owner.owned_paths);
+  assert.deepEqual(successor.cli.checks, ["npm test"]);
+  assert.equal(owner.valid, false);
+  assert.equal(owner.cli.frozen, true);
+  assert.ok(
+    !f.calls
+      .filter((args) => args[0] === "--bg")
+      .at(-1)
+      .includes("--resume"),
+  );
+  await f.report(successor);
+  const record = f.state.records.find((r) => r.sessionId === COPY);
+  record.state = "done";
+  record.status = "idle";
+  assert.equal((await f.act({ op: "collect", run_id: successor.run_id })).valid, true);
+});
 test("legacy ownership failure recollects without cache approvals, retaining historical evidence", async (t) => {
   const f = await fixture(t),
     job = await f.delegate();

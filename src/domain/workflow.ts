@@ -76,8 +76,35 @@ export interface Check {
 }
 // Reports cross a versioned, Python-schema-validated boundary. Optional fields
 // reflect the three distinct upstream result kinds, not new validation policy.
+export interface Finding {
+  location: string;
+  claim: string;
+  evidence: string;
+  prior_decision?: string;
+}
+export interface Disposition {
+  id: string;
+  finding_id: string;
+  review_run: string;
+  ref: string;
+  review_hash: string;
+  target_id: string;
+  action: "adopt" | "reject" | "optional";
+  route: "clear" | "disputed" | "adjudicated";
+  authority: string;
+  rationale: string;
+  evidence: string;
+  prior_decision?: string;
+  prior_finding?: string;
+  reopening?: string;
+  adjudication_run?: string;
+}
 export interface Report {
   status: string;
+  violations?: Finding[];
+  bugs?: Finding[];
+  suggestions?: string[];
+  decisions?: { ref: string; action: string; basis: string; evidence: string; rationale: string }[];
   verdict?: string;
   summary: string;
   run_id?: string;
@@ -101,7 +128,13 @@ export interface Job {
   cli?: CliState;
   target_id?: string | null;
   review_run?: string | null;
+  predecessor_run?: string;
+  handoff?: string;
+  succession_reason?: string;
+  cessation?: { source: string; status: string; agent_id: string };
+  dispatch?: "never" | "uncertain" | "confirmed";
   resume_from?: string;
+  assessed_decisions?: string[];
   resume_dispatch_started?: boolean;
   resume_preparation_failure?: string;
   error?: string;
@@ -121,6 +154,7 @@ export interface Task {
   consequential: boolean;
   phase: string;
   jobs: Job[];
+  dispositions?: Disposition[];
   target_id: string | null;
   accepted: boolean;
   accepted_target?: string;
@@ -143,6 +177,18 @@ export interface Command {
   checks?: string[];
   run_id?: string;
   generated_outputs?: unknown[];
+  ref?: string;
+  action?: Disposition["action"];
+  route?: "clear" | "disputed";
+  authority?: string;
+  rationale?: string;
+  evidence?: string;
+  prior_decision?: string;
+  prior_finding?: string;
+  reopening?: string;
+  predecessor_run?: string;
+  handoff?: string;
+  reason?: string;
 }
 export interface ModelIdentity {
   provider: string;
@@ -252,7 +298,7 @@ export function phaseAfterReport(role: Role, result: Report): string {
     ? "ready-for-root"
     : result.verdict === "changes_required"
       ? role === "reviewer"
-        ? "needs-adjudication"
+        ? "needs-assessment"
         : "needs-fixes"
       : "needs-evidence";
 }

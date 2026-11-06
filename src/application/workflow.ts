@@ -1,4 +1,16 @@
 import {
+  blockingRefs,
+  dispositionFor,
+  recordDisposition,
+  requireResolvedFindings,
+  requireNoPendingDisputes,
+  requireHistoricalResolutions,
+  assessmentTokens,
+  pendingAdjudicationReports,
+  blockingReviews,
+  sourceFinding,
+} from "../domain/findings.ts";
+import {
   requireAdjudicableReview,
   requireAdoptedCorrection,
   requireDisjointWriters,
@@ -328,11 +340,18 @@ export class Workflow {
         return [...latest.values()].filter((job) =>
           isCli(job)
             ? !job.cli!.frozen || (job.cli!.unexpected_copy && !job.cli!.copy_frozen)
-            : ACTIVE.has(this.manager()?.getRecord(job.agent_id)?.status ?? job.status),
+            : job.dispatch !== "never" &&
+              (ACTIVE.has(this.manager()?.getRecord(job.agent_id)?.status ?? job.status) ||
+                (job.dispatch === "uncertain" && !job.collected) ||
+                (isWriter(job.role) &&
+                  !job.cessation &&
+                  !["completed", "stopped", "failed"].includes(
+                    this.manager()?.getRecord(job.agent_id)?.status ?? "",
+                  ))),
         );
       });
   }
-  async status(ctx: Context, id?: string) {
+  async status(ctx: Context, id?: string, run?: string, ref?: string) {
     const session = this.session;
     const tasks = id ? [this.task(id, ctx)] : Object.values(this.tasks);
     for (const { task, job } of this.latestCli(tasks)) {
@@ -354,7 +373,14 @@ export class Workflow {
       }
     }
     this.save(ctx);
-    return structuredClone(tasks);
+    return tasks.map((task) => ({
+      ...structuredClone(task),
+      jobs: structuredClone(run ? task.jobs.filter((j) => j.run_id === run) : task.jobs),
+      dispositions: structuredClone(
+        task.dispositions?.filter((d) => (!run || d.review_run === run) && (!ref || d.ref === ref)),
+      ),
+      recovery: this.recovery({ op: "status", task_id: task.task_id, run_id: run }).recovery,
+    }));
   }
   execute(params: Command, ctx: Context, signal?: AbortSignal) {
     const session = this.session;
@@ -388,6 +414,191 @@ export class Workflow {
     await this.io.mkdir(path, { recursive: true, mode: 0o700 });
     return path;
   }
+  async requireCessation(task: Task, job: Job) {
+    if (job.dispatch === "never" && !job.agent_id) return;
+    if (isCli(job)) {
+      await this.cliOperation("observe", job, task.cwd);
+      if (!job.cli!.frozen || (job.cli!.unexpected_copy && !job.cli!.copy_frozen))
+        throw new Error(
+          "Takeover requires exact CLI freeze; explicitly stop/collect the observed UUID/cwd first.",
+        );
+      await this.io.originalRequest(task, job);
+      await this.claude.audit(job);
+    } else {
+      const record = this.manager()?.getRecord(job.agent_id);
+      if (record) {
+        if (record.type !== `astraeus-${job.role}`)
+          throw new Error(
+            "Predecessor native role binding changed; recover exact original host identity.",
+          );
+        if (!["completed", "stopped", "failed"].includes(record.status))
+          throw new Error(
+            "Predecessor writes have not ceased; explicitly stop and collect exact owner first.",
+          );
+        assertReceipt(job, record);
+        job.cessation = {
+          source: "native manager before takeover",
+          status: record.status,
+          agent_id: job.agent_id!,
+        };
+      } else if (!job.cessation || job.cessation.agent_id !== job.agent_id)
+        throw new Error(
+          "Cannot verify cessation of predecessor writes. Missing native record is not stop evidence. Recover exact native handle and explicitly stop/collect; do not retry dispatch.",
+        );
+    }
+  }
+  async auditDispositions(task: Task, ctx: Context) {
+    const checked = new Set<string>();
+    const historical = blockingReviews(task);
+    const pendingReports = pendingAdjudicationReports(task);
+    for (const review of historical) {
+      await this.validate(review, task, ctx);
+      checked.add(review.run_id);
+    }
+    for (const decision of task.jobs.filter(
+      (j) =>
+        j.role === "adjudicator" &&
+        ((j.valid && historical.some((r) => r.run_id === j.review_run)) ||
+          pendingReports.includes(j)),
+    )) {
+      await this.validate(decision, task, ctx);
+      checked.add(decision.run_id);
+    }
+    for (const d of task.dispositions ?? []) {
+      const source = task.jobs.find((j) => j.run_id === d.review_run);
+      if (!source || source.result_hash !== d.review_hash || source.target_id !== d.target_id)
+        throw new Error(
+          "Persistent disposition source binding changed; recover original evidence.",
+        );
+      if (d.prior_finding) {
+        const origin = sourceFinding(task, d.prior_finding).review;
+        if (!checked.has(origin.run_id)) {
+          await this.validate(origin, task, ctx);
+          checked.add(origin.run_id);
+        }
+      }
+      if (!checked.has(source.run_id)) {
+        await this.validate(source, task, ctx);
+        checked.add(source.run_id);
+      }
+      if (d.adjudication_run) {
+        const adjudication = task.jobs.find((j) => j.run_id === d.adjudication_run);
+        if (!adjudication || adjudication.review_run !== source.run_id)
+          throw new Error("Disposition adjudication binding changed.");
+        if (!checked.has(adjudication.run_id)) {
+          await this.validate(adjudication, task, ctx);
+          checked.add(adjudication.run_id);
+        }
+      }
+    }
+  }
+  pendingReportContext(task: Task): string {
+    const reports = pendingAdjudicationReports(task);
+    return JSON.stringify({
+      reports: reports.map(({ run_id, result_hash, target_id, result }) => ({
+        run_id,
+        result_hash,
+        target_id,
+        result,
+      })),
+      owner_assessments: task.jobs
+        .filter(
+          (j) =>
+            isWriter(j.role) &&
+            j.collected &&
+            reports.some((r) => j.assessed_decisions?.includes(`${r.run_id}/report`)),
+        )
+        .map(
+          ({
+            run_id,
+            valid,
+            assessed_decisions,
+            summary,
+            artifact,
+            result_hash,
+            receipt_path,
+            receipt_hash,
+          }) => ({
+            run_id,
+            valid,
+            assessed_decisions,
+            summary,
+            artifact,
+            result_hash,
+            receipt_path,
+            receipt_hash,
+          }),
+        ),
+    });
+  }
+  recovery(p: Command, error?: unknown) {
+    const task = p.task_id ? this.tasks[p.task_id] : undefined;
+    const jobs = task
+      ? p.run_id
+        ? task.jobs.filter((j) => j.run_id === p.run_id)
+        : task.jobs.slice(-3)
+      : [];
+    return {
+      diagnostic: error
+        ? "Astraeus operation failed; post-operation state below, no success inferred."
+        : "Post-operation state; status is not acceptance.",
+      error: error === undefined ? undefined : String(error),
+      task_id: p.task_id,
+      run_id: p.run_id ?? jobs.at(-1)?.run_id,
+      phase: task?.phase,
+      accepted: task?.accepted,
+      recovery: jobs.map((j) => ({
+        run_id: j.run_id,
+        status: j.status,
+        collected: j.collected,
+        valid: j.valid,
+        dispatch: j.dispatch ?? "uncertain",
+        lifecycle:
+          j.dispatch === "never"
+            ? "never dispatched"
+            : j.collected
+              ? j.valid
+                ? "collected validated result; root acceptance still required"
+                : "collected unsuccessful"
+              : ACTIVE.has(
+                    this.manager()?.getRecord(j.agent_id)?.status ?? (isCli(j) ? j.status : ""),
+                  )
+                ? "known running; collect later, not success"
+                : "possibly launched or ended; verify exact host identity and collect outcome",
+        allowed:
+          j.dispatch === "never"
+            ? ["status", "collect"]
+            : [
+                "status",
+                "collect",
+                "explicit stop after exact identity verification",
+                ...(j.collected && isWriter(j.role) && (j.cessation || j.cli?.frozen)
+                  ? [
+                      "resume latest owner with bounded prompt and adopted decisions",
+                      "explicit same-role delegate takeover with predecessor_run/reason/handoff and unchanged pins/scope",
+                    ]
+                  : []),
+                ...(j.collected && !isWriter(j.role) && j.agent_id
+                  ? ["fresh reviewer/adjudicator after evidence assessment"]
+                  : []),
+              ],
+        blocked: [
+          "blind retry of uncertain launch",
+          "accept without complete evidence",
+          ...(!j.cessation && !j.cli?.frozen
+            ? ["fresh-owner takeover until verified cessation"]
+            : []),
+        ],
+        guidance:
+          "Inspect exact managed handle/lifecycle evidence. Missing records never prove stop. Recover original host identity; do not relaunch uncertain work. For collected failed owner, resume or explicitly take over only after cessation with reason/handoff and unchanged pins/scope.",
+      })),
+      allowed: task
+        ? ["status(task_id)"]
+        : [
+            "start with task_id, requirements and acceptance; delegate also requires role/model/thinking/prompt",
+          ],
+    };
+  }
   async validate(job: Job, task: Task, ctx: Context, accept = false) {
     if (job.result_hash !== this.io.hash(await this.io.readFile(job.artifact!, "utf8")))
       throw new Error("Saved result bytes changed; run a fresh review.");
@@ -401,7 +612,7 @@ export class Workflow {
       "--task-id",
       task.task_id,
       "--target-id",
-      task.target_id!,
+      job.target_id!,
       "--assurance",
       "reported",
     ];
@@ -413,6 +624,10 @@ export class Workflow {
         source.result_hash !== this.io.hash(await this.io.readFile(source.artifact!, "utf8"))
       )
         throw new Error("Original review bytes changed; adjudication is stale.");
+      if (
+        source.receipt_hash !== this.io.hash(await this.io.readFile(source.receipt_path!, "utf8"))
+      )
+        throw new Error("Original review host receipt bytes changed.");
       args.push("--review-result", source.artifact!);
       if (source.receipt_path!) args.push("--review-receipt", source.receipt_path!);
     }
@@ -451,7 +666,37 @@ export class Workflow {
       );
   }
   async action(p: Command, ctx: Context, signal: AbortSignal | undefined) {
-    if (p.op === "status") return this.status(ctx, p.task_id);
+    const required: Record<string, (keyof Command)[]> = {
+      start: ["task_id", "requirements", "acceptance"],
+      delegate: ["task_id", "role", "model", "thinking", "prompt"],
+      collect: ["task_id", "run_id"],
+      stop: ["task_id", "run_id"],
+      resume: ["task_id", "run_id", "prompt"],
+      disposition: [
+        "task_id",
+        "run_id",
+        "ref",
+        "action",
+        "route",
+        "authority",
+        "rationale",
+        "evidence",
+      ],
+      reconcile_generated: ["task_id", "run_id"],
+      accept: ["task_id"],
+      invalidate: ["task_id"],
+      authorize_design: ["task_id"],
+      status: [],
+    };
+    if (!Object.hasOwn(required, p.op)) throw new Error(`Unknown operation: ${p.op}`);
+    const missing = required[p.op].filter(
+      (key) => typeof p[key] !== "string" || !(p[key] as string).trim(),
+    );
+    if (missing.length)
+      throw new Error(`${p.op} requires ${missing.join(", ")}; no dispatch attempted.`);
+    if (p.predecessor_run && p.op !== "delegate")
+      throw new Error("predecessor_run is delegate-only; resume retains the existing owner.");
+    if (p.op === "status") return this.status(ctx, p.task_id, p.run_id, p.ref);
     if (!p.task_id || !/^[A-Za-z0-9][A-Za-z0-9_-]{0,79}$/.test(p.task_id))
       throw new Error("task_id must be a short path-safe identifier.");
     if (p.op === "start") {
@@ -501,8 +746,19 @@ export class Workflow {
     }
     if (p.op === "delegate") return this.delegate(task, p, ctx, signal);
     const job = task.jobs.find((j) => j.run_id === p.run_id)!;
-    if (["collect", "stop", "resume", "reconcile_generated"].includes(p.op) && !job)
+    if (["collect", "stop", "resume", "reconcile_generated", "disposition"].includes(p.op) && !job)
       throw new Error("Unknown run_id");
+    if (p.op === "disposition") {
+      if ((await this.target(ctx)) !== job.target_id || task.target_id !== job.target_id)
+        throw new Error("Disposition requires the exact current reviewed target.");
+      await this.auditDispositions(task, ctx);
+      await this.validate(job, task, ctx);
+      if (p.prior_finding)
+        await this.validate(sourceFinding(task, p.prior_finding).review, task, ctx);
+      const decision = recordDisposition(task, job, p, this.io.randomUUID());
+      this.save(ctx);
+      return decision;
+    }
     if (p.op === "reconcile_generated") return this.reconcileGenerated(task, job, p, ctx);
     if (p.op === "collect") return this.collect(task, job, ctx);
     if (p.op === "stop") {
@@ -516,7 +772,23 @@ export class Workflow {
       }
       try {
         if (isCli(job)) await this.cliOperation("stop", job, task.cwd);
-        else await this.io.rpc(this.host.events, "stop", { agentId: job.agent_id });
+        else {
+          if (!job.agent_id)
+            throw new Error(
+              "No bound native handle: no stop attempted. Recover exact host identity and cessation evidence; do not retry uncertain launch.",
+            );
+          await this.io.rpc(this.host.events, "stop", { agentId: job.agent_id });
+          const record = this.manager()?.getRecord(job.agent_id);
+          if (!record || !["stopped", "completed", "failed"].includes(record.status))
+            throw new Error(
+              "Stop not verified by native host; inspect exact owner before retry or takeover.",
+            );
+          job.cessation = {
+            source: "native manager after explicit stop",
+            status: record.status,
+            agent_id: job.agent_id!,
+          };
+        }
         job.status = isCli(job) ? observedStatus(job.cli!.observed) : "stopped";
         job.collected = false;
         job.valid = false;
@@ -584,8 +856,18 @@ export class Workflow {
             (!isCli(j) && ACTIVE.has(this.manager()?.getRecord(j.agent_id)?.status ?? j.status)),
         )
       )
-        throw new Error("Collect every managed result before acceptance.");
+        throw new Error(
+          "Collect every managed result before acceptance; unresolved or unknown ongoing writes require exact host cessation evidence.",
+        );
+      await this.auditDispositions(task, ctx);
+      requireNoPendingDisputes(task);
       const latestWorkers = new Map();
+      const responsibility = (writer: Job): string => {
+        const parent = writer.predecessor_run ?? writer.resume_from;
+        const prior =
+          parent && task.jobs.slice(0, task.jobs.indexOf(writer)).find((j) => j.run_id === parent);
+        return prior ? responsibility(prior) : (writer.agent_id ?? writer.run_id);
+      };
       for (const writer of task.jobs.filter((j) => isWriter(j.role))) {
         // An unstarted correction is still failed work of its recorded owner,
         // not a new null-ID owner that permanently blocks later successful fixes.
@@ -596,7 +878,12 @@ export class Workflow {
           !writer.agent_id && prior?.agent_id && this.settlePreparationFailure(writer)
             ? prior.agent_id
             : writer.agent_id;
-        latestWorkers.set(key, writer);
+        latestWorkers.set(
+          writer.predecessor_run || writer.resume_from
+            ? responsibility(writer)
+            : (key ?? writer.run_id),
+          writer,
+        );
       }
       if ([...latestWorkers.values()].some((j) => !j.valid))
         throw new Error("Implementation owner has unresolved failed or incomplete work.");
@@ -610,7 +897,14 @@ export class Workflow {
         if (!last?.result || !last.valid)
           throw new Error("A complete validated review is required.");
         if (last.result.verdict === "pass") await this.validate(last, task, ctx, true);
-        else {
+        else if (
+          last.result.verdict === "changes_required" &&
+          blockingRefs(last).length &&
+          blockingRefs(last).every((ref) => dispositionFor(task, last, ref))
+        ) {
+          await this.validate(last, task, ctx);
+          requireResolvedFindings(task, last);
+        } else {
           const adjudication = [...task.jobs]
             .reverse()
             .find((j) => j.role === "adjudicator" && j.review_run === last.run_id && j.valid);
@@ -620,6 +914,7 @@ export class Workflow {
             );
           await this.validate(adjudication, task, ctx, true);
         }
+        requireHistoricalResolutions(task, last);
       }
       // This tool checks process evidence; root remains responsible for truth and scope.
       task.accepted = true;
@@ -637,6 +932,14 @@ export class Workflow {
     const role = p.role!;
     if (!ROLES.includes(role) || !p.prompt?.trim())
       throw new Error("delegate requires role and a bounded prompt.");
+    if (p.run_id && role !== "adjudicator")
+      throw new Error(
+        "delegate run_id selects an original review only for adjudicator; use resume for owner continuation or predecessor_run for succession.",
+      );
+    if (!isWriter(role) && p.predecessor_run)
+      throw new Error(
+        "Review/adjudication must use fresh independent sessions, never owner takeover.",
+      );
     const policy = await this.policy(ctx);
     if (!isWriter(role) && policy.assurance === "strict")
       throw new Error(
@@ -664,6 +967,7 @@ export class Workflow {
       const ping = await this.io.rpc(this.host.events, "ping", {});
       if (ping?.version !== 2) throw new Error("Unsupported Tintinweb RPC version");
     }
+    await this.auditDispositions(task, ctx);
     const currentTarget = await this.target(ctx);
     // External writer state must be current even without a native manager.
     const cliOwners = new Map(
@@ -684,14 +988,23 @@ export class Workflow {
       }
     }
     const running = this.activeJobs(task.cwd);
+    if (
+      Object.values(this.tasks).some(
+        (t) => t.cwd === task.cwd && t.jobs.some((j) => j.dispatch === "uncertain" && !j.agent_id),
+      )
+    )
+      throw new Error(
+        "Possibly launched unbound dispatch: recover exact host identity/cessation evidence; no blind retry or new launch is allowed.",
+      );
     if (!isWriter(role) && running.length)
       throw new Error("Freeze writers and collect outstanding work before review/adjudication.");
     if (!isWriter(role) && task.jobs.some((j) => !j.collected))
       throw new Error("Collect existing runs first.");
     let review: Job | undefined;
     if (role === "adjudicator") {
-      review = requireAdjudicableReview(task, currentTarget);
+      review = requireAdjudicableReview(task, currentTarget, p.run_id);
     }
+    let requiredChecks = p.checks ?? [];
     let owned = p.owned_paths || ["."];
     if (!owned.length) throw new Error("owned_paths must identify at least one owned path.");
     if (
@@ -701,17 +1014,77 @@ export class Workflow {
     owned = owned.map((path) => this.io.normalize(path).replace(/\/+$/, "") || ".");
     if (isWriter(role)) {
       requireDisjointWriters(owned, running);
-      if (
+      if (p.predecessor_run) {
+        const prior = task.jobs.find((j) => j.run_id === p.predecessor_run);
+        if (
+          !prior ||
+          prior.role !== role ||
+          !prior.collected ||
+          task.jobs.some(
+            (j) => j.predecessor_run === prior.run_id || j.resume_from === prior.run_id,
+          )
+        )
+          throw new Error(
+            "Takeover requires latest collected predecessor of the same role, without an existing successor.",
+          );
+        if (!p.reason?.trim() || !p.handoff?.trim())
+          throw new Error(
+            "Takeover requires reason and handoff: requirements, current code/check evidence and unresolved decisions.",
+          );
+        if (
+          prior.requested.model !== p.model ||
+          prior.requested.effort !== p.thinking ||
+          JSON.stringify(prior.owned_paths) !== JSON.stringify(owned)
+        )
+          throw new Error(
+            "Takeover must preserve exact predecessor model/thinking and owned scope.",
+          );
+        if (
+          (prior.transport ?? "pi-native") !==
+          (role === "designer" ? CLAUDE_TRANSPORT : "pi-native")
+        )
+          throw new Error(
+            "Takeover cannot migrate the predecessor transport; recover original native designer instead.",
+          );
+        if (isCli(prior)) {
+          let checkOwner = prior;
+          while (!checkOwner.cli?.checks && checkOwner.resume_from) {
+            const parent = task.jobs
+              .slice(0, task.jobs.indexOf(checkOwner))
+              .find((j) => j.run_id === checkOwner.resume_from);
+            if (!parent || !isCli(parent)) break;
+            checkOwner = parent;
+          }
+          if (!checkOwner.cli?.checks)
+            throw new Error(
+              "Inherited required checks are unknown; recover original request/check evidence before takeover. An undispatched initial preparation may instead be retried as a fresh delegate after verified settlement.",
+            );
+          requiredChecks = checkOwner.cli.checks;
+          if (p.checks && JSON.stringify(p.checks) !== JSON.stringify(requiredChecks))
+            throw new Error(
+              "Takeover preserves predecessor required checks; no silent removal or override.",
+            );
+        }
+        await this.requireCessation(task, prior);
+        const decision = requireAdoptedCorrection(task);
+        if (decision) {
+          if (currentTarget !== task.target_id)
+            throw new Error("Target changed since review; obtain fresh evidence before fixes.");
+          await this.validate(decision, task, ctx);
+        }
+      } else if (
         task.jobs.some((j) => isWriter(j.role) && j.collected && !this.settlePreparationFailure(j))
       )
-        throw new Error("Resume the original implementation owner; do not replace it for fixes.");
+        throw new Error(
+          "Resume the original implementation owner or explicitly delegate with predecessor_run/reason/handoff after verified cessation of writes.",
+        );
       task.target_id = null;
       task.accepted = false;
     } else task.target_id = currentTarget;
     const run_id = this.io.randomUUID();
     if (role === "designer") {
       validatePaths(owned);
-      validateChecks(p.checks ?? []);
+      validateChecks(requiredChecks);
     }
     const job: Job = {
       run_id,
@@ -722,9 +1095,16 @@ export class Workflow {
       collected: false,
       valid: false,
       owned_paths: owned,
-      requested: { model: p.model!, effort: p.thinking },
+      requested: p.predecessor_run
+        ? structuredClone(task.jobs.find((j) => j.run_id === p.predecessor_run)!.requested)
+        : { model: p.model!, effort: p.thinking },
       review_run: review?.run_id ?? null,
+      ...(isWriter(role) ? { assessed_decisions: assessmentTokens(task) } : {}),
       target_id: task.target_id,
+      dispatch: "never",
+      ...(p.predecessor_run
+        ? { predecessor_run: p.predecessor_run, handoff: p.handoff, succession_reason: p.reason }
+        : {}),
     };
     if (role === "designer") job.cli = { frozen: false, evidence: [] };
     task.jobs.push(job);
@@ -735,49 +1115,63 @@ export class Workflow {
         ? "review"
         : "adjudication";
     this.save(ctx);
-    const designText = task.design_authorization
-      ? await this.io.readFile(this.io.join(this.root, "references/claude-design.md"), "utf8")
-      : "";
-    const policyText = await this.io.readFile(
-      this.io.join(
-        this.root,
-        "skills",
-        `pi-astraeus-${isWriter(role) ? "orchestrate" : role === "reviewer" ? "review" : "adjudicate"}`,
-        "SKILL.md",
-      ),
-      "utf8",
-    );
-    const contract = !isWriter(role)
-      ? await this.io.readFile(
-          this.io.join(
-            this.root,
-            "schemas",
-            `${role === "reviewer" ? "review" : "adjudication"}.json`,
-          ),
-          "utf8",
-        )
-      : "";
-    const prompt = [
-      `Task ${task.task_id}. Role ${role}. Work only on assigned scope; no child delegation.`,
-      `Requirements:\n${task.requirements}\nAcceptance conditions:\n${task.acceptance}\nConstraints/non-goals/preserved contracts:\n${task.constraints}`,
-      task.design_authorization
-        ? `Design authorization (root-reported, not authenticated): ${JSON.stringify(task.design_authorization)}\nDesign handoff policy:\n${designText}`
-        : "",
-      `Assignment:\n${p.prompt}\nOwned paths:\n${owned.join("\n")}`,
-      `Role policy:\n${policyText}\nRead relevant references under ${this.io.join(this.root, "references")} when needed.`,
-      !isWriter(role)
-        ? `Stable target_id: ${task.target_id}. task_id: ${task.task_id}. Reported assurance: built-in read-only tools only, no OS sandbox or generation-time schema guarantee. Return exactly one JSON object matching this schema, no additional prose:\n${contract}`
-        : "Return actual edits, verification outcomes and remaining issues. Keep implementation and ordinary verification together.",
-      review
-        ? `Original review bytes:\n${await this.io.readFile(review.artifact!, "utf8")}\nreview_sha256: ${review.result_hash}`
-        : "",
-    ]
-      .filter(Boolean)
-      .join("\n\n");
     try {
+      const designText = task.design_authorization
+        ? await this.io.readFile(this.io.join(this.root, "references/claude-design.md"), "utf8")
+        : "";
+      const policyText = await this.io.readFile(
+        this.io.join(
+          this.root,
+          "skills",
+          `pi-astraeus-${isWriter(role) ? "orchestrate" : role === "reviewer" ? "review" : "adjudicate"}`,
+          "SKILL.md",
+        ),
+        "utf8",
+      );
+      const contract = !isWriter(role)
+        ? await this.io.readFile(
+            this.io.join(
+              this.root,
+              "schemas",
+              `${role === "reviewer" ? "review" : "adjudication"}.json`,
+            ),
+            "utf8",
+          )
+        : "";
+      const prompt = [
+        `Task ${task.task_id}. Role ${role}. Work only on assigned scope; no child delegation.`,
+        `Requirements:\n${task.requirements}\nAcceptance conditions:\n${task.acceptance}\nConstraints/non-goals/preserved contracts:\n${task.constraints}`,
+        task.design_authorization
+          ? `Design authorization (root-reported, not authenticated): ${JSON.stringify(task.design_authorization)}\nDesign handoff policy:\n${designText}`
+          : "",
+        `Assignment:\n${p.prompt}\nOwned paths:\n${owned.join("\n")}`,
+        job.assessed_decisions?.length
+          ? `This owner run is assigned assessment of these exact finding/report tokens: ${JSON.stringify(job.assessed_decisions)}. Report concrete assessment/refutation/correction and verification evidence for each within authorized scope, including report-level unresolved matters and coverage/evidence gaps. A supported refutation or evidence-only assessment need not change code. Root checks the substance; a completed run alone does not establish truth. Bound adjudication reports (claims/gaps to assess, not new scope authority): ${this.pendingReportContext(task)}`
+          : "",
+        `Role policy:\n${policyText}\nRead relevant references under ${this.io.join(this.root, "references")} when needed.`,
+        !isWriter(role)
+          ? `Stable target_id: ${task.target_id}. task_id: ${task.task_id}. Reported assurance: built-in read-only tools only, no OS sandbox or generation-time schema guarantee. Return exactly one JSON object matching this schema, no additional prose:\n${contract}`
+          : "Return actual edits, verification outcomes and remaining issues. Keep implementation and ordinary verification together.",
+        role === "reviewer" && pendingAdjudicationReports(task).length
+          ? `Retained adjudication report-level matters remain pending even when individual claims are rejected. Independently check resolution of unresolved matters and coverage/evidence gaps against the original task and the reported owner assessment/check evidence below; do not infer resolution from omission, a prior pass, or an override. These claims/gaps are not new scope authority. This is reported evidence, not a proposed verdict: ${this.pendingReportContext(task)}`
+          : "",
+        task.dispositions?.length
+          ? `Persistent finding history (root judgments, not new requirements):\n${JSON.stringify(task.dispositions)}\nLink repeated/reworded/new-ID findings with prior_decision. Reject/optional decisions remain nonblocking unless root explicitly reopens with concrete new evidence or relevant code change. A new target hash, severity or wording alone is insufficient. Unmapped new blocking findings still require root assessment. Do not infer arbitrary semantic equivalence.`
+          : "",
+        p.predecessor_run
+          ? `Fresh-owner succession from ${p.predecessor_run}. Reason: ${p.reason}. You inherit all predecessor obligations, scope, check evidence, unresolved decisions and history; assess fixes, refute unsupported claims or propose a smaller repair. Handoff:\n${p.handoff}`
+          : "",
+        review
+          ? `Original review bytes:\n${await this.io.readFile(review.artifact!, "utf8")}\nreview_sha256: ${review.result_hash}`
+          : "",
+      ]
+        .filter(Boolean)
+        .join("\n\n");
       if (role === "designer") {
-        await this.prepareCli(task, job, ctx, p.checks ?? []);
+        await this.prepareCli(task, job, ctx, requiredChecks);
         this.save(ctx); // Persist binding before launch; failures must never invite a blind retry.
+        job.dispatch = "uncertain";
+        this.save(ctx);
         await this.cliOperation(
           "start",
           job,
@@ -785,9 +1179,12 @@ export class Workflow {
           await this.cliPrompt(task, job, prompt),
           job.cli!.checks!,
         );
+        job.dispatch = "confirmed";
         this.save(ctx);
         return job;
       }
+      job.dispatch = "uncertain";
+      this.save(ctx);
       const response = await this.io.rpc(this.host.events, "spawn", {
         type: `astraeus-${role}`,
         prompt,
@@ -800,11 +1197,13 @@ export class Workflow {
           cwd: ctx.cwd,
           onSpawned: (id: string) => {
             job.agent_id = id;
+            job.dispatch = "confirmed";
             this.save(ctx);
           },
         },
       });
       job.agent_id = response.id;
+      job.dispatch = "confirmed";
       job.status = this.manager()?.getRecord(response.id)?.status ?? "running";
       this.save(ctx);
       return job;
@@ -815,6 +1214,7 @@ export class Workflow {
         : (this.manager()?.getRecord(job.agent_id)?.status ??
           (job.agent_id ? "unavailable" : "error"));
       job.error = String(error);
+      if (job.dispatch === "never") job.collected = true;
       this.save(ctx);
       throw error;
     }
@@ -1034,12 +1434,30 @@ export class Workflow {
       job.collected = true;
       job.valid = false;
       job.error =
-        "Native child record unavailable: attempt settled as unsuccessful, not completed. A fresh reviewer/adjudicator may retry; implementation ownership still requires original-session recovery.";
+        "Native child record unavailable: collected unsuccessful, not completed or stopped. Recover exact host handle and verify cessation before writer takeover; uncertain dispatch must not be blindly retried.";
       task.phase = "needs-evidence";
       this.save(ctx);
       return job;
     }
     job.status = record.status;
+    if (job.resume_from && job.dispatch === "uncertain") {
+      if (ACTIVE.has(record.status)) job.dispatch = "confirmed";
+      else {
+        job.collected = true;
+        job.valid = false;
+        job.error =
+          "Native resume launch was not confirmed; terminal manager output may belong to predecessor. Outcome remains unsuccessful. Verify cessation, then explicitly resume this latest owner or take over with handoff; do not attribute predecessor output to this run.";
+        task.phase = "needs-evidence";
+        this.save(ctx);
+        return job;
+      }
+    }
+    if (isWriter(job.role) && ["completed", "stopped", "failed"].includes(record.status))
+      job.cessation = {
+        source: "native manager during collect",
+        status: record.status,
+        agent_id: job.agent_id!,
+      };
     if (ACTIVE.has(record.status)) {
       this.save(ctx);
       return { ...job, note: "Still running. Continue independent work or collect later." };
@@ -1051,9 +1469,18 @@ export class Workflow {
         throw new Error("Resolved child role differs from requested role.");
       const receipt = assertReceipt(job, record);
       const directory = await this.artifacts(task, ctx);
-      job.receipt_path = this.io.join(directory, `${job.run_id}.receipt.json`);
       const receiptBytes = JSON.stringify(receipt, null, 2);
-      await this.io.writeFile(job.receipt_path!, receiptBytes, { mode: 0o600 });
+      if (
+        job.receipt_hash &&
+        (job.receipt_hash !== this.io.hash(receiptBytes) ||
+          job.receipt_hash !== this.io.hash(await this.io.readFile(job.receipt_path!, "utf8")))
+      )
+        throw new Error(
+          "Saved host receipt bytes changed; collect a fresh run, not replacement evidence.",
+        );
+      job.receipt_path = this.io.join(directory, `${job.run_id}.receipt.json`);
+      if (!job.receipt_hash)
+        await this.io.writeFile(job.receipt_path!, receiptBytes, { mode: 0o600 });
       job.receipt_hash = this.io.hash(receiptBytes);
       if (record.status !== "completed")
         throw new Error(`Child ${record.status}: ${record.error || "incomplete output"}`);
@@ -1066,16 +1493,48 @@ export class Workflow {
         if ((await this.target(ctx)) !== job.target_id || task.target_id !== job.target_id)
           throw new Error("Review target changed while child was running.");
         const bytes = parseReport(record.structuredJson ?? record.result ?? "");
+        if (
+          job.result_hash &&
+          (job.result_hash !== this.io.hash(bytes) ||
+            job.result_hash !== this.io.hash(await this.io.readFile(job.artifact!, "utf8")))
+        )
+          throw new Error("Saved result bytes changed; run a fresh review.");
         job.artifact = this.io.join(directory, `${job.run_id}.json`);
-        await this.io.writeFile(job.artifact!, bytes, { mode: 0o600 });
+        if (!job.result_hash) await this.io.writeFile(job.artifact!, bytes, { mode: 0o600 });
         job.result_hash = this.io.hash(bytes);
         job.result = await this.validate(job, task, ctx);
         job.valid = true;
         task.phase = phaseAfterReport(job.role, job.result!);
+        if (job.role === "adjudicator" && job.result!.status === "complete") {
+          const source = task.jobs.find((j) => j.run_id === job.review_run)!;
+          const staged = { ...task, dispositions: [...(task.dispositions ?? [])] };
+          for (const d of job.result!.decisions ?? []) {
+            if (d.ref.startsWith("unresolved/")) continue;
+            recordDisposition(
+              staged,
+              source,
+              {
+                op: "disposition",
+                ref: d.ref,
+                action: d.action === "fix" ? "adopt" : "reject",
+                route: ["investigate", "human_decision"].includes(d.action) ? "disputed" : "clear",
+                authority: d.basis,
+                rationale: d.rationale,
+                evidence: d.evidence,
+                reopening: d.rationale,
+              },
+              this.io.randomUUID(),
+              job,
+            );
+          }
+          task.dispositions = staged.dispositions;
+          task.phase = phaseAfterReport(job.role, job.result!);
+        }
       }
       await this.io.rpc(this.host.events, "consume", { agentId: job.agent_id });
       delete job.error;
     } catch (error: any) {
+      job.valid = false;
       job.error = String(error);
       task.phase = "needs-evidence";
     }
@@ -1225,6 +1684,10 @@ export class Workflow {
     }
     if (latestOwner !== job)
       throw new Error("Resume only the latest run of the original implementation owner.");
+    if (task.jobs.some((j) => j.predecessor_run === job.run_id))
+      throw new Error("Predecessor has a fresh successor; resume only the effective owner.");
+    await this.auditDispositions(task, ctx);
+    const followPrompt = `${p.prompt}\n\nAssess adopted findings and report-level pending matters against requirements and evidence; refute unsupported claims or propose a smaller repair rather than blindly implementing them. Preserve scope; optional ideas add no completion gate. This run is assigned these exact finding/report tokens: ${JSON.stringify(assessmentTokens(task))}. Report concrete assessment/refutation/correction and verification evidence for each within authorized scope, including unresolved matters and coverage/evidence gaps. A supported refutation or evidence-only assessment need not change code; root checks the substance. Bound adjudication reports (claims/gaps to assess, not new scope authority): ${this.pendingReportContext(task)}. Persistent decisions:\n${JSON.stringify(task.dispositions ?? [])}`;
     const decision = requireAdoptedCorrection(task);
     if (decision) {
       if ((await this.target(ctx)) !== task.target_id)
@@ -1254,6 +1717,8 @@ export class Workflow {
         ...job,
         run_id: this.io.randomUUID(),
         resume_from: job.run_id,
+        assessed_decisions: assessmentTokens(task),
+        dispatch: "never",
         agent_id: null,
         cli: { frozen: false, evidence: [] },
         collected: false,
@@ -1274,6 +1739,8 @@ export class Workflow {
         await this.prepareCli(task, follow, ctx, job.cli!.checks!, job.cli);
         follow.agent_id = job.agent_id;
         this.save(ctx);
+        follow.dispatch = "uncertain";
+        this.save(ctx);
         await this.cliOperation(
           "resume",
           follow,
@@ -1281,9 +1748,10 @@ export class Workflow {
           await this.cliPrompt(
             task,
             follow,
-            `Continue only original authorized design scope ${task.design_authorization!.scope}; preserve Opus design decisions unless explicit user/functional constraints require changes.\n${p.prompt}`,
+            `Continue only original authorized design scope ${task.design_authorization!.scope}; preserve Opus design decisions unless explicit user/functional constraints require changes.\n${followPrompt}`,
           ),
         );
+        follow.dispatch = "confirmed";
         this.save(ctx);
         return follow;
       } catch (error: any) {
@@ -1309,7 +1777,10 @@ export class Workflow {
       ...job,
       run_id: this.io.randomUUID(),
       resume_from: job.run_id,
+      assessed_decisions: assessmentTokens(task),
       resume_dispatch_started: false,
+      dispatch: "never",
+      cessation: undefined,
       collected: false,
       valid: false,
       summary: undefined,
@@ -1325,6 +1796,7 @@ export class Workflow {
     try {
       this.save(ctx);
       follow.resume_dispatch_started = true;
+      follow.dispatch = "uncertain";
       this.save(ctx);
       // Public native Agent tool supports resumption; RPC intentionally strips resume fields.
       const reply = await ctx.executeTool!(
@@ -1334,8 +1806,8 @@ export class Workflow {
           resume: job.agent_id,
           prompt:
             job.role === "designer"
-              ? `Continue only the original authorized design scope ${task.design_authorization!.scope}; preserve Opus design decisions unless explicit user or functional constraints require a change.\n${p.prompt}`
-              : p.prompt,
+              ? `Continue only the original authorized design scope ${task.design_authorization!.scope}; preserve Opus design decisions unless explicit user or functional constraints require a change.\n${followPrompt}`
+              : followPrompt,
           description: `Continue ${task.task_id}`,
           run_in_background: true,
         },
@@ -1347,8 +1819,12 @@ export class Workflow {
           "Native resume did not start the original owner: " +
             JSON.stringify({ reply, status: updated?.status }),
         );
+      follow.dispatch = "confirmed";
+      this.save(ctx);
       return follow;
     } catch (error: any) {
+      if (ACTIVE.has(this.manager()?.getRecord(follow.agent_id)?.status ?? ""))
+        follow.dispatch = "confirmed";
       follow.status = "error";
       follow.error = String(error);
       follow.collected = true;

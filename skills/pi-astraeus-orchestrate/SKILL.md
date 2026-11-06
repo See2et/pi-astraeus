@@ -96,20 +96,26 @@ after ordinary verification. Mandatory project path globs add requirements, neve
 risk-based ones. Root decides borderline cases with a short reason. Trivial spelling/format
 edits can remain solo; optional polish adds no acceptance gate.
 
-Only a complete `changes_required` review triggers one separate fresh
-[adjudicator](../pi-astraeus-adjudicate/SKILL.md) before adopting fixes or accepting the
-rejected target. Complete `pass` goes to root acceptance after validation and current
-source/evidence checks. Optional suggestions do not trigger adjudication. Incomplete or
-`inconclusive` review needs evidence or the next review round; adjudication cannot waive
-coverage. The original implementation owner makes adopted fixes and verifies them.
+Complete `pass` goes to root after validation and current source/evidence checks.
+For complete `changes_required`, root may record explicit `disposition` decisions and
+route clear bounded requirement-backed fixes directly to owner assessment. Disputed
+scope/evidence/interpretation requires fresh independent
+[adjudication](../pi-astraeus-adjudicate/SKILL.md). Optional/unsubstantiated ideas never
+expand completion conditions; unresolved blocking findings still block. Incomplete or
+`inconclusive` coverage needs evidence or another review and cannot be waived.
+Persist adopt/reject/optional history with exact review/target bindings. In fresh reviews,
+require explicit links for repeated/reworded claims, including new IDs; root may map missed
+duplicates. Reopening reject/optional needs concrete new evidence or relevant code change,
+not wording, severity or a new target hash. Root remains the semantic judge.
 
-Reviews and adjudications have no fixed total dispatch limit. Use one separate fresh
-adjudicator per complete `changes_required` review. Retry malformed, interrupted, or
-failed attempts as needed; incomplete or inconclusive results need evidence or another
-review. No reviewer/adjudicator debate loops or recursive acceptance agents. Continue
-authorized corrections and reviews without requesting user continuation solely because
-of an attempt count. Repeat checks only for a concrete issue or evidence gap; unresolved
-work remains incomplete.
+The owner assesses adopted fixes, may refute unsupported claims or propose a smaller
+repair, and implements/verifies corrections. If unavailable, use explicit `delegate`
+with `predecessor_run`, `reason` and `handoff`, only after verified cessation of old writes;
+missing records alone are not proof. Preserve authorization/scope/transport/pins and all
+history and responsibilities. No automatic stop or blind retry of uncertain launch.
+Reviews/adjudications have no fixed attempt cap. Retry only with concrete recovery or
+evidence; no debate loops, recursive acceptance agents or continuation requests solely
+because of an attempt count. Repeat checks only for a concrete issue or evidence gap.
 
 Read [contracts](../../references/contracts.md) for structured results; review and
 adjudication always return exact JSON. Validate schemas and acceptance semantics,

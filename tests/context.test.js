@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { execFileSync } from "node:child_process";
 import { Workflow, ROOT, ENTRY } from "../src/infrastructure/workflow-runtime.ts";
 import { delta } from "../src/infrastructure/claude.ts";
+import { modelView, MODEL_VIEW_MAX_BYTES } from "../extensions/model-view.ts";
 import {
   prepareBranchEntries,
   convertToLlm,
@@ -143,6 +144,67 @@ async function fixture(t) {
   return { session, manager, baseline, job, task, cwd, tool };
 }
 
+test("decision, succession and actionable error recovery are allowlisted without private state", () => {
+  const task = modelView({
+    task_id: "task",
+    jobs: [
+      {
+        run_id: "successor",
+        predecessor_run: "failed",
+        handoff: "requirements/code/checks/unresolved",
+        succession_reason: "Unavailable",
+        assessed_decisions: ["decision"],
+        dispatch: "confirmed",
+        cessation: { source: "native host", status: "stopped", agent_id: "old" },
+        cli: { baseline: marker },
+      },
+    ],
+    dispositions: [
+      {
+        id: "decision",
+        finding_id: "identity",
+        review_run: "review",
+        ref: "bugs/0",
+        prior_decision: "prior",
+        prior_finding: "origin/bugs/0",
+        review_hash: "hash",
+        target_id: "target",
+        action: "optional",
+        route: "clear",
+        authority: "scope",
+        rationale: "Not required",
+        evidence: "Contract",
+      },
+    ],
+  });
+  assert.equal(task.jobs[0].predecessor_run, "failed");
+  assert.equal(task.dispositions[0].prior_decision, "prior");
+  assert.equal(task.dispositions[0].prior_finding, "origin/bugs/0");
+  assert.deepEqual(task.jobs[0].assessed_decisions, ["decision"]);
+  assert.ok(!JSON.stringify(task).includes(marker));
+  const error = modelView({
+    diagnostic: "Operation failed",
+    task_id: "task",
+    run_id: "partial",
+    phase: "implementation",
+    accepted: false,
+    recovery: [
+      {
+        run_id: "partial",
+        dispatch: "uncertain",
+        lifecycle: "possibly launched",
+        allowed: ["status", "collect"],
+        blocked: ["blind retry"],
+        guidance: "Recover exact host identity",
+      },
+    ],
+    private: marker,
+  });
+  assert.equal(error.recovery[0].dispatch, "uncertain");
+  assert.deepEqual(error.recovery[0].blocked, ["blind retry"]);
+  assert.ok(Buffer.byteLength(JSON.stringify(error)) <= MODEL_VIEW_MAX_BYTES);
+  assert.ok(!JSON.stringify(error).includes(marker));
+});
 test("registered tool and startup guidance bound 15k-file restored state with observational baseline", async (t) => {
   const f = await fixture(t);
   const result = await f.tool.execute(
