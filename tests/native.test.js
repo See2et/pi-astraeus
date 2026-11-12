@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { execFileSync } from "node:child_process";
 import { setTimeout as delay } from "node:timers/promises";
-import { rpc } from "../src/infrastructure/workflow-runtime.ts";
+import { Workflow, ENTRY, rpc } from "../src/infrastructure/workflow-runtime.ts";
 
 test("Pi 1.0.4 loads both factories and runs real fresh/reused children with only a local stub", async (t) => {
   const base = await mkdtemp(join(tmpdir(), "pi-astraeus-native-"));
@@ -238,6 +238,41 @@ test("Pi 1.0.4 loads both factories and runs real fresh/reused children with onl
       (await invoke({ op: "collect", task_id: "native-worker", run_id: worker.run_id })).valid,
       true,
     );
+    // Use genuine host lifecycle entries from the real local-stub child, with
+    // a disconnected manager facade (the same lookup result as cleanup).
+    const history = structuredClone(sessionManager.getBranch());
+    const snapshot = history.findLast((entry) => entry.customType === ENTRY);
+    const historicalOwner = snapshot.data.tasks["native-worker"].jobs[0];
+    delete historicalOwner.cessation; // pre-recovery collector compatibility
+    historicalOwner.dispatch = "uncertain";
+    const terminal = history.findLast(
+      (entry) => entry.customType === "subagents:record" && entry.data.id === worker.agent_id,
+    );
+    assert.ok(terminal, "The real host must persist terminal lifecycle metadata");
+    const recovery = new Workflow({
+      events,
+      manager: () => undefined,
+      appendEntry: (customType, data) => history.push({ type: "custom", customType, data }),
+    });
+    const recoveryCtx = {
+      cwd,
+      hasUI: false,
+      sessionManager: {
+        getSessionId: () => sessionManager.getSessionId(),
+        getBranch: () => history,
+      },
+    };
+    recovery.restore(recoveryCtx);
+    const recovered = await recovery.execute(
+      { op: "collect", task_id: "native-worker", run_id: worker.run_id },
+      recoveryCtx,
+    );
+    assert.equal(recovered.valid, true);
+    assert.equal(recovered.cessation?.entry_id, terminal.id);
+    assert.equal(recovered.cessation?.run_id, worker.run_id);
+    assert.equal(recovered.cessation?.cwd, cwd);
+    assert.equal(recovered.cessation?.status, "completed");
+    assert.equal(requests, 2, "Historical recovery must not launch inference");
     const follow = await invoke({
       op: "resume",
       task_id: "native-worker",

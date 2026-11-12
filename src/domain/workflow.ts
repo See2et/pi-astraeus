@@ -131,7 +131,19 @@ export interface Job {
   predecessor_run?: string;
   handoff?: string;
   succession_reason?: string;
-  cessation?: { source: string; status: string; agent_id: string };
+  cessation?: {
+    source: string;
+    status: string;
+    agent_id: string;
+    run_id?: string;
+    cwd?: string;
+    role?: Role;
+    session_id?: string;
+    entry_id?: string;
+    dispatch_entry_id?: string;
+    binding_entry_id?: string;
+    evidence_hash?: string;
+  };
   dispatch?: "never" | "uncertain" | "confirmed";
   resume_from?: string;
   assessed_decisions?: string[];

@@ -135,7 +135,23 @@ const parameters = Type.Object({
   ),
 });
 export default function (pi: ExtensionAPI) {
-  const delivery = lifecycleDelivery(pi);
+  const delivery = lifecycleDelivery(pi, {
+    unfinished: (ctx) =>
+      Object.values(workflow.tasks).some(
+        (task) => !task.accepted && task.cwd === realpathSync(ctx.cwd),
+      ),
+    notification: (message, ctx) => {
+      if (message.customType !== "subagent-notification") return false;
+      const details = message.details as { id?: string; others?: { id?: string }[] } | undefined;
+      const ids = new Set([details?.id, ...(details?.others ?? []).map((other) => other.id)]);
+      return Object.values(workflow.tasks).some(
+        (task) =>
+          !task.accepted &&
+          task.cwd === realpathSync(ctx.cwd) &&
+          task.jobs.some((job) => !!job.agent_id && ids.has(job.agent_id)),
+      );
+    },
+  });
   const workflow = new Workflow({
     events: pi.events,
     appendEntry: (type: string, data: unknown) => pi.appendEntry(type, data),
@@ -236,9 +252,10 @@ export default function (pi: ExtensionAPI) {
       },
     };
   });
-  pi.on("context", (event) => ({
-    messages: sanitizeContext(event.messages, guidance(Object.values(workflow.tasks))),
-  }));
+  pi.on("context", (event) => {
+    delivery.context(event.messages);
+    return { messages: sanitizeContext(event.messages, guidance(Object.values(workflow.tasks))) };
+  });
   // Pi compaction has its own summarization path, outside the context event.
   // Change only request-local preparations, not branchEntries/raw session history.
   pi.on("session_before_compact", (event) => {

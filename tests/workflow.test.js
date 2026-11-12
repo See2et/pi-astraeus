@@ -73,7 +73,13 @@ async function fixture(t) {
     events,
     agentDir: () => agentDir,
     appendEntry: (customType, data) =>
-      entries.push({ type: "custom", customType, data: structuredClone(data) }),
+      entries.push({
+        type: "custom",
+        id: `entry-${entries.length}`,
+        timestamp: new Date().toISOString(),
+        customType,
+        data: structuredClone(data),
+      }),
     manager: () => ({ getRecord: (id) => records.get(id) }),
     supportedThinking: () => ["off", "low", "medium", "high"],
     parseFrontmatter,
@@ -533,6 +539,112 @@ test("fresh owner succession needs verified cessation and successor failure cann
   await f.act({ op: "collect", run_id: review.run_id });
   assert.equal((await f.act({ op: "accept" })).accepted, true);
 });
+test("collect recovers exact host cessation after cleanup without rewriting a collected outcome", async (t) => {
+  const f = await fixture(t),
+    owner = await f.delegate("worker");
+  f.complete(owner, "Original outcome");
+  f.host.appendEntry("subagents:record", {
+    id: owner.agent_id,
+    type: "astraeus-worker",
+    description: "task: worker",
+    status: "completed",
+    startedAt: Date.now(),
+    completedAt: Date.now(),
+  });
+  await f.act({ op: "collect", run_id: owner.run_id });
+  // Older collectors did not retain cessation. Restore their persisted shape.
+  delete owner.cessation;
+  owner.dispatch = "uncertain";
+  f.workflow.save(f.ctx);
+  const before = structuredClone(owner),
+    receipt = await readFile(owner.receipt_path, "utf8");
+  f.records.clear();
+  f.workflow.restore(f.ctx);
+  await assert.rejects(f.delegate("reviewer"), /Freeze writers/);
+  const recovered = await f.act({ op: "collect", run_id: owner.run_id });
+  assert.equal(recovered.cessation?.status, "completed");
+  assert.equal(recovered.cessation?.run_id, owner.run_id);
+  assert.equal(recovered.cessation?.cwd, f.cwd);
+  assert.equal(recovered.cessation?.role, "worker");
+  assert.ok(recovered.cessation?.evidence_hash?.startsWith("sha256:"));
+  const after = structuredClone(f.workflow.tasks.task.jobs[0]);
+  delete after.cessation;
+  assert.deepEqual(after, before, "Cessation recovery must preserve the historical outcome");
+  assert.equal(await readFile(owner.receipt_path, "utf8"), receipt);
+  f.workflow.restore(f.ctx);
+  const repeated = await f.act({ op: "collect", run_id: owner.run_id });
+  assert.deepEqual(repeated.cessation, recovered.cessation, "Recovery persists and is repeatable");
+  const review = await f.delegate("reviewer");
+  assert.ok(review.agent_id, "Verified cessation releases the review freeze");
+});
+test("history recovery before collection proves cessation, never a successful outcome", async (t) => {
+  const f = await fixture(t),
+    owner = await f.delegate("worker");
+  f.host.appendEntry("subagents:record", {
+    id: owner.agent_id,
+    type: "astraeus-worker",
+    description: "task: worker",
+    status: "completed",
+    startedAt: Date.now(),
+    completedAt: Date.now(),
+    result: "This text is not cessation evidence or a verified result",
+  });
+  f.records.clear();
+  const recovered = await f.act({ op: "collect", run_id: owner.run_id });
+  assert.equal(recovered.cessation?.status, "completed");
+  assert.equal(recovered.valid, false);
+  assert.equal(recovered.collected, true);
+  assert.equal(recovered.summary, undefined);
+  const successor = await f.delegate("worker", {
+    predecessor_run: owner.run_id,
+    handoff: "Outcome still needs verification",
+    reason: "Original live session was cleaned up",
+  });
+  assert.equal(successor.predecessor_run, owner.run_id);
+});
+test.for([
+  ["absent", (entries, terminal) => entries.splice(entries.indexOf(terminal), 1)],
+  ["ambiguous", (entries, terminal) => entries.push(structuredClone(terminal))],
+  ["agent mismatch", (_entries, terminal) => (terminal.data.id = "another-agent")],
+  ["role mismatch", (_entries, terminal) => (terminal.data.type = "astraeus-reviewer")],
+  ["nonterminal", (_entries, terminal) => (terminal.data.status = "running")],
+  ["missing lifecycle time", (_entries, terminal) => delete terminal.data.completedAt],
+  ["predecessor lifecycle time", (_entries, terminal) => (terminal.data.startedAt = 1)],
+  ["cwd mismatch", (entries) => (entries.at(-1).data.tasks.task.cwd = "/another-repo")],
+  ["run mismatch", (entries) => (entries.at(-1).data.tasks.task.jobs[0].run_id = "other-run")],
+])("native history stays blocking for %s evidence", async ([_name, corrupt], t) => {
+  const f = await fixture(t),
+    owner = await f.delegate("worker");
+  f.host.appendEntry("subagents:record", {
+    id: owner.agent_id,
+    type: "astraeus-worker",
+    description: "task: worker",
+    status: "completed",
+    startedAt: Date.now(),
+    completedAt: Date.now(),
+  });
+  const terminal = f.ctx.sessionManager.getBranch().at(-1);
+  f.complete(owner, "Saved outcome remains intact");
+  await f.act({ op: "collect", run_id: owner.run_id });
+  delete owner.cessation;
+  owner.dispatch = "uncertain";
+  f.workflow.save(f.ctx);
+  corrupt(f.ctx.sessionManager.getBranch(), terminal);
+  f.records.clear();
+  const recovered = await f.act({ op: "collect", run_id: owner.run_id });
+  assert.equal(recovered.cessation, undefined);
+  assert.equal(recovered.valid, true, "A historical outcome is not rewritten");
+  assert.match(recovered.note, /Native terminal history blocked/);
+  await assert.rejects(f.delegate("reviewer"), /Freeze writers/);
+  await assert.rejects(
+    f.delegate("worker", {
+      predecessor_run: owner.run_id,
+      handoff: "No cessation evidence",
+      reason: "Manager cleanup",
+    }),
+    /cessation|writes/,
+  );
+});
 test("clear requirement-backed fix routes to owner assessment, preserving source binding", async (t) => {
   const f = await fixture(t),
     owner = await f.delegate("worker");
@@ -582,7 +694,26 @@ test("uncertain native resume cannot accept a completed predecessor's output as 
   const collected = await f.act({ op: "collect", run_id: follow.run_id });
   assert.equal(collected.valid, false);
   assert.match(collected.error, /predecessor/);
-  await assert.rejects(f.act({ op: "accept" }), /owner.*failed|incomplete/);
+  // A late host entry may still describe the original completed turn. Its
+  // agent ID is shared; that is not evidence this uncertain resume ended.
+  f.host.appendEntry("subagents:record", {
+    id: owner.agent_id,
+    type: "astraeus-worker",
+    description: "task: worker",
+    status: "completed",
+    startedAt: Date.now(),
+    completedAt: Date.now(),
+    result: "Previous run succeeded",
+  });
+  f.records.clear();
+  const recovered = await f.act({ op: "collect", run_id: follow.run_id });
+  assert.equal(recovered.cessation, undefined);
+  assert.equal(recovered.valid, false);
+  assert.match(recovered.note, /uncertain resume/);
+  const predecessor = await f.act({ op: "collect", run_id: owner.run_id });
+  assert.match(predecessor.note, /another task or later run/);
+  await assert.rejects(f.delegate("reviewer"), /Freeze writers/);
+  await assert.rejects(f.act({ op: "accept" }), /ongoing writes|owner.*failed|incomplete/);
 });
 test("unbound uncertain launch remains blocked after collection; no blind redispatch", async (t) => {
   const f = await fixture(t);

@@ -88,6 +88,16 @@ implementation + ordinary verification (same owner)
      inconclusive     -> obtain bounded missing evidence -> fresh review
 ```
 
+For a cleaned-up native manager record, reopen the original Pi session and active
+branch, then call `astraeus_workflow` with `op: "collect"`, the exact `task_id` and
+`run_id` (also for an already-collected run). Collection can reconcile cessation
+from the host's persisted `subagents:record` joined to the original run/agent/cwd/role
+dispatch checkpoints. It preserves the saved outcome and receipt/report hashes;
+historical terminal evidence alone never creates successful output. Missing tasks,
+missing/ambiguous/mismatched/nonterminal history, or an uncertain resume remain
+blocking. It does not search other sessions, stop/relaunch workers, or edit private
+state; recover the original session/branch or report the missing evidence instead.
+
 Native worker output is concise prose describing actual changes and checks. CLI designers
 write a run-bound implementation JSON to their run-specific pending report. Reviewer and
 adjudicator output is exactly one JSON object (one JSON fence is tolerated), matching
@@ -179,6 +189,12 @@ user prompts. Delivery stays pending until an actual `agent_start`, not merely d
 If user- or notification-owned preparation exits without a run, autonomous idle retry
 uses a hidden wake for the already-appended notice, backing off from 100 ms to 5 seconds.
 Manual compaction/non-streaming busy work delays wakes without waiting for new user input.
+A successful manual compact that interrupts unfinished managed parent work requests one
+continuation on the same session/branch. Cancellation or failure alone does not restart
+it; explicit stop, reload and navigation discard that continuation. Unconsumed queued
+notices retain their own delivery obligation, and managed native completion notifications
+also wait through compaction. Explicit stop cancels existing notice wakes; later transitions
+can notify again. Neither path automatically collects, accepts or relaunches children.
 Notices are appended once; stable public observations do not create duplicate notices.
 A user arriving during a notification-owned wake waits before submission; registered
 commands still execute immediately and explicit streaming delivery choices are unchanged.

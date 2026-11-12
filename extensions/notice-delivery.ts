@@ -4,19 +4,41 @@ import {
   type ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 
-type Owner = { waking: boolean; flush(): void };
-type Pending = { sessionId: string; anchors: Set<string>; attempts: number; retryAt: number };
+type Message = Parameters<ExtensionAPI["sendMessage"]>[0];
+type SendOptions = Parameters<AgentSession["sendCustomMessage"]>[1];
+type Owner = {
+  waking: boolean;
+  flush(): void;
+  compact?(session: AgentSession): (success: boolean) => void;
+  stop?(): void;
+  native?(message: Message, options: SendOptions): SendOptions;
+  appended?(message: Message): void;
+};
+type Pending = {
+  sessionId: string;
+  anchors: Set<string>;
+  attempts: number;
+  retryAt: number;
+  notices?: Message[];
+};
 type Flight = {
   prompts: number;
   messages?: number;
   active?: boolean;
   pending?: Pending;
   owner?: Owner;
+  compacting?: number;
+  compactAbort?: boolean;
+  stopped?: boolean;
 };
 const onBranch = (ctx: ExtensionContext, pending: Pending) =>
   ctx.sessionManager.getSessionId() === pending.sessionId &&
   ctx.sessionManager.getBranch().some((entry) => pending.anchors.has(entry.id));
-type Observer = { flights: WeakMap<object, Flight>; messagesObserved?: boolean };
+type Observer = {
+  flights: WeakMap<object, Flight>;
+  messagesObserved?: boolean;
+  compactObserved?: boolean;
+};
 const observerKey = Symbol.for("pi-astraeus:prompt-flight-observer");
 
 // Pi 1.0.4 has no preflight-complete event: isIdle() is true while prompt()
@@ -74,10 +96,61 @@ function observePrompts(): Observer {
     };
     observer.messagesObserved = true;
   }
+  if (!observer.compactObserved) {
+    // Upgrade the retained public-method observer in place. The reservation must
+    // precede compact's initial abort, not the later session_before_compact hook.
+    const compact = prototype.compact;
+    const abort = prototype.abort;
+    const send = prototype.sendCustomMessage;
+    prototype.compact = async function (...args: Parameters<AgentSession["compact"]>) {
+      const flight = observer.flights.get(this.sessionManager);
+      if (!flight?.owner) return compact.apply(this, args);
+      flight.compacting = (flight.compacting ?? 0) + 1;
+      const finish = flight.owner.compact?.(this);
+      let success = false;
+      try {
+        flight.compactAbort = true;
+        let operation: ReturnType<AgentSession["compact"]>;
+        try {
+          operation = compact.apply(this, args);
+        } finally {
+          flight.compactAbort = false;
+        }
+        const result = await operation;
+        success = true;
+        return result;
+      } finally {
+        flight.compacting--;
+        finish?.(success);
+        flight.owner?.flush();
+      }
+    };
+    prototype.abort = function (...args: Parameters<AgentSession["abort"]>) {
+      const flight = observer.flights.get(this.sessionManager);
+      const internal = flight?.compactAbort;
+      if (flight) flight.compactAbort = false;
+      if (!internal) flight?.owner?.stop?.();
+      return abort.apply(this, args);
+    };
+    prototype.sendCustomMessage = async function (message, options) {
+      const owner = observer.flights.get(this.sessionManager)?.owner;
+      const adapted = owner?.native?.(message, options);
+      const result = send.call(this, message, adapted ?? options);
+      if (adapted) owner?.appended?.(message);
+      return result;
+    };
+    observer.compactObserved = true;
+  }
   return observer;
 }
 
-export function lifecycleDelivery(pi: ExtensionAPI) {
+export function lifecycleDelivery(
+  pi: ExtensionAPI,
+  managed: {
+    unfinished(ctx: ExtensionContext): boolean;
+    notification(message: Message, ctx: ExtensionContext): boolean;
+  },
+) {
   const observer = observePrompts();
   let current:
     | {
@@ -85,18 +158,21 @@ export function lifecycleDelivery(pi: ExtensionAPI) {
         flight: Flight;
         owner: Owner;
         pending?: Pending;
+        interruption?: Pending;
+        continuation?: Pending;
         timer?: ReturnType<typeof setTimeout>;
       }
     | undefined;
   const retry = () => {
     const state = current;
-    if (!state?.pending || state.timer) return;
+    const obligation = state?.pending ?? state?.continuation;
+    if (!state || !obligation || state.timer) return;
     state.timer = setTimeout(
       () => {
         state.timer = undefined;
         state.owner.flush();
       },
-      Math.max(100, state.pending.retryAt - Date.now()),
+      Math.max(100, obligation.retryAt - Date.now()),
     );
     state.timer.unref?.();
   };
@@ -117,24 +193,75 @@ export function lifecycleDelivery(pi: ExtensionAPI) {
     flight.pending = pending;
     const owner: Owner = {
       waking: false,
+      compact(session) {
+        const state = current;
+        const anchor = ctx.sessionManager.getLeafId();
+        if (
+          !state ||
+          flight.stopped ||
+          !(flight.active || session.isStreaming) ||
+          !managed.unfinished(ctx) ||
+          !anchor
+        )
+          return () => {};
+        const interruption: Pending = {
+          sessionId: ctx.sessionManager.getSessionId(),
+          anchors: new Set([anchor]),
+          attempts: 0,
+          retryAt: 0,
+        };
+        state.interruption = interruption;
+        return (success) => {
+          if (current !== state || state.interruption !== interruption) return;
+          state.interruption = undefined;
+          if (success && managed.unfinished(ctx) && onBranch(ctx, interruption))
+            state.continuation = interruption;
+        };
+      },
+      stop() {
+        if (current?.owner !== owner) return;
+        current.interruption = undefined;
+        current.continuation = undefined;
+        // Explicit stop cancels existing autonomous attention, including the
+        // session-owned reload obligation, without deleting notices/history or
+        // suppressing a genuinely later transition. Compact's own abort skips stop.
+        current.pending = undefined;
+        delete flight.pending;
+        clearTimeout(current.timer);
+        current.timer = undefined;
+        flight.stopped = true;
+      },
+      native(message, options) {
+        if (
+          options?.triggerTurn &&
+          options.deliverAs === "followUp" &&
+          managed.notification(message, ctx)
+        )
+          return prepare(message);
+        return undefined;
+      },
+      appended: anchorNotice,
       flush() {
         const state = current;
-        if (!state || state.owner !== owner || !state.pending) return;
+        if (!state || state.owner !== owner) return;
         if (
-          ctx.sessionManager.getSessionId() !== state.pending.sessionId ||
-          (state.pending.anchors.size > 0 && !onBranch(ctx, state.pending))
+          state.pending &&
+          (state.pending.sessionId !== ctx.sessionManager.getSessionId() ||
+            (state.pending.anchors.size > 0 && !onBranch(ctx, state.pending)))
         ) {
           state.pending = undefined;
           delete flight.pending;
-          clearTimeout(state.timer);
-          state.timer = undefined;
-          return;
         }
+        if (state.continuation && (!onBranch(ctx, state.continuation) || !managed.unfinished(ctx)))
+          state.continuation = undefined;
+        const obligation = state.pending ?? state.continuation;
+        if (!obligation) return;
         if (
+          flight.compacting ||
           flight.prompts ||
           flight.messages ||
           flight.active ||
-          Date.now() < state.pending.retryAt
+          Date.now() < obligation.retryAt
         ) {
           retry();
           return;
@@ -156,20 +283,23 @@ export function lifecycleDelivery(pi: ExtensionAPI) {
         }
         clearTimeout(state.timer);
         state.timer = undefined;
-        // Dispatch is not consumption. Only agent_start clears this obligation;
-        // handled/failed preparation retries without another user prompt or notice.
-        state.pending.retryAt =
-          Date.now() + Math.min(5000, 100 * 2 ** Math.min(state.pending.attempts++, 6));
+        // Dispatch is not consumption. A new agent_start can consume the wake;
+        // queued notices are also consumed when they enter an active context.
+        // Handled/failed preparation retries without another user prompt or notice.
+        obligation.retryAt =
+          Date.now() + Math.min(5000, 100 * 2 ** Math.min(obligation.attempts++, 6));
         owner.waking = true;
-        // The notice was already appended once. A failed/handled preflight never
-        // consumed it; wake with a distinct hidden context message, not a duplicate
-        // notice or synthetic user prompt. No success is inferred.
+        // Leave queued/appended attention intact and wake with a hidden context
+        // message, never a duplicate notice or synthetic user prompt. A successful
+        // manual interruption adds only a parent continuation, not child actions.
         retry();
         pi.sendMessage(
           {
             customType: "pi-astraeus:claude-wake",
             display: false,
-            content: "Pending Claude lifecycle notice needs attention; no success inferred.",
+            content: state.pending
+              ? "Pending managed lifecycle/completion notice needs attention; no success inferred."
+              : "Manual compaction interrupted unfinished Astraeus work. Continue the parent work; do not infer child success or automatically collect, accept, or relaunch children.",
           },
           { deliverAs: "followUp", triggerTurn: true },
         );
@@ -180,6 +310,51 @@ export function lifecycleDelivery(pi: ExtensionAPI) {
     current = { ctx, flight, owner, pending };
     retry();
   };
+  // Track attention before dispatch, including native followUp messages that Pi
+  // has queued but not appended. Dispatch and turn_start are not consumption:
+  // only an actual model context containing those messages consumes that queue.
+  const prepare = (message: Message): SendOptions => {
+    const state = current!;
+    const idle = state.ctx.isIdle();
+    const running = state.flight.active || state.ctx.signal !== undefined;
+    const active = !state.flight.compacting && running;
+    const preparing =
+      state.flight.prompts > 0 ||
+      (state.flight.messages ?? 0) > 0 ||
+      (state.owner.waking && !active);
+    const deferred = !!state.flight.compacting || (preparing && idle) || (!idle && !active);
+    state.pending ??= {
+      sessionId: state.ctx.sessionManager.getSessionId(),
+      anchors: new Set(),
+      attempts: 0,
+      retryAt: 0,
+    };
+    state.pending.notices ??= [];
+    state.pending.notices.push(message);
+    state.flight.pending = state.pending;
+    // An active followUp has no entry yet. Bind it to its originating branch
+    // until the persisted notice itself can supply the anchor.
+    if (running) {
+      const leaf = state.ctx.sessionManager.getLeafId();
+      if (leaf) state.pending.anchors.add(leaf);
+    }
+    if (!deferred && idle) {
+      state.owner.waking = true;
+      state.pending.retryAt = Date.now() + 100;
+      state.pending.attempts = 1;
+    }
+    retry();
+    return { deliverAs: "followUp", triggerTurn: !deferred };
+  };
+  function anchorNotice(message: Message) {
+    const leaf = current?.ctx.sessionManager.getLeafEntry();
+    if (
+      leaf?.type === "custom_message" &&
+      leaf.customType === message.customType &&
+      leaf.content === message.content
+    )
+      current?.pending?.anchors.add(leaf.id);
+  }
   return {
     start,
     dispose,
@@ -188,7 +363,11 @@ export function lifecycleDelivery(pi: ExtensionAPI) {
         // Session-owned, like prompt reservations: preserve this across reload,
         // rather than mistaking non-streaming compaction for an active run.
         current.flight.active = true;
+        if (current.flight.compacting) return;
+        current.flight.stopped = false;
         current.pending = undefined;
+        current.interruption = undefined;
+        current.continuation = undefined;
         delete current.flight.pending;
         clearTimeout(current.timer);
         current.timer = undefined;
@@ -201,51 +380,27 @@ export function lifecycleDelivery(pi: ExtensionAPI) {
         current.owner.flush();
       }
     },
-    notify(message: Parameters<ExtensionAPI["sendMessage"]>[0]) {
+    context(messages: { role: string; customType?: string; content?: unknown }[]) {
+      const pending = current?.pending;
+      if (!pending?.notices?.length) return;
+      pending.notices = pending.notices.filter(
+        (notice) =>
+          !messages.some(
+            (message) =>
+              message.role === "custom" &&
+              message.customType === notice.customType &&
+              JSON.stringify(message.content) === JSON.stringify(notice.content),
+          ),
+      );
+      if (!pending.notices.length) {
+        current!.pending = undefined;
+        delete current!.flight.pending;
+      }
+    },
+    notify(message: Message) {
       if (!current) return;
-      const idle = current.ctx.isIdle();
-      // Pi exposes the run signal before dispatching agent_start handlers in
-      // order. An earlier awaited handler can therefore be streaming before
-      // our own active flag is set; it must retain native followUp delivery.
-      const active = current.flight.active || current.ctx.signal !== undefined;
-      const preparing =
-        current.flight.prompts > 0 ||
-        (current.flight.messages ?? 0) > 0 ||
-        (current.owner.waking && !active);
-      const deferred = (preparing && idle) || (!idle && !active);
-      if (deferred || idle) {
-        current.pending ??= {
-          sessionId: current.ctx.sessionManager.getSessionId(),
-          anchors: new Set(),
-          attempts: 0,
-          retryAt: 0,
-        };
-        current.flight.pending = current.pending;
-      }
-      if (!deferred && idle && current.pending) {
-        current.owner.waking = true;
-        current.pending.retryAt = Date.now() + 100;
-        current.pending.attempts = 1;
-      }
-      // Non-triggering delivery appends context for the reserved user run, or
-      // waits out non-streaming busy work (manual compaction). isIdle() false
-      // alone does NOT imply sendMessage will queue: Pi starts a competing run
-      // if triggerTurn is true while compaction, rather than a run, owns it.
-      // Active runs retain Pi's native followUp queue; truly idle roots wake.
-      if (current.pending) retry();
-      pi.sendMessage(message, { deliverAs: "followUp", triggerTurn: !deferred });
-      if (current.pending) {
-        // Non-triggering delivery appends synchronously in the pinned SDK. Use
-        // the notices themselves, not the pre-send ancestor or exact current
-        // leaf: later notices must not overwrite earlier unconsumed anchors.
-        const leaf = current.ctx.sessionManager.getLeafEntry();
-        if (
-          leaf?.type === "custom_message" &&
-          leaf.customType === message.customType &&
-          leaf.content === message.content
-        )
-          current.pending.anchors.add(leaf.id);
-      }
+      pi.sendMessage(message, prepare(message));
+      anchorNotice(message);
     },
   };
 }

@@ -1,6 +1,7 @@
 import { test } from "vitest";
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, cp, rm, writeFile } from "node:fs/promises";
+import { execFileSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -208,7 +209,7 @@ test("fake observation child timeout/output/cancellation are bounded without sto
   assert.match((await pending).diagnostic, /cancelled/);
 });
 
-async function notificationFixture(t, initialState = "done", holdStartup = false) {
+async function notificationFixture(t, initialState = "done", holdStartup = false, native = false) {
   const base = await mkdtemp(join(tmpdir(), "astraeus-notices-"));
   t.onTestFinished(() => rm(base, { recursive: true, force: true }));
   const cwd = join(base, "repo"),
@@ -217,6 +218,11 @@ async function notificationFixture(t, initialState = "done", holdStartup = false
     recordPath = join(base, "records.json"),
     startedPath = join(base, "query-started");
   await Promise.all([mkdir(cwd), mkdir(agentDir), mkdir(bin)]);
+  if (native) {
+    execFileSync("git", ["init", "-q"], { cwd });
+    await cp(join(ROOT, "agents"), join(agentDir, "agents"), { recursive: true });
+    await writeFile(join(cwd, "astraeus.toml"), 'allowed_models = ["local-notice/stub"]\n');
+  }
   const record = {
     id: "12345678",
     sessionId: uuid,
@@ -252,7 +258,8 @@ async function notificationFixture(t, initialState = "done", holdStartup = false
     ModelRuntime,
     createEventBus,
   } = await import("@earendil-works/pi-coding-agent");
-  const { createAssistantMessageEventStream } = await import("@earendil-works/pi-ai");
+  const { createAssistantMessageEventStream, getCurrentTools } =
+    await import("@earendil-works/pi-ai");
   let parentRequests = 0;
   const prompts = {
     hold: false,
@@ -261,6 +268,7 @@ async function notificationFixture(t, initialState = "done", holdStartup = false
     input: null,
     commands: 0,
     attempts: 0,
+    childFinishes: [],
   };
   const navigation = {
     cancel: false,
@@ -269,7 +277,14 @@ async function notificationFixture(t, initialState = "done", holdStartup = false
     summaryRequests: 0,
     finish: null,
   };
-  const compaction = { gate: null, started: false };
+  const compaction = {
+    gate: null,
+    started: false,
+    success: false,
+    error: false,
+    abortGate: null,
+    aborting: false,
+  };
   const fake = (pi) => {
     pi.registerCommand("fixture-immediate", {
       description: "Deterministic command",
@@ -285,11 +300,30 @@ async function notificationFixture(t, initialState = "done", holdStartup = false
       await input.promise;
       return input.result;
     });
-    pi.on("session_before_compact", async () => {
+    pi.on("session_before_compact", async (event) => {
       if (!compaction.gate) return;
       compaction.started = true;
       await compaction.gate;
-      return { cancel: true };
+      if (compaction.error) {
+        navigation.summaryMode = "error";
+        return;
+      }
+      return compaction.success
+        ? {
+            compaction: {
+              summary: "Fixture compacted work; still unfinished.",
+              firstKeptEntryId: event.preparation.firstKeptEntryId,
+              tokensBefore: event.preparation.tokensBefore,
+            },
+          }
+        : { cancel: true };
+    });
+    pi.on("agent_settled", async () => {
+      if (!compaction.abortGate) return;
+      const gate = compaction.abortGate;
+      compaction.abortGate = null;
+      compaction.aborting = true;
+      await gate;
     });
     pi.on("session_before_tree", () => (navigation.cancel ? { cancel: true } : undefined));
     pi.on("session_tree", () => {
@@ -347,13 +381,32 @@ async function notificationFixture(t, initialState = "done", holdStartup = false
           options?.signal?.addEventListener("abort", abort, { once: true });
           if (options?.signal?.aborted) abort();
         } else {
-          parentRequests++;
-          prompts.contexts.push(structuredClone(_context.messages));
-          const finish = () => {
-            stream.push({ type: "done", reason: "stop", message });
+          const child =
+            native &&
+            !getCurrentTools(_context.messages).some((tool) => tool.name === "astraeus_workflow");
+          if (!child) {
+            parentRequests++;
+            prompts.contexts.push(structuredClone(_context.messages));
+          }
+          let finished = false;
+          const finish = (reason = "stop") => {
+            if (finished) return;
+            finished = true;
+            options?.signal?.removeEventListener("abort", abort);
+            message.stopReason = reason;
+            if (reason === "aborted") message.errorMessage = "Fixture response aborted";
+            stream.push(
+              reason === "stop"
+                ? { type: "done", reason, message }
+                : { type: "error", reason, error: message },
+            );
             stream.end(message);
           };
-          if (prompts.hold) prompts.finishes.push(finish);
+          const abort = () => finish("aborted");
+          options?.signal?.addEventListener("abort", abort, { once: true });
+          if (options?.signal?.aborted) abort();
+          else if (child) prompts.childFinishes.push(finish);
+          else if (prompts.hold) prompts.finishes.push(finish);
           else queueMicrotask(finish);
         }
         return stream;
@@ -398,7 +451,13 @@ async function notificationFixture(t, initialState = "done", holdStartup = false
     noExtensions: true,
     noContextFiles: true,
     extensionFactories: [fake],
-    additionalExtensionPaths: holdStartup ? [startup.extension, ROOT] : [ROOT],
+    additionalExtensionPaths: [
+      ...(holdStartup ? [startup.extension] : []),
+      ...(native
+        ? [process.env.PI_ASTRAEUS_SUBAGENTS || join(ROOT, "node_modules/@tintinweb/pi-subagents")]
+        : []),
+      ROOT,
+    ],
     disabledBuiltinExtensions: ["mcp"],
   });
   await loader.reload();
@@ -410,7 +469,10 @@ async function notificationFixture(t, initialState = "done", holdStartup = false
       "gate extension must run before Astraeus, not an appended inline factory",
     );
   const manager = SessionManager.inMemory(cwd);
-  manager.appendCustomEntry(ENTRY, { version: 1, tasks: { fixture: task(cwd) } });
+  manager.appendCustomEntry(ENTRY, {
+    version: 1,
+    tasks: { fixture: task(cwd, native ? [] : [job()]) },
+  });
   const { session } = await createAgentSession({
     cwd,
     agentDir,
@@ -743,7 +805,7 @@ for (const exit of ["handled", "auth-error"])
     }
   });
 
-async function heldCompaction(f) {
+function compactable(f) {
   // Enough persisted conversation for Pi's actual manual compaction entry point.
   f.manager.appendMessage({
     role: "user",
@@ -756,8 +818,13 @@ async function heldCompaction(f) {
     timestamp: Date.now(),
   });
   f.session.refreshContext();
+}
+
+async function heldCompaction(f, success = false) {
+  if (!f.session.isStreaming) compactable(f);
   let release;
   f.compaction.started = false;
+  f.compaction.success = success;
   f.compaction.gate = new Promise((resolve) => {
     release = resolve;
   });
@@ -768,6 +835,351 @@ async function heldCompaction(f) {
   await until(() => f.compaction.started);
   return { release, outcome };
 }
+
+test("successful manual compact continues only the interrupted unfinished managed parent", async (t) => {
+  const f = await notificationFixture(t, "working");
+  compactable(f);
+  f.prompts.hold = true;
+  const user = f.session.prompt("Unfinished managed work");
+  await until(() => f.parentRequests() === 1);
+  const compacting = await heldCompaction(f, true);
+  await user;
+  await delay(150);
+  assert.equal(f.parentRequests(), 1, "the initial abort is inside the busy window");
+  f.prompts.hold = false;
+  compacting.release();
+  assert.ok((await compacting.outcome).result);
+  await until(() => f.parentRequests() === 2);
+  await f.session.waitForIdle();
+  await delay(250);
+  assert.equal(f.parentRequests(), 2, "one autonomous continuation, not an unfinished-task loop");
+  assert.equal(
+    f.manager.getBranch().filter((e) => e.type === "message" && e.message.role === "user").length,
+    3,
+    "only seeded history and original user input; no synthetic user turn",
+  );
+  assert.deepEqual(f.errors, []);
+});
+
+for (const exit of ["cancel", "failure"])
+  test(`${exit} manual compact without independent attention does not continue the interrupted parent`, async (t) => {
+    const f = await notificationFixture(t, "working");
+    compactable(f);
+    f.prompts.hold = true;
+    const user = f.session.prompt("Interrupted managed parent");
+    await until(() => f.parentRequests() === 1);
+    f.compaction.error = exit === "failure";
+    const compacting = await heldCompaction(f);
+    await user;
+    f.prompts.hold = false;
+    compacting.release();
+    if (exit === "failure") {
+      await until(() => f.navigation.summaryRequests === 1);
+      f.navigation.finish("error");
+    }
+    assert.match(
+      (await compacting.outcome).error.message,
+      exit === "cancel" ? /Compaction cancelled/ : /Fixture summary error/,
+    );
+    await delay(350);
+    assert.equal(f.parentRequests(), 1);
+    assert.equal(f.notices.length, 0);
+  });
+
+for (const boundary of ["stop", "reload", "tree", "new-session", "user"])
+  test(`successful compact continuation respects ${boundary} before a reserved prompt exits`, async (t) => {
+    const f = await notificationFixture(t, "working");
+    compactable(f);
+    const target = f.manager.getLeafId();
+    f.prompts.hold = true;
+    const original = f.session.prompt("Interrupted managed work");
+    await until(() => f.parentRequests() === 1);
+    const compacting = await heldCompaction(f, true);
+    await original;
+    let release;
+    const gate = {
+      started: false,
+      promise: new Promise((resolve) => {
+        release = resolve;
+      }),
+      result: { action: boundary === "user" ? "continue" : "handled" },
+    };
+    f.prompts.input = gate;
+    const user = "User arriving at compact completion, exactly once";
+    let reserved;
+    const unsubscribe = f.session.subscribe((event) => {
+      if (event.type === "compaction_end" && event.result) reserved = f.session.prompt(user);
+    });
+    f.prompts.hold = false;
+    compacting.release();
+    assert.ok((await compacting.outcome).result);
+    unsubscribe();
+    await until(() => gate.started);
+    await delay(150);
+    assert.equal(f.parentRequests(), 1, "prompt reservation wins over the autonomous wake");
+    if (boundary === "stop") await f.session.abort();
+    if (boundary === "reload") await f.session.reload();
+    if (boundary === "tree") await f.session.navigateTree(target, { summarize: false });
+    if (boundary === "new-session") {
+      f.manager.newSession();
+      f.session.refreshContext();
+      await f.session.extensionRunner.emit({ type: "session_start", reason: "new" });
+    }
+    release();
+    await reserved;
+    await f.session.waitForIdle();
+    await delay(350);
+    assert.equal(f.parentRequests(), boundary === "user" ? 2 : 1);
+    assert.equal(
+      f.notices.filter((notice) => notice.message.customType === "pi-astraeus:claude-wake").length,
+      0,
+    );
+    if (boundary === "user") {
+      assert.equal(
+        f.manager
+          .buildSessionContext()
+          .messages.filter(
+            (message) =>
+              message.role === "user" && message.content.some((part) => part.text === user),
+          ).length,
+        1,
+      );
+      assert.equal(f.prompts.attempts, 2, "no duplicate low-level user turn or wake");
+    }
+    assert.deepEqual(f.errors, []);
+  });
+
+for (const scope of ["idle-managed", "unmanaged-active"])
+  test(`successful manual compact does not create an obligation for ${scope}`, async (t) => {
+    const f = await notificationFixture(t, "working");
+    if (scope === "unmanaged-active") {
+      f.manager.appendCustomEntry(ENTRY, { version: 1, tasks: {} });
+      await f.session.extensionRunner.emit({ type: "session_start" });
+    }
+    compactable(f);
+    f.prompts.hold = true;
+    const original = scope === "unmanaged-active" ? f.session.prompt("Ordinary Pi usage") : null;
+    if (original) await until(() => f.parentRequests() === 1);
+    const compacting = await heldCompaction(f, true);
+    await original;
+    f.prompts.hold = false;
+    compacting.release();
+    assert.ok((await compacting.outcome).result);
+    await delay(350);
+    assert.equal(f.parentRequests(), original ? 1 : 0);
+    assert.equal(f.notices.length, 0);
+  });
+
+test("explicit Escape clearQueue and abort cancels queued attention across reload, not later transitions", async (t) => {
+  const f = await notificationFixture(t, "working");
+  f.prompts.hold = true;
+  const original = f.session.prompt("Parent explicitly stopped before queued attention");
+  await until(() => f.parentRequests() === 1);
+  f.record.state = "done";
+  f.record.status = "idle";
+  await f.publish();
+  await f.status();
+  assert.equal(f.notices.length, 1);
+  assert.equal(f.session.agent.hasQueuedMessages(), true);
+  assert.equal(
+    f.manager.getBranch().filter((entry) => entry.customType === "pi-astraeus:claude-lifecycle")
+      .length,
+    0,
+  );
+
+  // Actual public Escape path: remove queued messages, then stop the parent.
+  f.session.clearQueue();
+  f.prompts.hold = false;
+  await f.session.abort();
+  await original;
+  await delay(350);
+  assert.equal(
+    f.parentRequests(),
+    1,
+    "explicit stop must not be undone by a pending attention wake",
+  );
+  await f.session.reload();
+  await delay(350);
+  assert.equal(
+    f.parentRequests(),
+    1,
+    "the cancelled obligation must not survive same-session reload",
+  );
+  assert.equal(
+    f.notices.filter((notice) => notice.message.customType === "pi-astraeus:claude-wake").length,
+    0,
+  );
+
+  f.record.state = "blocked";
+  await f.publish();
+  await f.status();
+  await until(() => f.parentRequests() === 2);
+  await f.session.waitForIdle();
+  await delay(200);
+  assert.equal(
+    f.parentRequests(),
+    2,
+    "a genuinely later independent transition may notify normally, once",
+  );
+  assert.equal(f.notices.at(-1).message.details.status, "blocked");
+  assert.equal(
+    f.manager.getBranch().filter((entry) => entry.customType === "pi-astraeus:claude-lifecycle")
+      .length,
+    1,
+  );
+  assert.deepEqual(f.errors, []);
+});
+
+for (const success of [false, true])
+  test(`queued-before-abort attention survives ${success ? "successful" : "cancelled"} manual compact and is delivered without new input`, async (t) => {
+    const f = await notificationFixture(t, "working");
+    compactable(f);
+    f.prompts.hold = true;
+    const user = f.session.prompt("Parent interrupted before its queued lifecycle notice");
+    await until(() => f.parentRequests() === 1);
+    f.record.state = "done";
+    f.record.status = "idle";
+    await f.publish();
+    await f.status();
+    assert.equal(f.notices.length, 1);
+    assert.equal(
+      f.manager.getBranch().filter((e) => e.customType === "pi-astraeus:claude-lifecycle").length,
+      0,
+      "notice is still in Pi's followUp queue, not yet appended",
+    );
+    const compacting = await heldCompaction(f, success);
+    await user;
+    await delay(150);
+    assert.equal(f.parentRequests(), 1);
+    f.prompts.hold = false;
+    compacting.release();
+    const outcome = await compacting.outcome;
+    if (success) assert.ok(outcome.result);
+    else assert.match(outcome.error.message, /Compaction cancelled/);
+    await until(() =>
+      f.prompts.contexts.some((messages) =>
+        JSON.stringify(messages).includes("ready to attempt collect, NOT implementation success."),
+      ),
+    );
+    await f.session.waitForIdle();
+    const requests = f.parentRequests();
+    await delay(250);
+    assert.equal(f.parentRequests(), requests, "delivered followUp consumes its retry obligation");
+    assert.equal(
+      f.manager.getBranch().filter((e) => e.customType === "pi-astraeus:claude-lifecycle").length,
+      1,
+    );
+    assert.deepEqual(f.errors, []);
+  });
+
+test("real native managed child completion waits until held manual compact ends", async (t) => {
+  const f = await notificationFixture(t, "working", false, true);
+  const invoke = (params) =>
+    f.session.agent.state.tools
+      .find((tool) => tool.name === "astraeus_workflow")
+      .execute("fixture-native", params, new AbortController().signal);
+  await invoke({
+    op: "start",
+    task_id: "native",
+    requirements: "Exercise completion during compaction",
+    acceptance: "Attention waits for idle",
+  });
+  const delegated = await invoke({
+    op: "delegate",
+    task_id: "native",
+    role: "worker",
+    model: "local-notice/stub",
+    thinking: "off",
+    prompt: "Return fixture work summary",
+  });
+  assert.notEqual(delegated.isError, true, JSON.stringify(delegated));
+  await until(() => f.prompts.childFinishes.length === 1);
+  compactable(f);
+  f.prompts.hold = true;
+  const original = f.session.prompt("Parent work interrupted by manual compact");
+  await until(() => f.parentRequests() === 1);
+  let finishAbort;
+  f.compaction.abortGate = new Promise((resolve) => {
+    finishAbort = resolve;
+  });
+  const entering = heldCompaction(f, true);
+  await until(() => f.compaction.aborting);
+  assert.equal(f.session.isStreaming, false);
+  assert.equal(
+    f.compaction.started,
+    false,
+    "still in compact's initial abort, before before_compact",
+  );
+  f.prompts.childFinishes.splice(0).forEach((finish) => finish());
+  await until(() =>
+    f.notices.some((notice) => notice.message.customType === "subagent-notification"),
+  );
+  await delay(150);
+  assert.equal(
+    f.parentRequests(),
+    1,
+    "native completion must not infer during compact's initial abort",
+  );
+  finishAbort();
+  const compacting = await entering;
+  await original;
+  await delay(150);
+  assert.equal(f.parentRequests(), 1, "native completion stays deferred during the summary hook");
+  f.prompts.hold = false;
+  compacting.release();
+  assert.ok((await compacting.outcome).result);
+  await until(() => f.parentRequests() === 2);
+  await f.session.waitForIdle();
+  assert.ok(
+    JSON.stringify(f.prompts.contexts[1]).includes(
+      f.notices
+        .find((notice) => notice.message.customType === "subagent-notification")
+        .message.content.split("\n")[0],
+    ),
+  );
+  await delay(250);
+  assert.equal(f.parentRequests(), 2);
+  assert.equal(
+    f.manager.getBranch().filter((entry) => entry.customType === "subagent-notification").length,
+    1,
+  );
+  const saved = f.manager
+    .getBranch()
+    .filter((entry) => entry.customType === ENTRY)
+    .at(-1).data.tasks.native;
+  assert.equal(saved.accepted, false);
+  assert.equal(
+    saved.jobs.at(-1).collected,
+    false,
+    "attention never automatically collects or accepts the child",
+  );
+  assert.equal(f.prompts.childFinishes.length, 0, "no child relaunch");
+  assert.deepEqual(f.errors, []);
+});
+
+test("unmanaged native completion keeps Pi's original send semantics during compact", async (t) => {
+  const f = await notificationFixture(t, "working");
+  const compacting = await heldCompaction(f, true);
+  await f.session.sendCustomMessage(
+    {
+      customType: "subagent-notification",
+      content: "Unrelated native completion",
+      display: true,
+      details: { id: "unmanaged-native-child" },
+    },
+    { deliverAs: "followUp", triggerTurn: true },
+  );
+  assert.equal(
+    f.parentRequests(),
+    1,
+    "unrelated native usage passes through, not managed deferral",
+  );
+  compacting.release();
+  assert.ok((await compacting.outcome).result);
+  await delay(250);
+  assert.equal(f.parentRequests(), 1, "no managed continuation was fabricated for an idle compact");
+  assert.deepEqual(f.errors, []);
+});
 
 test("pending preflight attention wakes autonomously after compaction, not at the next user message", async (t) => {
   const f = await notificationFixture(t, "working");

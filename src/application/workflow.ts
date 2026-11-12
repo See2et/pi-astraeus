@@ -36,6 +36,7 @@ import {
 import type { Task, Job, Command, CliState } from "../domain/workflow.ts";
 import { assertReceipt, parseReport } from "../domain/receipts.ts";
 import type { Runtime, Host, Context, MonitorSession, WorkflowOptions } from "./ports.ts";
+import { nativeHistory } from "./native-history.ts";
 
 export class Workflow {
   readonly host: Host;
@@ -1429,15 +1430,27 @@ export class Workflow {
     }
     const record = this.manager()?.getRecord(job.agent_id);
     if (!record) {
-      if (job.collected) return job;
+      const history = nativeHistory(
+        task,
+        job,
+        ctx.sessionManager.getBranch(),
+        ctx.sessionManager.getSessionId(),
+        this.io.hash,
+      );
+      if (history.cessation) job.cessation = history.cessation;
+      if (job.collected) {
+        if (history.cessation) this.save(ctx);
+        return { ...job, note: history.diagnostic };
+      }
       job.status = "unavailable";
       job.collected = true;
       job.valid = false;
-      job.error =
-        "Native child record unavailable: collected unsuccessful, not completed or stopped. Recover exact host handle and verify cessation before writer takeover; uncertain dispatch must not be blindly retried.";
+      job.error = history.cessation
+        ? "Native child output unavailable after host cleanup. Recovered host terminal lifecycle proves cessation only, not a verified run outcome; explicitly hand off remaining work."
+        : "Native child record unavailable: collected unsuccessful, not completed or stopped. Recover exact host handle and verify cessation before writer takeover; uncertain dispatch must not be blindly retried.";
       task.phase = "needs-evidence";
       this.save(ctx);
-      return job;
+      return { ...job, note: history.diagnostic };
     }
     job.status = record.status;
     if (job.resume_from && job.dispatch === "uncertain") {
